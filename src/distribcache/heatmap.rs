@@ -166,12 +166,23 @@ pub struct CacheHeatmap {
 }
 
 impl CacheHeatmap {
-    /// Create a new heatmap
+    /// Create a new heatmap with 5-minute buckets retained for 7 days.
     pub fn new() -> Self {
+        Self::with_window(
+            Duration::from_secs(300),
+            Duration::from_secs(7 * 24 * 60 * 60),
+        )
+    }
+
+    /// Create a heatmap with `bucket_size` time buckets, keeping as many
+    /// buckets as cover `retention` (at least one; a bucket is at least 1 s).
+    pub fn with_window(bucket_size: Duration, retention: Duration) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let bucket_size_secs = bucket_size.as_secs().max(1);
+        let max_buckets = (retention.as_secs() / bucket_size_secs).max(1) as usize;
 
         Self {
             table_accesses: DashMap::new(),
@@ -179,12 +190,12 @@ impl CacheHeatmap {
             time_buckets: RwLock::new(Vec::new()),
             current_bucket: RwLock::new(TimeBucket {
                 start: now,
-                end: now + 300, // 5 minute default
+                end: now + bucket_size_secs,
                 accesses: HashMap::new(),
                 hit_ratio: 0.0,
             }),
-            bucket_size_secs: 300,
-            max_buckets: 2016, // 7 days at 5-minute buckets
+            bucket_size_secs,
+            max_buckets,
         }
     }
 

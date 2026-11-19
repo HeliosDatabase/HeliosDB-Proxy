@@ -223,7 +223,7 @@ impl ProxyServer {
                 });
         hook_context.request_id = uuid::Uuid::new_v4().to_string();
         let mut tables: Vec<String> =
-            crate::sql_text::table_names(&crate::sql_text::RELATION_PATTERN, query)
+            crate::sql_relations::table_names(&crate::sql_relations::RELATION_PATTERN, query)
                 .map(|t| t.split_whitespace().collect::<String>())
                 .collect();
         tables.sort();

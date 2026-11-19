@@ -134,13 +134,22 @@ pub mod cache;
 pub(crate) mod sql_lex;
 
 // ── Quote-aware SQL text scanning shared by both result caches (and the
-//    plugin hooks' statement context) ─────────────────────────────────
+//    plugin hooks' normalized statement text) ──────────────────────────
 #[cfg(any(
     feature = "query-cache",
     feature = "edge-proxy",
     feature = "wasm-plugins"
 ))]
 pub mod sql_text;
+
+// ── The relations a statement names: both result caches and the plugin
+//    hooks' statement context ───────────────────────────────────────
+#[cfg(any(
+    feature = "query-cache",
+    feature = "edge-proxy",
+    feature = "wasm-plugins"
+))]
+pub(crate) mod sql_relations;
 
 // ── Query routing hints ─────────────────────────────────────────────
 #[cfg(feature = "routing-hints")]

@@ -78,7 +78,9 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    (`CLIENTS="16 64" DUR=12 PGOPTIONS="-c synchronous_commit=off" MODES="session transaction"`)
    and gates on `scripts/regress/compare-usertp.py`, which exits 1 if any proxy-mode
    `committed_write` cell regresses beyond a 3% budget (`BUDGET_PCT`) in TPS or p99 (medians
-   over passes). Like every Docker/pgbench harness here it needs a live PostgreSQL backend
+   over passes). `ORDER=alternate` with an even `PASSES` runs the candidate first in every
+   other pass, so neither arm always measures on the backend state the other just left
+   (the default `fixed` runs the base first in every pass). Like every Docker/pgbench harness here it needs a live PostgreSQL backend
    and explicit owner approval per run (see Resource Constraints) — record that approval in
    the GATE-RECORD.
 4. **Lint gates** (exact CI commands):

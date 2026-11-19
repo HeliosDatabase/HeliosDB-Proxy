@@ -96,13 +96,12 @@ impl TenantJournalBudget {
     }
 
     fn reserve(&self, bytes: usize) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                let next = used.checked_add(bytes)?;
-                let limit = self.limit();
-                (limit == 0 || next <= limit).then_some(next)
-            })
-            .is_ok()
+        update(&self.used, |used| {
+            let next = used.checked_add(bytes)?;
+            let limit = self.limit();
+            (limit == 0 || next <= limit).then_some(next)
+        })
+        .is_ok()
     }
 }
 
@@ -200,16 +199,29 @@ struct SlotDebt {
     collecting: AtomicBool,
 }
 
+/// `AtomicUsize::fetch_update(AcqRel, Acquire, f)`, written out: that method
+/// is deprecated from Rust 1.99, and its replacement (`try_update`) does not
+/// exist on the 1.86 MSRV. `Ok` holds the value replaced, `Err` the value
+/// `f` refused.
+fn update(atomic: &AtomicUsize, mut f: impl FnMut(usize) -> Option<usize>) -> Result<usize, usize> {
+    let mut current = atomic.load(Ordering::Acquire);
+    while let Some(next) = f(current) {
+        match atomic.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+    Err(current)
+}
+
 impl SlotDebt {
     /// Take up to `most` permits off the debt; returns how many.
     fn cancel(&self, most: usize) -> usize {
         let mut cancelled = 0;
-        let _ = self
-            .owed
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owed| {
-                cancelled = owed.min(most);
-                Some(owed - cancelled)
-            });
+        let _ = update(&self.owed, |owed| {
+            cancelled = owed.min(most);
+            Some(owed - cancelled)
+        });
         cancelled
     }
 }
@@ -293,11 +305,7 @@ impl TenantSlot {
                     let Ok(permit) = sem.acquire().await else {
                         return;
                     };
-                    let owed =
-                        debt.owed
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owed| {
-                                owed.checked_sub(1)
-                            });
+                    let owed = update(&debt.owed, |owed| owed.checked_sub(1));
                     if owed.is_ok() {
                         permit.forget();
                     }
@@ -1260,6 +1268,31 @@ impl TenantSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_behaves_as_fetch_update() {
+        let a = AtomicUsize::new(5);
+        assert_eq!(update(&a, |v| Some(v + 2)), Ok(5));
+        assert_eq!(a.load(Ordering::SeqCst), 7);
+        assert_eq!(update(&a, |v| v.checked_sub(8)), Err(7));
+        assert_eq!(a.load(Ordering::SeqCst), 7);
+        // Concurrent updaters lose nothing.
+        let a = std::sync::Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let a = std::sync::Arc::clone(&a);
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        update(&a, |v| Some(v + 1)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(a.load(Ordering::SeqCst), 40_000);
+    }
 
     #[test]
     fn journal_budget_reserves_exact_boundary_and_releases_with_charge() {

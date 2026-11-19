@@ -221,6 +221,18 @@ impl FailoverController {
     }
 
     /// Set the current primary
+    /// The error for an operation on `node` that needs a connection the
+    /// controller cannot open: no backend template, or a node that is not
+    /// a registered candidate.
+    fn unreachable(node: NodeId, what: &str) -> ProxyError {
+        ProxyError::FailoverFailed(format!(
+            "cannot {} on node {:?}: no backend connection (attach one with \
+             FailoverController::with_backend_template and register the node \
+             as a candidate)",
+            what, node
+        ))
+    }
+
     pub async fn set_primary(&self, node_id: NodeId) {
         *self.current_primary.write().await = Some(node_id);
         tracing::info!("Primary set to {:?}", node_id);
@@ -347,7 +359,10 @@ impl FailoverController {
         }
 
         // Promote standby
-        self.promote_standby(new_primary).await?;
+        if let Err(e) = self.promote_standby(new_primary).await {
+            self.fail_failover(history_id, &e.to_string()).await;
+            return Err(e);
+        }
 
         // Complete failover
         *self.current_primary.write().await = Some(new_primary);
@@ -432,8 +447,9 @@ impl FailoverController {
     /// dead, so no new WAL is arriving). Bounded by
     /// `config.failover_timeout`.
     ///
-    /// When no backend template is attached, returns `Ok(())` after
-    /// a short delay — the pre-T0-TR4 skeleton behaviour for tests.
+    /// Without a backend template ([`Self::with_backend_template`]) the
+    /// standby cannot be reached, so the wait fails: a failover is never
+    /// reported as synchronised when nothing was checked.
     async fn wait_for_sync(&self, standby: NodeId) -> Result<()> {
         let endpoint = self
             .candidates
@@ -443,12 +459,7 @@ impl FailoverController {
             .map(|c| c.endpoint.clone());
         let cfg = match endpoint.as_ref().and_then(|e| self.backend_config_for(e)) {
             Some(c) => c,
-            None => {
-                // Skeleton path: simulate a brief wait so the state
-                // machine test harness still sees WaitingForSync.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                return Ok(());
-            }
+            None => return Err(Self::unreachable(standby, "check its replay position")),
         };
 
         let overall = self.config.failover_timeout;
@@ -499,8 +510,9 @@ impl FailoverController {
     /// post-promotion by re-running `pg_is_in_recovery()` (must now be
     /// `false`) on a fresh connection.
     ///
-    /// When no backend template is attached, logs and returns `Ok(())`
-    /// — skeleton / test path.
+    /// Without a backend template ([`Self::with_backend_template`]) the
+    /// standby cannot be reached, so the promotion fails: nothing is
+    /// reported as promoted that was not.
     async fn promote_standby(&self, standby: NodeId) -> Result<()> {
         let endpoint = self
             .candidates
@@ -510,13 +522,7 @@ impl FailoverController {
             .map(|c| c.endpoint.clone());
         let cfg = match endpoint.as_ref().and_then(|e| self.backend_config_for(e)) {
             Some(c) => c,
-            None => {
-                tracing::info!(
-                    node = ?standby,
-                    "promote_standby: skeleton path (no backend template) — no-op"
-                );
-                return Ok(());
-            }
+            None => return Err(Self::unreachable(standby, "promote it")),
         };
 
         let wait_secs = self.config.failover_timeout.as_secs().clamp(10, 300);
@@ -668,7 +674,16 @@ impl FailoverController {
             })
             .await;
 
-        self.promote_standby(target).await?;
+        if let Err(e) = self.promote_standby(target).await {
+            *self.state.write().await = FailoverState::Failed;
+            let _ = self
+                .event_tx
+                .send(FailoverEvent::FailoverFailed {
+                    reason: e.to_string(),
+                })
+                .await;
+            return Err(e);
+        }
 
         *self.current_primary.write().await = Some(target);
         *self.state.write().await = FailoverState::Completed;
@@ -760,7 +775,9 @@ impl FailoverController {
             .await?;
 
         // 4. Create replay manager and replay each transaction
-        let replay_manager = FailoverReplay::new(ReplayConfig {
+        // It reaches the new primary through this controller's backend
+        // template (a replay without one fails every statement).
+        let mut replay_manager = FailoverReplay::new(ReplayConfig {
             verify_results: true,
             statement_timeout_ms: 30000,
             retry_on_error: true,
@@ -769,6 +786,12 @@ impl FailoverController {
             wait_for_wal_sync: false, // Already waited above
             max_wal_lag_bytes: 0,
         });
+        if let Some(template) = &self.backend_template {
+            replay_manager = replay_manager.with_backend_template(template.clone());
+            replay_manager
+                .register_endpoint(new_primary_endpoint.id, new_primary_endpoint.clone())
+                .await;
+        }
 
         let mut transaction_results = Vec::new();
         let mut successful_replays = 0;
@@ -868,30 +891,53 @@ impl FailoverController {
             target_lsn
         );
 
-        // Use configured timeout
+        let endpoint = self
+            .candidates
+            .read()
+            .await
+            .get(&node)
+            .map(|c| c.endpoint.clone());
+        let cfg = match endpoint.as_ref().and_then(|e| self.backend_config_for(e)) {
+            Some(c) => c,
+            None => return Err(Self::unreachable(node, "check its WAL position")),
+        };
         let timeout = self.config.failover_timeout;
-        let start = std::time::Instant::now();
-
-        loop {
-            if start.elapsed() >= timeout {
-                return Err(ProxyError::Timeout(format!(
+        tokio::time::timeout(timeout, Self::poll_until_lsn(cfg, target_lsn))
+            .await
+            .map_err(|_| {
+                ProxyError::Timeout(format!(
                     "Timeout waiting for node {:?} to catch up to LSN {}",
                     node, target_lsn
-                )));
-            }
+                ))
+            })?
+    }
 
-            // Check if candidate has caught up
-            let candidates = self.candidates.read().await;
-            if let Some(candidate) = candidates.get(&node) {
-                // In a real implementation, we'd query the node's current LSN
-                // For now, we check if lag is acceptable
-                if candidate.lag_bytes == 0 {
-                    tracing::debug!("Node {:?} has caught up", node);
-                    return Ok(());
-                }
+    /// Poll the node's WAL position every 100 ms until it reaches
+    /// `target_lsn`: the replay position while it is in recovery, its
+    /// current WAL position once it is a primary.
+    async fn poll_until_lsn(cfg: BackendConfig, target_lsn: u64) -> Result<()> {
+        let mut client = BackendClient::connect(&cfg)
+            .await
+            .map_err(|e| ProxyError::Failover(format!("connect to node: {}", e)))?;
+        loop {
+            let value = client
+                .query_scalar(
+                    "SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
+                     ELSE pg_current_wal_lsn() END)::text",
+                )
+                .await
+                .map_err(|e| ProxyError::Failover(format!("wal position probe: {}", e)))?;
+            let text = value
+                .into_string()
+                .ok_or_else(|| ProxyError::Failover("null WAL position".into()))?;
+            let lsn = crate::server::parse_pg_lsn(&text).ok_or_else(|| {
+                ProxyError::Failover(format!("unreadable WAL position {:?}", text))
+            })?;
+            if lsn >= target_lsn {
+                tracing::debug!(lsn = %text, target_lsn, "node caught up");
+                client.close().await;
+                return Ok(());
             }
-            drop(candidates);
-
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -1078,19 +1124,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Coordinate replay
-        let result = controller
+        // Coordinate replay: without a backend template the controller
+        // cannot read the new primary's WAL position, so the replay is
+        // refused before anything runs -- never a synthetic success.
+        let err = controller
             .coordinate_failover_replay(&journal, failed_node, &new_primary)
             .await
-            .unwrap();
-
-        assert_eq!(result.total_transactions, 1);
-        // TR-07: coordinated replay constructs its FailoverReplay without a
-        // backend template, so it must report failure -- never a synthetic
-        // success for a replay that never executed.
-        assert_eq!(result.successful_replays, 0);
-        assert_eq!(result.failed_replays, 1);
-        assert!(!result.all_successful());
+            .unwrap_err();
+        assert!(err.to_string().contains("no backend connection"), "{err}");
     }
 
     #[test]
@@ -1158,7 +1199,8 @@ mod tests {
         let total_attempts = cap + 5;
         let mut ids_in_order = Vec::with_capacity(total_attempts);
         for _ in 0..total_attempts {
-            controller.initiate_failover().await.unwrap();
+            // No backend template: every attempt fails (and closes its entry).
+            controller.initiate_failover().await.unwrap_err();
             // Snapshot the id of whatever was just appended (the newest
             // entry, i.e. the one with the latest `started_at`).
             let history = controller.history().await;
@@ -1177,6 +1219,54 @@ mod tests {
         let expected_surviving = &ids_in_order[total_attempts - cap..];
         let actual_ids: Vec<_> = history.iter().map(|e| e.id).collect();
         assert_eq!(actual_ids, expected_surviving);
+        for entry in &history {
+            assert!(entry.ended_at.is_some() && !entry.success);
+        }
+    }
+
+    /// Without a backend template the controller cannot reach a standby:
+    /// a failover fails, its history entry is closed as failed, the state
+    /// is `Failed`, and the primary is unchanged. Nothing is reported as
+    /// promoted that was not.
+    #[tokio::test]
+    async fn test_failover_without_backend_fails_closed() {
+        let mut controller = FailoverController::new(FailoverConfig {
+            max_lag_bytes: u64::MAX,
+            ..Default::default()
+        });
+        let mut event_rx = controller.take_event_receiver().unwrap();
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let primary = NodeId::new();
+        controller.set_primary(primary).await;
+        let standby = NodeId::new();
+        controller
+            .register_candidate(FailoverCandidate {
+                node_id: standby,
+                endpoint: NodeEndpoint::new("standby", 5432).with_role(NodeRole::Standby),
+                is_sync: true,
+                lag_bytes: 0,
+                priority: 1,
+                last_heartbeat: None,
+            })
+            .await;
+
+        let err = controller.initiate_failover().await.unwrap_err();
+        assert!(err.to_string().contains("no backend connection"), "{err}");
+        assert_eq!(controller.state().await, FailoverState::Failed);
+        assert_eq!(controller.get_primary().await, Some(primary));
+        assert_eq!(controller.failover_count(), 0);
+        let history = controller.history().await;
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].success && history[0].ended_at.is_some());
+        assert!(history[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("promote")));
+
+        let err = controller.manual_failover(standby).await.unwrap_err();
+        assert!(err.to_string().contains("no backend connection"), "{err}");
+        assert_eq!(controller.state().await, FailoverState::Failed);
+        assert_eq!(controller.get_primary().await, Some(primary));
     }
 
     /// With two overlapping failovers in flight, closing one out must not
@@ -1284,8 +1374,9 @@ mod tests {
             tokio::spawn(async move { c1.initiate_failover().await }),
             tokio::spawn(async move { c2.initiate_failover().await }),
         );
-        r1.unwrap().unwrap();
-        r2.unwrap().unwrap();
+        // No backend template: both fail, and each closes its own entry.
+        r1.unwrap().unwrap_err();
+        r2.unwrap().unwrap_err();
 
         let history = controller.history().await;
         assert_eq!(
@@ -1299,7 +1390,7 @@ mod tests {
                 "every completed failover's entry must be closed out, not left open \
                  because the wrong entry got mutated"
             );
-            assert!(entry.success, "both concurrent failovers succeeded here");
+            assert!(!entry.success, "both concurrent failovers failed here");
         }
         // And the two entries are genuinely distinct records.
         assert_ne!(history[0].id, history[1].id);

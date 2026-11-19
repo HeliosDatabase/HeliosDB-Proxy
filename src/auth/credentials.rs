@@ -35,6 +35,11 @@ pub enum CredentialError {
 
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
+
+    /// The provider operation is not implemented in this release. It fails
+    /// closed instead of returning fabricated credentials or an empty listing.
+    #[error("Not supported: {0}")]
+    NotSupported(String),
 }
 
 /// Database credential
@@ -311,19 +316,23 @@ impl CredentialManager {
         Err(CredentialError::NotFound(key.to_string()))
     }
 
-    /// List all available credentials
-    pub fn list_credentials(&self) -> Vec<(String, String)> {
+    /// List all available credentials as `(key, provider name)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first provider error (for example
+    /// [`CredentialError::NotSupported`] from the Vault or AWS Secrets Manager
+    /// providers) instead of omitting that provider's credentials.
+    pub fn list_credentials(&self) -> Result<Vec<(String, String)>, CredentialError> {
         let mut result = Vec::new();
 
         for provider in &self.providers {
-            if let Ok(keys) = provider.list_credentials() {
-                for key in keys {
-                    result.push((key, provider.provider_name().to_string()));
-                }
+            for key in provider.list_credentials()? {
+                result.push((key, provider.provider_name().to_string()));
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Invalidate cached credential
@@ -391,7 +400,8 @@ impl CredentialManagerBuilder {
         self
     }
 
-    /// Add Vault provider
+    /// Add Vault provider. See [`VaultCredentialProvider`]: every lookup
+    /// through it fails with [`CredentialError::NotSupported`] in this release.
     pub fn with_vault(mut self, address: &str, token: &str, mount: &str) -> Self {
         self.providers.push(Box::new(VaultCredentialProvider::new(
             address, token, mount,
@@ -399,7 +409,9 @@ impl CredentialManagerBuilder {
         self
     }
 
-    /// Add AWS Secrets Manager provider
+    /// Add AWS Secrets Manager provider. See [`AwsSecretsManagerProvider`]:
+    /// every lookup through it fails with [`CredentialError::NotSupported`] in
+    /// this release.
     pub fn with_aws_secrets_manager(mut self, region: &str) -> Self {
         self.providers
             .push(Box::new(AwsSecretsManagerProvider::new(region)));
@@ -541,56 +553,50 @@ impl CredentialProvider for EnvironmentCredentialProvider {
     }
 }
 
-/// HashiCorp Vault credential provider
+/// HashiCorp Vault credential provider.
+///
+/// Reading credentials from Vault is not implemented in this release:
+/// `get_credential`, `refresh_credential` and `list_credentials` all fail
+/// closed with [`CredentialError::NotSupported`]. No credential is fabricated,
+/// and [`CredentialManager`] propagates the error instead of falling through
+/// to later providers.
 pub struct VaultCredentialProvider {
     address: String,
-    token: String,
     mount: String,
 }
 
 impl VaultCredentialProvider {
-    /// Create a new Vault provider
-    pub fn new(address: &str, token: &str, mount: &str) -> Self {
+    /// Create a new Vault provider. The token is not retained, because no
+    /// request is made to Vault in this release.
+    pub fn new(address: &str, _token: &str, mount: &str) -> Self {
         Self {
             address: address.to_string(),
-            token: token.to_string(),
             mount: mount.to_string(),
         }
+    }
+
+    fn unsupported(&self, operation: &str) -> CredentialError {
+        CredentialError::NotSupported(format!(
+            "HashiCorp Vault credential {operation} (address {}, mount {}) is not supported in this release",
+            self.address, self.mount
+        ))
     }
 }
 
 impl CredentialProvider for VaultCredentialProvider {
+    /// Always fails with [`CredentialError::NotSupported`].
     fn get_credential(&self, key: &str) -> Result<DatabaseCredential, CredentialError> {
-        // In a real implementation, this would make an HTTP request to Vault
-        // For demonstration, we return a placeholder
-        //
-        // Real implementation would:
-        // 1. POST to {address}/v1/{mount}/creds/{key}
-        // 2. Parse response for username/password
-        // 3. Handle lease renewal
-
-        let _ = (key, &self.address, &self.token, &self.mount);
-
-        Ok(DatabaseCredential {
-            username: format!("vault_user_{}", key),
-            password: "vault_generated_password".to_string(),
-            database: None,
-            host: None,
-            port: None,
-            options: HashMap::new(),
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
-            source: CredentialSource::Vault,
-        })
+        Err(self.unsupported(&format!("lookup of '{key}'")))
     }
 
+    /// Always fails with [`CredentialError::NotSupported`].
     fn refresh_credential(&self, key: &str) -> Result<DatabaseCredential, CredentialError> {
-        // In Vault, this would renew the lease or get a new credential
-        self.get_credential(key)
+        Err(self.unsupported(&format!("refresh of '{key}'")))
     }
 
+    /// Always fails with [`CredentialError::NotSupported`].
     fn list_credentials(&self) -> Result<Vec<String>, CredentialError> {
-        // In a real implementation, this would list roles from Vault
-        Ok(Vec::new())
+        Err(self.unsupported("listing"))
     }
 
     fn provider_name(&self) -> &str {
@@ -598,7 +604,13 @@ impl CredentialProvider for VaultCredentialProvider {
     }
 }
 
-/// AWS Secrets Manager credential provider
+/// AWS Secrets Manager credential provider.
+///
+/// Reading secrets from AWS Secrets Manager is not implemented in this
+/// release: `get_credential`, `refresh_credential` and `list_credentials` all
+/// fail closed with [`CredentialError::NotSupported`]. No credential is
+/// fabricated, and [`CredentialManager`] propagates the error instead of
+/// falling through to later providers.
 pub struct AwsSecretsManagerProvider {
     region: String,
 }
@@ -610,39 +622,29 @@ impl AwsSecretsManagerProvider {
             region: region.to_string(),
         }
     }
+
+    fn unsupported(&self, operation: &str) -> CredentialError {
+        CredentialError::NotSupported(format!(
+            "AWS Secrets Manager credential {operation} (region {}) is not supported in this release",
+            self.region
+        ))
+    }
 }
 
 impl CredentialProvider for AwsSecretsManagerProvider {
+    /// Always fails with [`CredentialError::NotSupported`].
     fn get_credential(&self, key: &str) -> Result<DatabaseCredential, CredentialError> {
-        // In a real implementation, this would use the AWS SDK
-        // For demonstration, we return a placeholder
-        //
-        // Real implementation would:
-        // 1. Use aws_sdk_secretsmanager to get secret value
-        // 2. Parse JSON for username/password
-        // 3. Handle rotation
-
-        let _ = (key, &self.region);
-
-        Ok(DatabaseCredential {
-            username: format!("aws_user_{}", key),
-            password: "aws_managed_password".to_string(),
-            database: None,
-            host: None,
-            port: None,
-            options: HashMap::new(),
-            expires_at: None,
-            source: CredentialSource::AwsSecretsManager,
-        })
+        Err(self.unsupported(&format!("lookup of '{key}'")))
     }
 
+    /// Always fails with [`CredentialError::NotSupported`].
     fn refresh_credential(&self, key: &str) -> Result<DatabaseCredential, CredentialError> {
-        self.get_credential(key)
+        Err(self.unsupported(&format!("refresh of '{key}'")))
     }
 
+    /// Always fails with [`CredentialError::NotSupported`].
     fn list_credentials(&self) -> Result<Vec<String>, CredentialError> {
-        // In a real implementation, this would list secrets from AWS
-        Ok(Vec::new())
+        Err(self.unsupported("listing"))
     }
 
     fn provider_name(&self) -> &str {
@@ -739,8 +741,67 @@ mod tests {
             .with_static_credentials(credentials)
             .build();
 
-        let list = manager.list_credentials();
+        let list = manager.list_credentials().unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    fn assert_not_supported<T: std::fmt::Debug>(
+        result: Result<T, CredentialError>,
+        needles: &[&str],
+    ) {
+        match result {
+            Err(CredentialError::NotSupported(msg)) => {
+                for needle in needles {
+                    assert!(msg.contains(needle), "{msg:?} lacks {needle:?}");
+                }
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_provider_fails_closed() {
+        let provider = VaultCredentialProvider::new("https://vault:8200", "s.token", "database");
+        let ctx = ["Vault", "https://vault:8200", "database"];
+        assert_not_supported(provider.get_credential("app"), &ctx);
+        assert_not_supported(provider.refresh_credential("app"), &ctx);
+        assert_not_supported(provider.list_credentials(), &ctx);
+    }
+
+    #[test]
+    fn aws_provider_fails_closed() {
+        let provider = AwsSecretsManagerProvider::new("eu-west-1");
+        let ctx = ["AWS Secrets Manager", "eu-west-1"];
+        assert_not_supported(provider.get_credential("app"), &ctx);
+        assert_not_supported(provider.refresh_credential("app"), &ctx);
+        assert_not_supported(provider.list_credentials(), &ctx);
+    }
+
+    #[test]
+    fn manager_propagates_unsupported_provider_without_caching() {
+        let mut credentials = HashMap::new();
+        credentials.insert("db1".to_string(), test_credential());
+
+        let manager = CredentialManager::builder()
+            .with_static_credentials(credentials)
+            .with_vault("https://vault:8200", "s.token", "database")
+            .with_aws_secrets_manager("eu-west-1")
+            .build();
+
+        // A key the static provider holds still resolves.
+        assert_eq!(manager.get_credential("db1").unwrap().username, "testuser");
+
+        // A key it lacks reaches Vault, which fails closed.
+        assert_not_supported(manager.get_credential("other"), &["Vault"]);
+        assert_not_supported(manager.refresh_credential("other"), &["Vault"]);
+        assert_not_supported(
+            manager.get_credential_from("other", "aws_secrets_manager"),
+            &["AWS Secrets Manager"],
+        );
+        assert_eq!(manager.cache_stats().entries, 1);
+
+        // Listing reports the failure instead of omitting the provider.
+        assert_not_supported(manager.list_credentials(), &["Vault"]);
     }
 
     #[test]

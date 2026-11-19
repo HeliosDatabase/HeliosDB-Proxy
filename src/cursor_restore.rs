@@ -3,8 +3,8 @@
 //! Saves and restores cursor state after failover.
 //! Allows resuming result set iteration from the last position.
 
-use super::{NodeEndpoint, NodeId, ProxyError, Result};
-use crate::backend::{BackendClient, BackendConfig};
+use super::{ProxyError, Result};
+use crate::backend::BackendClient;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -90,13 +90,6 @@ pub struct CursorRestore {
     max_cursors_per_session: usize,
     /// Whether cursor restore is enabled
     enabled: bool,
-    /// Optional backend-connection template. Host/port are swapped to
-    /// the target node's endpoint at `restore_cursor` time. When `None`,
-    /// `recreate_cursor` returns success without opening a connection —
-    /// the pre-T0-TR6 skeleton path used by unit tests.
-    backend_template: Option<BackendConfig>,
-    /// Per-node endpoints for resolving `target_node` → host:port.
-    endpoints: Arc<RwLock<HashMap<NodeId, NodeEndpoint>>>,
 }
 
 impl CursorRestore {
@@ -107,8 +100,6 @@ impl CursorRestore {
             session_cursors: Arc::new(RwLock::new(HashMap::new())),
             max_cursors_per_session: 100,
             enabled: true,
-            backend_template: None,
-            endpoints: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -116,28 +107,6 @@ impl CursorRestore {
     pub fn with_max_cursors(mut self, max: usize) -> Self {
         self.max_cursors_per_session = max;
         self
-    }
-
-    /// Attach a backend-connection template so real cursor recreation
-    /// can run `DECLARE` / `MOVE` against the target node.
-    pub fn with_backend_template(mut self, template: BackendConfig) -> Self {
-        self.backend_template = Some(template);
-        self
-    }
-
-    /// Register an endpoint for a node so restore can resolve where to
-    /// re-declare the cursor.
-    pub async fn register_endpoint(&self, node_id: NodeId, endpoint: NodeEndpoint) {
-        self.endpoints.write().await.insert(node_id, endpoint);
-    }
-
-    fn build_config(&self, endpoint: &NodeEndpoint) -> Option<BackendConfig> {
-        self.backend_template.as_ref().map(|t| {
-            let mut c = t.clone();
-            c.host = endpoint.host.clone();
-            c.port = endpoint.port;
-            c
-        })
     }
 
     /// Enable or disable cursor restore
@@ -250,11 +219,22 @@ impl CursorRestore {
             .collect()
     }
 
-    /// Restore a cursor on a new node
+    /// Recreate the saved cursor `cursor_name` at its saved position on
+    /// `client`, the connection the session continues on after a
+    /// failover: the statements of [`restore_statements`], run in order.
+    /// `in_transaction` says whether `client` is inside a transaction
+    /// block (a replayed one); a cursor without `WITH HOLD` lives only
+    /// inside one, so it is declared in that block, or after a `BEGIN`
+    /// this opens and the caller then owns.
+    ///
+    /// `Err` when the cursor is unknown or closed; a statement the backend
+    /// refuses is reported in the result (`success: false`, `error`), and
+    /// the cursor then does not exist on `client`.
     pub async fn restore_cursor(
         &self,
         cursor_name: &str,
-        target_node: NodeId,
+        client: &mut BackendClient,
+        in_transaction: bool,
     ) -> Result<CursorRestoreResult> {
         let start = std::time::Instant::now();
 
@@ -269,41 +249,35 @@ impl CursorRestore {
             )));
         }
 
-        // TODO: Implement actual cursor restoration
-        // 1. Re-execute the query on the new node
-        // 2. Create cursor with same name
-        // 3. Skip to the saved position
-        // 4. Update internal state
-
-        let rows_to_skip = cursor.position;
-        let result = self
-            .recreate_cursor(&cursor, target_node, rows_to_skip)
-            .await;
-
+        let statements = restore_statements(&cursor, in_transaction)?;
+        let mut outcome = Ok(());
+        for sql in &statements {
+            if let Err(e) = client.execute(sql).await {
+                outcome = Err(ProxyError::CursorRestore(format!("{}: {}", sql, e)));
+                break;
+            }
+        }
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        match result {
+        match outcome {
             Ok(()) => {
                 tracing::info!(
-                    "Restored cursor '{}' on node {:?}, skipped {} rows in {}ms",
+                    "Restored cursor '{}' at row {} in {}ms",
                     cursor_name,
-                    target_node,
-                    rows_to_skip,
+                    cursor.position,
                     duration_ms
                 );
-
                 Ok(CursorRestoreResult {
                     name: cursor_name.to_string(),
                     success: true,
                     recreated: true,
-                    rows_skipped: rows_to_skip,
+                    rows_skipped: cursor.position,
                     duration_ms,
                     error: None,
                 })
             }
             Err(e) => {
                 tracing::error!("Failed to restore cursor '{}': {}", cursor_name, e);
-
                 Ok(CursorRestoreResult {
                     name: cursor_name.to_string(),
                     success: false,
@@ -316,113 +290,41 @@ impl CursorRestore {
         }
     }
 
-    /// Recreate a cursor on the target node via `DECLARE` + `MOVE`.
-    ///
-    /// Emits SQL roughly equivalent to:
-    ///
-    /// ```sql
-    /// BEGIN;
-    /// DECLARE <name> [SCROLL] [NO SCROLL] CURSOR [WITH HOLD] FOR <query>;
-    /// MOVE FORWARD <skip_rows> IN <name>;
-    /// ```
-    ///
-    /// Parameters from `CursorState.parameters` are interpolated into
-    /// `<query>` as text-format literals — we don't use the extended
-    /// protocol for replay, matching the T0-TR5 design choice.
-    ///
-    /// The BEGIN is only emitted when the cursor is NOT `with_hold`; a
-    /// `WITH HOLD` cursor persists across commits and does not need an
-    /// enclosing transaction.
-    ///
-    /// When no backend template / endpoint is configured, returns
-    /// `Ok(())` after a short delay — the skeleton path retained for
-    /// unit tests that don't want to open real sockets.
-    async fn recreate_cursor(
-        &self,
-        cursor: &CursorState,
-        target_node: NodeId,
-        skip_rows: u64,
-    ) -> Result<()> {
-        let endpoint = self.endpoints.read().await.get(&target_node).cloned();
-        let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
-            Some(c) => c,
-            None => {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                return Ok(());
-            }
-        };
-
-        let mut client = BackendClient::connect(&cfg)
-            .await
-            .map_err(|e| ProxyError::CursorRestore(format!("connect: {}", e)))?;
-
-        // Substitute $N parameters in the query with text literals.
-        let interpolated_query = interpolate_cursor_params(&cursor.query, &cursor.parameters)?;
-
-        let scroll = match cursor.direction {
-            CursorDirection::Forward => "NO SCROLL",
-            CursorDirection::Backward | CursorDirection::Both => "SCROLL",
-        };
-        let with_hold = if cursor.with_hold { "WITH HOLD" } else { "" };
-
-        if !cursor.with_hold {
-            // Non-HOLD cursors require an enclosing transaction.
-            client
-                .execute("BEGIN")
-                .await
-                .map_err(|e| ProxyError::CursorRestore(format!("BEGIN: {}", e)))?;
-        }
-
-        let declare = format!(
-            "DECLARE {} {} CURSOR {} FOR {}",
-            quote_ident(&cursor.name),
-            scroll,
-            with_hold,
-            interpolated_query
-        );
-        client
-            .execute(&declare)
-            .await
-            .map_err(|e| ProxyError::CursorRestore(format!("DECLARE: {}", e)))?;
-
-        if skip_rows > 0 {
-            let move_sql = format!(
-                "MOVE FORWARD {} IN {}",
-                skip_rows,
-                quote_ident(&cursor.name)
-            );
-            client
-                .execute(&move_sql)
-                .await
-                .map_err(|e| ProxyError::CursorRestore(format!("MOVE: {}", e)))?;
-        }
-
-        client.close().await;
-        Ok(())
-    }
-
-    /// Restore all cursors for a session
+    /// [`Self::restore_cursor`] for every open cursor of a session, on the
+    /// same `client`. Only the first may open a transaction block: after
+    /// it the connection is inside one.
     pub async fn restore_session_cursors(
         &self,
         session_id: &Uuid,
-        target_node: NodeId,
+        client: &mut BackendClient,
+        mut in_transaction: bool,
     ) -> Vec<CursorRestoreResult> {
         let cursors = self.get_session_cursors(session_id).await;
         let mut results = Vec::new();
 
         for cursor in cursors {
-            if !cursor.closed {
-                match self.restore_cursor(&cursor.name, target_node).await {
-                    Ok(result) => results.push(result),
-                    Err(e) => results.push(CursorRestoreResult {
-                        name: cursor.name,
-                        success: false,
-                        recreated: false,
-                        rows_skipped: 0,
-                        duration_ms: 0,
-                        error: Some(e.to_string()),
-                    }),
+            if cursor.closed {
+                continue;
+            }
+            let opens_block = !in_transaction && !cursor.with_hold;
+            match self
+                .restore_cursor(&cursor.name, client, in_transaction)
+                .await
+            {
+                Ok(result) => {
+                    if result.success && opens_block {
+                        in_transaction = true;
+                    }
+                    results.push(result)
                 }
+                Err(e) => results.push(CursorRestoreResult {
+                    name: cursor.name,
+                    success: false,
+                    recreated: false,
+                    rows_skipped: 0,
+                    duration_ms: 0,
+                    error: Some(e.to_string()),
+                }),
             }
         }
 
@@ -468,6 +370,40 @@ impl Default for CursorRestore {
 
 /// Quote a PostgreSQL identifier (table/cursor/column name). Doubles
 /// any embedded `"` and wraps the whole thing in double quotes.
+/// The statements that recreate `cursor` at its saved position:
+/// `BEGIN` when it has no `WITH HOLD` and the connection is not in a
+/// transaction block (`in_transaction`), then
+/// `DECLARE <name> [NO] SCROLL CURSOR [WITH HOLD] FOR <query>` with the
+/// saved parameters as literals, then `MOVE FORWARD <position>` when it
+/// had advanced.
+pub fn restore_statements(cursor: &CursorState, in_transaction: bool) -> Result<Vec<String>> {
+    let query = interpolate_cursor_params(&cursor.query, &cursor.parameters)?;
+    let scroll = match cursor.direction {
+        CursorDirection::Forward => "NO SCROLL",
+        CursorDirection::Backward | CursorDirection::Both => "SCROLL",
+    };
+    let mut statements = Vec::with_capacity(3);
+    if !cursor.with_hold && !in_transaction {
+        statements.push("BEGIN".to_string());
+    }
+    let hold = if cursor.with_hold { " WITH HOLD" } else { "" };
+    statements.push(format!(
+        "DECLARE {} {} CURSOR{} FOR {}",
+        quote_ident(&cursor.name),
+        scroll,
+        hold,
+        query
+    ));
+    if cursor.position > 0 {
+        statements.push(format!(
+            "MOVE FORWARD {} IN {}",
+            cursor.position,
+            quote_ident(&cursor.name)
+        ));
+    }
+    Ok(statements)
+}
+
 fn quote_ident(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 2);
     out.push('"');
@@ -702,21 +638,26 @@ mod tests {
         assert!(cursors.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_restore_cursor() {
-        let restore = CursorRestore::new();
+    #[test]
+    fn test_restore_statements() {
         let session_id = Uuid::new_v4();
         let mut state = make_cursor_state("test_cursor", session_id);
         state.position = 500;
-
-        restore.save_cursor(state).await.unwrap();
-
-        let target = NodeId::new();
-        let result = restore.restore_cursor("test_cursor", target).await.unwrap();
-
-        assert!(result.success);
-        assert!(result.recreated);
-        assert_eq!(result.rows_skipped, 500);
+        state.with_hold = false;
+        let sql = restore_statements(&state, false).unwrap();
+        assert_eq!(sql[0], "BEGIN");
+        assert!(sql[1].starts_with("DECLARE \"test_cursor\" "), "{}", sql[1]);
+        assert!(!sql[1].contains("WITH HOLD"));
+        assert_eq!(sql[2], "MOVE FORWARD 500 IN \"test_cursor\"");
+        // Inside the replayed transaction block: no BEGIN.
+        let sql = restore_statements(&state, true).unwrap();
+        assert!(sql[0].starts_with("DECLARE"));
+        // WITH HOLD outlives the block: no BEGIN either way; at row 0 no MOVE.
+        state.with_hold = true;
+        state.position = 0;
+        let sql = restore_statements(&state, false).unwrap();
+        assert_eq!(sql.len(), 1);
+        assert!(sql[0].contains(" CURSOR WITH HOLD FOR "), "{}", sql[0]);
     }
 
     #[tokio::test]

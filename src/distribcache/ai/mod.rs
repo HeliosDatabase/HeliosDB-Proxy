@@ -23,8 +23,8 @@ pub use conversation::{
 pub use rag::{Chunk, ChunkId, RagCacheStatsSnapshot, RagChunkCache};
 pub use semantic::{
     cosine_similarity, AIWorkloadContext, BranchContext, BranchId, Embedding,
-    SemanticCacheStatsSnapshot, SemanticEntry, SemanticIndex, SemanticIndexConfig,
-    SemanticQueryCache, SimilarityResult, VectorId,
+    SemanticCacheStatsSnapshot, SemanticEntry, SemanticIndex, SemanticQueryCache, SimilarityResult,
+    VectorId,
 };
 pub use tools::{ToolCacheStatsSnapshot, ToolCallKey, ToolResult, ToolResultCache};
 // Note: SessionId is defined as a newtype struct in the parent distribcache module

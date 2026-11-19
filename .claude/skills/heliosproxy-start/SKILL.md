@@ -13,7 +13,7 @@ or CLI flags (good for one-liner demos and CI).
 ## When to use
 
 - First-time bring-up after `cargo install`
-- Restarting after a config change (no live reload — see Pitfalls)
+- Restarting after a config change that SIGHUP does not apply (see Pitfalls)
 - Running the proxy under systemd / Docker / Kubernetes
 - Background-launching as part of a test fixture
 
@@ -70,7 +70,7 @@ ExecStart=/usr/local/bin/heliosdb-proxy --config /etc/heliosproxy/proxy.toml
 Restart=on-failure
 User=heliosproxy
 Group=heliosproxy
-TimeoutStopSec=30s
+TimeoutStopSec=75s
 
 [Install]
 WantedBy=multi-user.target
@@ -83,8 +83,11 @@ sudo systemctl status heliosproxy
 journalctl -u heliosproxy -f
 ```
 
-`TimeoutStopSec=30s` gives the drain (SIGTERM → wait for sessions
-to close) a chance to finish before systemd hard-kills.
+`TimeoutStopSec=75s` gives the drain (SIGTERM → each session ends
+with FATAL `57P01` once nothing of it is in flight, at most
+`shutdown_drain_timeout_secs`, default 60) time to finish before
+systemd hard-kills. Add `ExecReload=/bin/kill -HUP $MAINPID` for
+`systemctl reload`.
 
 ### Recipe 4: Docker / Compose
 
@@ -92,7 +95,8 @@ to close) a chance to finish before systemd hard-kills.
 # docker-compose.yml
 services:
   heliosproxy:
-    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0
+    stop_grace_period: 70s   # longer than shutdown_drain_timeout_secs
     volumes:
       - ./proxy.toml:/etc/heliosproxy/proxy.toml:ro
     ports:
@@ -111,44 +115,45 @@ docker compose logs -f heliosproxy
 
 ```bash
 curl -s http://localhost:9090/health        # {"status":"ok"}
-curl -s http://localhost:9090/version | jq  # {"version":"0.4.1",...}
+curl -s http://localhost:9090/version | jq  # {"version":"3.0.0",...}
 psql -h localhost -p 6432 -U postgres -c "SELECT 1"
 ```
 
 If admin returns 200 but PG returns "connection refused" — the
 proxy is up but the PG listener didn't bind. Check the log for
-`bind failed` lines and confirm `--listen` / `[server] listen_address`.
+`bind failed` lines and confirm `--listen` / the top-level `listen_address`.
 
-### Recipe 6: Environment-variable overrides
+### Recipe 6: Environment variables
+
+There is no generic env-var override. `proxy.toml` values can reference
+the environment (`${NAME}`, `${NAME:-default}`, expanded before parsing),
+`RUST_LOG` controls logging, and `HELIOS_DRAIN_TIMEOUT_SECS` overrides
+`shutdown_drain_timeout_secs`:
 
 ```bash
-HELIOSPROXY_LOG_LEVEL=debug \
-HELIOSPROXY_ADMIN=0.0.0.0:9999 \
-heliosdb-proxy --config proxy.toml
+ADMIN_TOKEN=... RUST_LOG=heliosdb_proxy=debug \
+heliosdb-proxy --config proxy.toml   # proxy.toml: admin_token = "${ADMIN_TOKEN}"
 ```
-
-Env-vars take precedence over the config file but lose to explicit
-CLI flags.
 
 ## Pitfalls
 
-- **No live config reload in v0.4.x.** Editing `proxy.toml` does
-  nothing until you restart. Restart = SIGTERM (drain), then start
-  with the new config. See `heliosproxy-shutdown` for drain semantics.
+- **SIGHUP reloads `proxy.toml`, but not every section.** Keys read
+  only at startup are kept (the log names them) and need a restart:
+  SIGTERM (drain), then start with the new config, or a SIGUSR2
+  handoff to a new process. See `heliosproxy-shutdown`.
 - **`Address already in use` on 6432 or 9090.** Another process
   is bound. `lsof -i :6432` to identify. Common culprit: a previous
   `heliosdb-proxy` that didn't fully exit (kill -9 it after
   graceful timeout).
-- **`--admin 127.0.0.1:9090` makes admin local-only.** For remote
-  /metrics scraping, bind to `0.0.0.0:9090` and put it behind a
-  firewall / reverse-proxy with auth — admin endpoints are
-  unauthenticated by default.
-- **Don't set `--primary` AND `[[nodes]]` in `proxy.toml`** — CLI
-  primary wins and silently overrides the TOML; you'll lose your
-  weight / role config.
-- **Process foregrounded via Ctrl-C drains synchronously.** If you
-  have long-running idle sessions, Ctrl-C blocks until they close
-  or `TimeoutStopSec` fires. Press Ctrl-C twice to force-quit.
+- **`--admin 127.0.0.1:9090` (the default) makes admin local-only.**
+  A non-loopback admin address without `admin_token` (or
+  `--admin-token`) is refused at startup unless
+  `admin_allow_insecure = true`.
+- **`--primary` / `--standby` apply only without `--config`.** With a
+  config file, `[[nodes]]` is the whole node list.
+- **Ctrl-C (SIGINT) drains.** Idle sessions end at once; a session
+  inside a transaction is waited for, up to
+  `shutdown_drain_timeout_secs`. Press Ctrl-C twice to exit at once.
 
 ## See also
 

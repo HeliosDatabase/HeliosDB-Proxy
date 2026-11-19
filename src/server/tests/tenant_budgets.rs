@@ -7821,8 +7821,11 @@ async fn journal_source_uses_startup_tenant_budget_identity() {
 
 mod branch_routing;
 mod extended_hooks;
+#[cfg(feature = "wasm-plugins")]
 mod plugin_cached;
+#[cfg(feature = "wasm-plugins")]
 mod plugin_context;
+#[cfg(feature = "wasm-plugins")]
 mod plugin_reload;
 mod routing_targets;
 mod session_bound;

@@ -89,9 +89,19 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # The release body is docs/releases/<version>.md when the tag has one
+      # (v3.0.0 -> docs/releases/3.0.0.md), followed by GitHub's generated list
+      # of merged pull requests; without one, the generated list alone.
+      - name: Release notes
+        id: notes
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME#v}.md"
+          if [ -f "$notes" ]; then echo "body_path=$notes" >> "$GITHUB_OUTPUT"; fi
+
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
+          body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: true
           files: artifacts/*
         env:

@@ -3,7 +3,8 @@
 //! Saves and restores session state after failover.
 //! Includes SET parameters, timezone, search_path, and custom variables.
 
-use super::{NodeEndpoint, NodeId, ProxyError, Result};
+use super::{NodeId, ProxyError, Result};
+use crate::backend::BackendClient;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -24,6 +25,79 @@ fn quote_session_ident(name: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// A prepared-statement name as SQL: bare when it is a plain lower-case
+/// identifier (how PostgreSQL folds an unquoted `PREPARE` name), quoted
+/// otherwise so the exact recorded name is recreated.
+fn prepared_name_sql(name: &str) -> String {
+    let mut chars = name.chars();
+    let plain = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+    if plain {
+        name.to_string()
+    } else {
+        quote_session_ident(name)
+    }
+}
+
+/// Quote a value as a PostgreSQL string literal. A value containing a
+/// backslash uses the `E'...'` form with backslashes doubled, so it reads
+/// the same whatever `standard_conforming_strings` is.
+fn quote_session_literal(value: &str) -> String {
+    let escape = value.contains('\\');
+    let mut out = String::with_capacity(value.len() + 3);
+    if escape {
+        out.push('E');
+    }
+    out.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\'' => out.push_str("''"),
+            '\\' if escape => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// `SELECT pg_catalog.set_config(<name>, <value>, false)`: sets a session
+/// parameter to exactly the recorded text, including list values such as
+/// `search_path` and dotted custom names, with both quoted as literals.
+fn set_config_statement(name: &str, value: &str) -> String {
+    format!(
+        "SELECT pg_catalog.set_config({}, {}, false)",
+        quote_session_literal(name),
+        quote_session_literal(value)
+    )
+}
+
+/// The `CREATE TEMP TABLE IF NOT EXISTS` that recreates `table`'s schema
+/// (empty) from its recorded columns. Column types and default
+/// expressions are copied verbatim.
+pub fn temp_table_restore_statement(table: &TempTableInfo) -> String {
+    let mut stmt = String::with_capacity(64 + table.name.len());
+    stmt.push_str("CREATE TEMP TABLE IF NOT EXISTS ");
+    stmt.push_str(&quote_session_ident(&table.name));
+    stmt.push_str(" (");
+    for (i, col) in table.columns.iter().enumerate() {
+        if i > 0 {
+            stmt.push_str(", ");
+        }
+        stmt.push_str(&quote_session_ident(&col.name));
+        stmt.push(' ');
+        stmt.push_str(&col.data_type);
+        if !col.nullable {
+            stmt.push_str(" NOT NULL");
+        }
+        if let Some(default) = &col.default_expr {
+            stmt.push_str(" DEFAULT ");
+            stmt.push_str(default);
+        }
+    }
+    stmt.push(')');
+    stmt
 }
 
 /// Session state information
@@ -177,43 +251,56 @@ impl SessionState {
         self.last_activity = chrono::Utc::now();
     }
 
-    /// Generate SET statements to restore session
-    pub fn generate_restore_statements(&self) -> Vec<String> {
-        let mut statements = Vec::new();
-
-        // Core parameters
-        statements.push(format!("SET timezone TO '{}'", self.timezone));
-        statements.push(format!(
-            "SET search_path TO {}",
-            self.search_path.join(", ")
-        ));
-        statements.push(format!("SET client_encoding TO '{}'", self.client_encoding));
-        statements.push(format!("SET datestyle TO '{}'", self.datestyle));
-        statements.push(format!("SET intervalstyle TO '{}'", self.intervalstyle));
-
+    /// The statements that restore this session's parameters: one
+    /// `SELECT pg_catalog.set_config(name, value, false)` per parameter
+    /// (timezone, search_path, client_encoding, datestyle, intervalstyle,
+    /// application_name when set, then the custom ones).
+    pub fn parameter_restore_statements(&self) -> Vec<String> {
+        let mut statements = vec![
+            set_config_statement("timezone", &self.timezone),
+            set_config_statement("search_path", &self.search_path.join(", ")),
+            set_config_statement("client_encoding", &self.client_encoding),
+            set_config_statement("datestyle", &self.datestyle),
+            set_config_statement("intervalstyle", &self.intervalstyle),
+        ];
         if let Some(ref app_name) = self.application_name {
-            statements.push(format!("SET application_name TO '{}'", app_name));
+            statements.push(set_config_statement("application_name", app_name));
         }
-
-        // Custom parameters
         for (name, value) in &self.custom_parameters {
-            statements.push(format!("SET {} TO '{}'", name, value));
+            statements.push(set_config_statement(name, value));
         }
+        statements
+    }
 
-        // Prepared statements
-        for prep in self.prepared_statements.values() {
-            if prep.param_types.is_empty() {
-                statements.push(format!("PREPARE {} AS {}", prep.name, prep.query));
-            } else {
-                statements.push(format!(
-                    "PREPARE {} ({}) AS {}",
-                    prep.name,
-                    prep.param_types.join(", "),
-                    prep.query
-                ));
-            }
-        }
+    /// The `PREPARE` statements that recreate this session's prepared
+    /// statements.
+    pub fn prepared_restore_statements(&self) -> Vec<String> {
+        self.prepared_statements
+            .values()
+            .map(|prep| {
+                if prep.param_types.is_empty() {
+                    format!(
+                        "PREPARE {} AS {}",
+                        prepared_name_sql(&prep.name),
+                        prep.query
+                    )
+                } else {
+                    format!(
+                        "PREPARE {} ({}) AS {}",
+                        prepared_name_sql(&prep.name),
+                        prep.param_types.join(", "),
+                        prep.query
+                    )
+                }
+            })
+            .collect()
+    }
 
+    /// Parameter then prepared-statement restore statements, in the order
+    /// [`SessionMigrate::migrate_session`] runs them.
+    pub fn generate_restore_statements(&self) -> Vec<String> {
+        let mut statements = self.parameter_restore_statements();
+        statements.extend(self.prepared_restore_statements());
         statements
     }
 }
@@ -223,17 +310,17 @@ impl SessionState {
 pub struct SessionMigrateResult {
     /// Session ID
     pub session_id: Uuid,
-    /// Migration succeeded
+    /// Every restore statement succeeded on the target connection
     pub success: bool,
     /// Target node
     pub target_node: NodeId,
-    /// SET statements executed
+    /// Session parameters restored
     pub parameters_restored: usize,
     /// Prepared statements restored
     pub prepared_statements_restored: usize,
-    /// Temp tables (attempted) migration
+    /// Temp tables recreated (schema only)
     pub temp_tables_migrated: usize,
-    /// Temp tables that failed to migrate
+    /// Temp tables not recreated because the migration failed first
     pub temp_tables_failed: usize,
     /// Migration time (ms)
     pub duration_ms: u64,
@@ -251,12 +338,6 @@ pub struct SessionMigrate {
     migrate_temp_tables: bool,
     /// Maximum sessions to track
     max_sessions: usize,
-    /// Optional backend-connection template. Host/port swapped to the
-    /// target node at migration time. When `None`, `execute_statement`
-    /// and `migrate_temp_table` take the skeleton path.
-    backend_template: Option<crate::backend::BackendConfig>,
-    /// Per-node endpoints for resolving `target_node` → host:port.
-    endpoints: Arc<RwLock<HashMap<NodeId, NodeEndpoint>>>,
 }
 
 impl SessionMigrate {
@@ -267,8 +348,6 @@ impl SessionMigrate {
             enabled: true,
             migrate_temp_tables: false, // Disabled by default (expensive)
             max_sessions: 10000,
-            backend_template: None,
-            endpoints: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -276,27 +355,6 @@ impl SessionMigrate {
     pub fn with_max_sessions(mut self, max: usize) -> Self {
         self.max_sessions = max;
         self
-    }
-
-    /// Attach a backend-connection template so session migration can
-    /// run `SET`, `PREPARE`, and `CREATE TEMP TABLE` against the target.
-    pub fn with_backend_template(mut self, template: crate::backend::BackendConfig) -> Self {
-        self.backend_template = Some(template);
-        self
-    }
-
-    /// Register an endpoint for a node.
-    pub async fn register_endpoint(&self, node_id: NodeId, endpoint: NodeEndpoint) {
-        self.endpoints.write().await.insert(node_id, endpoint);
-    }
-
-    fn build_config(&self, endpoint: &NodeEndpoint) -> Option<crate::backend::BackendConfig> {
-        self.backend_template.as_ref().map(|t| {
-            let mut c = t.clone();
-            c.host = endpoint.host.clone();
-            c.port = endpoint.port;
-            c
-        })
     }
 
     /// Enable/disable temp table migration
@@ -408,57 +466,88 @@ impl SessionMigrate {
         tracing::debug!("Closed session {:?}", session_id);
     }
 
-    /// Migrate session to a new node
+    /// Restore the saved session `session_id` on `client`, the connection
+    /// the session continues on at `target_node` after a failover: its
+    /// parameters ([`SessionState::parameter_restore_statements`]), its
+    /// prepared statements, then (with temp-table migration enabled) the
+    /// schema of each temp table ([`temp_table_restore_statement`]), run
+    /// in that order. Session state lives on a connection, so it is
+    /// restored on the caller's connection, never on one of its own.
+    ///
+    /// `Err`, before anything is sent, when migration is disabled, the
+    /// session is unknown, or its temp tables cannot be carried over:
+    /// temp-table migration is disabled, or a table holds rows (they died
+    /// with the failed node and are not recreated). A statement the
+    /// backend refuses stops the migration and is reported in the result
+    /// (`success: false`, `error`); `client` then holds a partial session
+    /// and must be discarded, and the session keeps its original node.
     pub async fn migrate_session(
         &self,
         session_id: Uuid,
         target_node: NodeId,
+        client: &mut BackendClient,
     ) -> Result<SessionMigrateResult> {
         let start = std::time::Instant::now();
 
+        if !self.enabled {
+            return Err(ProxyError::SessionMigration(
+                "session migration is disabled".to_string(),
+            ));
+        }
         let session = self.get_session(&session_id).await.ok_or_else(|| {
             ProxyError::SessionMigration(format!("Session {:?} not found", session_id))
         })?;
+        self.check_temp_tables(&session)?;
 
-        // Generate restore statements
-        let statements = session.generate_restore_statements();
+        let parameters = session.parameter_restore_statements();
+        let prepared = session.prepared_restore_statements();
+        let temp_tables: Vec<String> = if self.migrate_temp_tables {
+            session
+                .temp_tables
+                .iter()
+                .map(temp_table_restore_statement)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        // Execute SET statements
-        let mut parameters_restored = 0;
-        let mut prepared_statements_restored = 0;
-
-        for stmt in &statements {
-            match self.execute_statement(target_node, stmt).await {
-                Ok(()) => {
-                    if stmt.starts_with("SET ") {
-                        parameters_restored += 1;
-                    } else if stmt.starts_with("PREPARE ") {
-                        prepared_statements_restored += 1;
-                    }
+        let mut counts = [0usize; 3];
+        let mut failure = None;
+        'restore: for (kind, statements) in [&parameters, &prepared, &temp_tables]
+            .into_iter()
+            .enumerate()
+        {
+            for stmt in statements {
+                if let Err(e) = client.execute(stmt).await {
+                    failure = Some(format!("{}: {}", stmt, e));
+                    break 'restore;
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to execute restore statement: {} - {}", stmt, e);
-                }
+                counts[kind] += 1;
             }
         }
+        let [parameters_restored, prepared_statements_restored, temp_tables_migrated] = counts;
+        let duration_ms = start.elapsed().as_millis() as u64;
 
-        // Migrate temp tables if enabled
-        let mut temp_tables_migrated = 0;
-        let mut temp_tables_failed = 0;
-
-        if self.migrate_temp_tables {
-            for table in &session.temp_tables {
-                match self.migrate_temp_table(target_node, table).await {
-                    Ok(()) => temp_tables_migrated += 1,
-                    Err(e) => {
-                        temp_tables_failed += 1;
-                        tracing::warn!("Failed to migrate temp table {}: {}", table.name, e);
-                    }
-                }
-            }
+        if let Some(error) = failure {
+            tracing::error!(
+                "Failed to migrate session {:?} to node {:?}: {}",
+                session_id,
+                target_node,
+                error
+            );
+            return Ok(SessionMigrateResult {
+                session_id,
+                success: false,
+                target_node,
+                parameters_restored,
+                prepared_statements_restored,
+                temp_tables_migrated,
+                temp_tables_failed: temp_tables.len() - temp_tables_migrated,
+                duration_ms,
+                error: Some(error),
+            });
         }
 
-        // Update session's node
         {
             let mut sessions = self.sessions.write().await;
             if let Some(s) = sessions.get_mut(&session_id) {
@@ -467,14 +556,13 @@ impl SessionMigrate {
             }
         }
 
-        let duration_ms = start.elapsed().as_millis() as u64;
-
         tracing::info!(
-            "Migrated session {:?} to node {:?}: {} params, {} prepared, {}ms",
+            "Migrated session {:?} to node {:?}: {} params, {} prepared, {} temp tables, {}ms",
             session_id,
             target_node,
             parameters_restored,
             prepared_statements_restored,
+            temp_tables_migrated,
             duration_ms
         );
 
@@ -485,99 +573,41 @@ impl SessionMigrate {
             parameters_restored,
             prepared_statements_restored,
             temp_tables_migrated,
-            temp_tables_failed,
+            temp_tables_failed: 0,
             duration_ms,
             error: None,
         })
     }
 
-    /// Execute a statement on the target node.
-    ///
-    /// Used to replay `SET <var> = <val>` and `PREPARE <name> AS <sql>`
-    /// statements generated by `SessionState::generate_restore_statements()`.
-    /// When no backend template / endpoint is configured, returns
-    /// `Ok(())` after a short delay — skeleton path.
-    async fn execute_statement(&self, node: NodeId, stmt: &str) -> Result<()> {
-        let endpoint = self.endpoints.read().await.get(&node).cloned();
-        let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
-            Some(c) => c,
-            None => {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                return Ok(());
-            }
+    /// Refuse a migration that would silently lose temp tables: with
+    /// temp-table migration disabled any temp table is lost, and a table
+    /// holding rows cannot be recreated faithfully (only its schema can;
+    /// the rows lived on the failed node — journal writes into it and use
+    /// failover replay instead).
+    fn check_temp_tables(&self, session: &SessionState) -> Result<()> {
+        let names = |tables: Vec<&TempTableInfo>| {
+            tables
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-
-        let mut client = crate::backend::BackendClient::connect(&cfg)
-            .await
-            .map_err(|e| ProxyError::SessionMigration(format!("connect: {}", e)))?;
-        let outcome = client.execute(stmt).await;
-        client.close().await;
-        outcome
-            .map(|_| ())
-            .map_err(|e| ProxyError::SessionMigration(format!("execute: {}", e)))
-    }
-
-    /// Migrate a temp table's schema to the target.
-    ///
-    /// Emits a single `CREATE TEMP TABLE IF NOT EXISTS` so subsequent
-    /// queries against the table name succeed. Data migration (`has_data`)
-    /// is deliberately NOT performed: the source is by definition the
-    /// dead primary, and resurrecting its uncommitted data is unsafe.
-    /// Callers that need data migration should journal writes into the
-    /// temp table and use failover replay (T0-TR5) instead.
-    async fn migrate_temp_table(&self, node: NodeId, table: &TempTableInfo) -> Result<()> {
-        let endpoint = self.endpoints.read().await.get(&node).cloned();
-        let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
-            Some(c) => c,
-            None => {
-                tracing::debug!(
-                    table = %table.name,
-                    "migrate_temp_table: skeleton path (no backend template)"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                return Ok(());
-            }
-        };
-
-        // Build a best-effort CREATE TEMP TABLE statement from the
-        // recorded schema. Column types are copied verbatim from the
-        // journal; callers are responsible for ensuring those names are
-        // PG-valid.
-        let mut stmt = String::with_capacity(64 + table.name.len());
-        stmt.push_str("CREATE TEMP TABLE IF NOT EXISTS ");
-        stmt.push_str(&quote_session_ident(&table.name));
-        stmt.push_str(" (");
-        for (i, col) in table.columns.iter().enumerate() {
-            if i > 0 {
-                stmt.push_str(", ");
-            }
-            stmt.push_str(&quote_session_ident(&col.name));
-            stmt.push(' ');
-            stmt.push_str(&col.data_type);
-            if !col.nullable {
-                stmt.push_str(" NOT NULL");
-            }
-            if let Some(default) = &col.default_expr {
-                stmt.push_str(" DEFAULT ");
-                stmt.push_str(default);
-            }
+        if !self.migrate_temp_tables && !session.temp_tables.is_empty() {
+            return Err(ProxyError::SessionMigration(format!(
+                "session {:?} has temp tables ({}) and temp-table migration is disabled",
+                session.session_id,
+                names(session.temp_tables.iter().collect())
+            )));
         }
-        stmt.push(')');
-
-        let mut client = crate::backend::BackendClient::connect(&cfg)
-            .await
-            .map_err(|e| ProxyError::SessionMigration(format!("connect: {}", e)))?;
-        let outcome = client.execute(&stmt).await;
-        client.close().await;
-        outcome
-            .map(|_| ())
-            .map_err(|e| ProxyError::SessionMigration(format!("create temp table: {}", e)))?;
-
-        if table.has_data {
-            tracing::warn!(
-                table = %table.name,
-                "temp table has data but migration intentionally does not copy it — route writes through the journal and use failover replay"
-            );
+        let with_rows: Vec<&TempTableInfo> =
+            session.temp_tables.iter().filter(|t| t.has_data).collect();
+        if !with_rows.is_empty() {
+            return Err(ProxyError::SessionMigration(format!(
+                "session {:?} temp tables ({}) hold rows that cannot be migrated from the \
+                 failed node; only their schema could be recreated",
+                session.session_id,
+                names(with_rows)
+            )));
         }
         Ok(())
     }
@@ -679,7 +709,90 @@ mod tests {
         let statements = state.generate_restore_statements();
 
         assert!(statements.iter().any(|s| s.contains("timezone")));
-        assert!(statements.iter().any(|s| s.contains("PREPARE my_query")));
+        assert!(statements
+            .iter()
+            .any(|s| s == "PREPARE my_query (integer) AS SELECT * FROM users WHERE id = $1"));
+    }
+
+    /// Parameter values and names are SQL literals, so list values, dotted
+    /// custom names, quotes and backslashes reach the target unchanged.
+    #[test]
+    fn test_parameter_restore_statements_quote_values() {
+        let mut state = SessionState::new(
+            Uuid::new_v4(),
+            "user".to_string(),
+            "db".to_string(),
+            NodeId::new(),
+        );
+        state.set_parameter("search_path".to_string(), "\"$user\", public".to_string());
+        state.set_parameter("application_name".to_string(), "o'brien".to_string());
+        state.set_parameter("myapp.tenant".to_string(), "a\\b".to_string());
+
+        let statements = state.parameter_restore_statements();
+        assert_eq!(
+            statements[0],
+            "SELECT pg_catalog.set_config('timezone', 'UTC', false)"
+        );
+        assert!(statements.contains(
+            &"SELECT pg_catalog.set_config('search_path', '\"$user\", public', false)".to_string()
+        ));
+        assert!(statements.contains(
+            &"SELECT pg_catalog.set_config('application_name', 'o''brien', false)".to_string()
+        ));
+        assert!(statements.contains(
+            &"SELECT pg_catalog.set_config('myapp.tenant', E'a\\\\b', false)".to_string()
+        ));
+        assert_eq!(statements.len(), 7);
+    }
+
+    /// A prepared-statement name that PostgreSQL would fold or reject
+    /// unquoted is quoted, so the recorded name is recreated exactly.
+    #[test]
+    fn test_prepared_restore_statements_quote_unusual_names() {
+        let mut state = SessionState::new(
+            Uuid::new_v4(),
+            "user".to_string(),
+            "db".to_string(),
+            NodeId::new(),
+        );
+        state.add_prepared_statement(PreparedStatementInfo {
+            name: "S_1".to_string(),
+            query: "SELECT 1".to_string(),
+            param_types: vec![],
+            created_at: chrono::Utc::now(),
+        });
+        assert_eq!(
+            state.prepared_restore_statements(),
+            vec!["PREPARE \"S_1\" AS SELECT 1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_temp_table_restore_statement() {
+        let table = TempTableInfo {
+            name: "scratch".to_string(),
+            schema: "pg_temp_3".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: "integer".to_string(),
+                    nullable: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "note".to_string(),
+                    data_type: "text".to_string(),
+                    nullable: true,
+                    default_expr: Some("'x'".to_string()),
+                },
+            ],
+            has_data: false,
+            row_count: None,
+        };
+        assert_eq!(
+            temp_table_restore_statement(&table),
+            "CREATE TEMP TABLE IF NOT EXISTS \"scratch\" (\"id\" integer NOT NULL, \"note\" text DEFAULT 'x')"
+        );
     }
 
     #[tokio::test]
@@ -724,24 +837,166 @@ mod tests {
         assert_eq!(session.timezone, "Europe/London");
     }
 
+    use crate::backend::BackendClient;
+    use crate::upgrade_orchestrator::test_backend::{Reply, ScriptedPg};
+
+    fn temp_table(name: &str, has_data: bool) -> TempTableInfo {
+        TempTableInfo {
+            name: name.to_string(),
+            schema: "pg_temp_3".to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: "integer".to_string(),
+                nullable: true,
+                default_expr: None,
+            }],
+            has_data,
+            row_count: None,
+        }
+    }
+
+    /// A fake backend accepting everything except statements containing
+    /// `refuse`, and a client connected to it.
+    async fn backend(refuse: &'static str) -> (ScriptedPg, BackendClient) {
+        let pg = ScriptedPg::spawn(move |q| {
+            if q.contains(refuse) {
+                Reply::Error(format!("refused: {q}"))
+            } else {
+                Reply::Command("OK")
+            }
+        })
+        .await;
+        let client = BackendClient::connect(&pg.config()).await.unwrap();
+        (pg, client)
+    }
+
     #[tokio::test]
-    async fn test_migrate_session() {
-        let migrate = SessionMigrate::new();
+    async fn test_migrate_session_restores_on_the_given_connection() {
+        let migrate = SessionMigrate::new().with_temp_table_migration(true);
         let session_id = Uuid::new_v4();
-        let state = SessionState::new(
+        let mut state = SessionState::new(
             session_id,
             "user".to_string(),
             "db".to_string(),
             NodeId::new(),
         );
-
+        state.add_prepared_statement(PreparedStatementInfo {
+            name: "q".to_string(),
+            query: "SELECT 1".to_string(),
+            param_types: vec![],
+            created_at: chrono::Utc::now(),
+        });
+        state.add_temp_table(temp_table("scratch", false));
         migrate.register_session(state).await.unwrap();
 
+        let (pg, mut client) = backend("never").await;
         let target = NodeId::new();
-        let result = migrate.migrate_session(session_id, target).await.unwrap();
+        let result = migrate
+            .migrate_session(session_id, target, &mut client)
+            .await
+            .unwrap();
 
-        assert!(result.success);
-        assert!(result.parameters_restored > 0);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.parameters_restored, 5);
+        assert_eq!(result.prepared_statements_restored, 1);
+        assert_eq!(result.temp_tables_migrated, 1);
+        assert_eq!(result.temp_tables_failed, 0);
+        let seen = pg.seen();
+        assert_eq!(seen.len(), 7);
+        assert!(seen[0].starts_with("SELECT pg_catalog.set_config('timezone'"));
+        assert_eq!(seen[5], "PREPARE q AS SELECT 1");
+        assert!(seen[6].starts_with("CREATE TEMP TABLE IF NOT EXISTS \"scratch\""));
+        // The session now lives on the target node.
+        let session = migrate.get_session(&session_id).await.unwrap();
+        assert_eq!(session.original_node, target);
+        client.close().await;
+    }
+
+    /// A statement the target refuses stops the migration: the result
+    /// reports the failure and the session keeps its original node.
+    #[tokio::test]
+    async fn test_migrate_session_reports_a_refused_statement() {
+        let migrate = SessionMigrate::new().with_temp_table_migration(true);
+        let session_id = Uuid::new_v4();
+        let origin = NodeId::new();
+        let mut state = SessionState::new(session_id, "user".to_string(), "db".to_string(), origin);
+        state.set_parameter("work_mem".to_string(), "bogus".to_string());
+        state.add_temp_table(temp_table("scratch", false));
+        migrate.register_session(state).await.unwrap();
+
+        let (pg, mut client) = backend("work_mem").await;
+        let result = migrate
+            .migrate_session(session_id, NodeId::new(), &mut client)
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("refused"));
+        assert_eq!(result.parameters_restored, 5);
+        assert_eq!(result.temp_tables_migrated, 0);
+        assert_eq!(result.temp_tables_failed, 1);
+        // Nothing ran after the refusal.
+        assert_eq!(pg.seen().len(), 6);
+        let session = migrate.get_session(&session_id).await.unwrap();
+        assert_eq!(session.original_node, origin);
+        client.close().await;
+    }
+
+    /// Temp tables that cannot be carried over refuse the migration before
+    /// anything is sent: with temp-table migration disabled, and for a
+    /// table holding rows.
+    #[tokio::test]
+    async fn test_migrate_session_refuses_to_lose_temp_tables() {
+        let session_id = Uuid::new_v4();
+        let mut state = SessionState::new(
+            session_id,
+            "user".to_string(),
+            "db".to_string(),
+            NodeId::new(),
+        );
+        state.add_temp_table(temp_table("scratch", false));
+        let disabled = SessionMigrate::new();
+        disabled.register_session(state.clone()).await.unwrap();
+        let (pg, mut client) = backend("never").await;
+        let err = disabled
+            .migrate_session(session_id, NodeId::new(), &mut client)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("temp-table migration is disabled"),
+            "{err}"
+        );
+
+        state.add_temp_table(temp_table("filled", true));
+        let enabled = SessionMigrate::new().with_temp_table_migration(true);
+        enabled.register_session(state).await.unwrap();
+        let err = enabled
+            .migrate_session(session_id, NodeId::new(), &mut client)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("filled"), "{err}");
+        assert!(err.to_string().contains("hold rows"), "{err}");
+        assert!(pg.seen().is_empty());
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_migrate_session_disabled_or_unknown_fails() {
+        let (pg, mut client) = backend("never").await;
+        let mut migrate = SessionMigrate::new();
+        let err = migrate
+            .migrate_session(Uuid::new_v4(), NodeId::new(), &mut client)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        migrate.set_enabled(false);
+        let err = migrate
+            .migrate_session(Uuid::new_v4(), NodeId::new(), &mut client)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("disabled"), "{err}");
+        assert!(pg.seen().is_empty());
+        client.close().await;
     }
 
     #[tokio::test]

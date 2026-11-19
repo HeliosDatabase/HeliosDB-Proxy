@@ -111,6 +111,14 @@ function_call = "large-objects"
 # Seconds to wait for a new primary during failover before returning an error.
 write_timeout_secs = 30
 
+# Bound of the SIGTERM / SIGINT shutdown drain and the SIGUSR2 binary-handoff
+# drain (env override HELIOS_DRAIN_TIMEOUT_SECS). Listeners close, /health/ready
+# answers 503, and each session ends with FATAL 57P01 once nothing of it is in
+# flight; at the timeout what is still open is cut. Keep the supervisor's stop
+# grace period (docker stop -t, terminationGracePeriodSeconds, TimeoutStopSec)
+# longer than this.
+# shutdown_drain_timeout_secs = 60
+
 # =============================================================================
 # LIMITS — Operational safety bounds & timeouts (PG-wire data path)
 # =============================================================================
@@ -556,72 +564,31 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # RATE LIMIT — Query rate and concurrency limiting
 # =============================================================================
 
+# Only these keys exist (`RateLimitToml` in src/config.rs). Needs the
+# rate-limiting feature. Every request costs 1; there are no tenant, cost or
+# priority keys.
 # [rate_limit]
-# enabled             = true
-# default_qps         = 1000          # Default queries per second per key
-# default_burst       = 2000          # Token bucket burst capacity
-# default_concurrency = 100           # Max concurrent queries per key
-#
-# # Action when limit exceeded: reject | warn | queue(5s) | throttle(100ms)
-# exceeded_action     = "reject"
-# retry_after         = true          # Include Retry-After header in errors
-#
-# # Limit scopes
-# user_limits_enabled      = true
-# database_limits_enabled  = true
-# client_ip_limits_enabled = true
-# pattern_limits_enabled   = false    # Per-query-pattern limiting
-#
-# # Overflow queue settings
-# queue_max_wait_secs = 5
-# queue_size          = 1000
-#
-# # Throttle writes when replication lag exceeds this threshold.
-# replication_throttle_threshold_secs = 5
-#
-# # Cost-based estimation (weight expensive queries higher).
-# cost_estimation_enabled = true
-#
-# # Priority multipliers — higher-priority callers get proportionally more QPS.
-# [rate_limit.priority]
-# low      = 0.5
-# normal   = 1.0
-# high     = 2.0
-# critical = 10.0
+# enabled               = true
+# default_qps           = 1000     # token-bucket rate per bucket, enforced as configured
+# default_burst         = 2000     # bucket depth
+# max_concurrent        = 0        # >0: requests in flight per bucket; above it 53400
+# key_by                = "user"   # user | client_ip | database | global
+# window_max_requests   = 0        # >0: optional sliding window: at most this many
+# window_secs           = 60       #     requests per bucket within window_secs
+# cleanup_interval_secs = 60       # idle buckets dropped this often (bounds memory)
 
 # =============================================================================
 # CIRCUIT BREAKER — Per-node failure detection and recovery
 # =============================================================================
 
+# Only these keys exist (`CircuitBreakerToml`). Needs the circuit-breaker
+# feature. Faults are counted in a 30 s window; the adaptive threshold is not
+# configurable.
 # [circuit_breaker]
-# failure_threshold          = 5     # Failures in window to trip breaker
-# failure_window_secs        = 30    # Sliding failure window
-# cooldown_secs              = 10    # Time in open state before half-open probe
-# half_open_success_threshold = 3    # Successes in half-open to close breaker
-# half_open_max_probes       = 2     # Concurrent probes in half-open
-# adaptive_enabled           = false # Adaptive thresholds based on history
-#
-# # Failure conditions
-# [circuit_breaker.failure_conditions]
-# timeout_secs           = 5
-# slow_threshold_secs    = 2        # Slow responses count as failures
-# ignore_transient       = true     # Ignore retryable errors
-# count_connection_errors = true
-# count_timeouts         = true
-# error_codes            = [
-#     "08001", "08004", "08006",    # Connection failures
-#     "57P01", "57P02", "57P03",    # Server shutdown / crash
-#     "XX000", "XX001", "XX002",    # Internal / corruption
-# ]
-#
-# # Sync mode-specific thresholds (tighter for sync standbys).
-# [circuit_breaker.sync_modes]
-# sync_threshold     = 3
-# sync_cooldown_secs = 5
-# semisync_threshold     = 5
-# semisync_cooldown_secs = 10
-# async_threshold        = 10
-# async_cooldown_secs    = 30
+# enabled           = true
+# failure_threshold = 5    # faults in the window that open a node's circuit
+# open_secs         = 10   # then requests are admitted as half-open probes (<= 2 at once)
+# success_threshold = 3    # successful probes that close it; a failed probe reopens it
 
 # =============================================================================
 # ANALYTICS — Query analytics, slow query log, and pattern detection
@@ -724,7 +691,10 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # tenants = ["acme", "widgetco"]
 # tenant_column = "tenant_id"
 # tenant_tables = ["orders", "products"]
-# unknown_tenant = "refuse"
+# unknown_tenant = "refuse"         # "passthrough" keeps 2.2 behaviour
+# refused_functions = ["dblink", "dblink_exec", "lo_import", "lo_export", "pg_read_file"]
+#                                   # default: the XML exports, dblink*, lo_import/lo_export,
+#                                   # pg_read_file, pg_read_binary_file (see docs)
 # max_clients_per_tenant = 20
 # max_active_queries_per_tenant = 4
 # active_query_wait_ms = 5000

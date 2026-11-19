@@ -1,8 +1,8 @@
 //! Multi-tier cache implementations
 //!
-//! L1: Hot cache (in-memory, <100μs)
-//! L2: Warm cache (SSD, <1ms)
-//! L3: Distributed cache (mesh, <10ms)
+//! L1: Hot cache (in-memory, uncompressed)
+//! L2: Warm cache (in-memory, compressed; nothing is written to disk)
+//! L3: Distributed cache (peer mesh over TCP)
 
 mod l1_hot;
 mod l2_warm;
@@ -10,7 +10,7 @@ mod l3_distributed;
 
 pub use l1_hot::HotCache;
 pub use l2_warm::WarmCache;
-pub use l3_distributed::DistributedCache;
+pub use l3_distributed::{DistributedCache, PeerOpReport, ReplicationReport};
 
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 pub enum CacheTier {
     /// L1: In-memory hot cache
     L1,
-    /// L2: SSD warm cache
+    /// L2: In-memory compressed warm cache
     L2,
     /// L3: Distributed mesh cache
     L3,
@@ -34,9 +34,7 @@ pub enum EvictionPolicy {
     /// Least Frequently Used
     #[default]
     LFU,
-    /// Adaptive (switches between LRU and LFU based on access patterns)
-    Adaptive,
-    /// Time-based (oldest entries first)
+    /// First In, First Out (oldest insertion first)
     FIFO,
 }
 
@@ -105,23 +103,9 @@ impl CacheKey {
         self
     }
 
-    /// Get table name from the key (if available)
-    pub fn table(&self) -> &str {
-        "unknown"
-    }
-
-    /// Get the fingerprint for metrics
-    pub fn fingerprint(&self) -> super::QueryFingerprint {
-        super::QueryFingerprint {
-            template: format!("{:x}", self.fingerprint_hash),
-            tables: Vec::new(),
-            param_hash: self.param_hash,
-        }
-    }
-
-    /// Check if key matches a pattern
+    /// Whether `pattern` contains this key's fingerprint hash in lowercase
+    /// hex (a substring test, not a glob or regex).
     pub fn matches_pattern(&self, pattern: &str) -> bool {
-        // Simple pattern matching for invalidation
         pattern.contains(&format!("{:x}", self.fingerprint_hash))
     }
 
@@ -293,6 +277,10 @@ impl LFUEviction {
         self.counts.remove(&key_hash);
     }
 
+    pub fn clear(&self) {
+        self.counts.clear();
+    }
+
     pub fn evict_one(&self) -> Option<u64> {
         // Find entry with minimum frequency
         let mut min_key = None;
@@ -338,7 +326,11 @@ mod tests {
 
         assert!(!entry.is_expired());
 
-        // For actual expiration test we'd need to wait or mock time
+        // Backdate the entry past its TTL.
+        let mut expired = entry.clone();
+        expired.created_at -= 5;
+        assert!(expired.is_expired());
+        assert_eq!(expired.remaining_ttl(), Duration::ZERO);
     }
 
     #[test]

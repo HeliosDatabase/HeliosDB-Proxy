@@ -1,9 +1,9 @@
-//! L1 Hot Cache - In-memory cache with <100μs access time
+//! L1 Hot Cache - uncompressed in-memory cache
 //!
 //! Features:
-//! - LRU/LFU eviction with frequency aging
-//! - Per-session affinity for connection locality
-//! - Automatic size management
+//! - LFU, LRU or FIFO eviction ([`EvictionPolicy`])
+//! - Size-bounded (total bytes and per-entry bytes)
+//! - Table index for invalidation
 
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -11,9 +11,18 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::{CacheEntry, EvictionPolicy, LFUEviction, TierStats};
-use crate::distribcache::{QueryFingerprint, SessionId};
+use crate::distribcache::{CacheError, CacheResult, QueryFingerprint};
 
-/// L1 Hot Cache - In-memory with LRU/LFU eviction
+/// Insertion and last-access sequence numbers of one entry, from the cache's
+/// logical clock. FIFO evicts the smallest `inserted`, LRU the smallest
+/// `last_access`.
+#[derive(Debug, Clone, Copy)]
+struct AccessOrder {
+    inserted: u64,
+    last_access: u64,
+}
+
+/// L1 Hot Cache - in-memory with LFU, LRU or FIFO eviction
 pub struct HotCache {
     /// Main cache storage
     cache: DashMap<u64, CacheEntry>,
@@ -21,8 +30,11 @@ pub struct HotCache {
     /// LFU eviction tracker
     eviction: Arc<LFUEviction>,
 
-    /// Per-session affinity tracking
-    session_affinity: DashMap<SessionId, HashSet<u64>>,
+    /// Insertion / access order for LRU and FIFO eviction
+    order: DashMap<u64, AccessOrder>,
+
+    /// Logical clock for `order`
+    clock: AtomicU64,
 
     /// Table to key index for invalidation
     table_index: DashMap<String, HashSet<u64>>,
@@ -51,7 +63,8 @@ impl HotCache {
         Self {
             cache: DashMap::new(),
             eviction: Arc::new(LFUEviction::new()),
-            session_affinity: DashMap::new(),
+            order: DashMap::new(),
+            clock: AtomicU64::new(0),
             table_index: DashMap::new(),
             current_size: AtomicUsize::new(0),
             max_size,
@@ -63,8 +76,12 @@ impl HotCache {
         }
     }
 
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Get an entry from the cache
-    pub fn get(&self, fingerprint: &QueryFingerprint, _session: SessionId) -> Option<CacheEntry> {
+    pub fn get(&self, fingerprint: &QueryFingerprint) -> Option<CacheEntry> {
         let key = self.fingerprint_to_hash(fingerprint);
 
         if let Some(mut entry) = self.cache.get_mut(&key) {
@@ -76,9 +93,13 @@ impl HotCache {
                 return None;
             }
 
-            // Update access count for LFU
+            // Update access count for LFU and access order for LRU
             entry.access_count += 1;
             self.eviction.touch(key);
+            let now = self.tick();
+            if let Some(mut order) = self.order.get_mut(&key) {
+                order.last_access = now;
+            }
             self.hits.fetch_add(1, Ordering::Relaxed);
 
             Some(entry.clone())
@@ -88,18 +109,16 @@ impl HotCache {
         }
     }
 
-    /// Insert an entry into the cache
-    pub fn insert(
-        &self,
-        fingerprint: QueryFingerprint,
-        entry: CacheEntry,
-        session: Option<SessionId>,
-    ) {
+    /// Insert an entry into the cache.
+    ///
+    /// Fails with [`CacheError::TooLarge`] when the entry exceeds the
+    /// per-entry or total size limit; nothing is stored then.
+    pub fn insert(&self, fingerprint: QueryFingerprint, entry: CacheEntry) -> CacheResult<()> {
         let entry_size = entry.size();
 
-        // Skip if entry is too large
-        if entry_size > self.max_entry_size {
-            return;
+        let limit = self.max_entry_size.min(self.max_size);
+        if entry_size > limit {
+            return Err(CacheError::TooLarge(entry_size, limit));
         }
 
         let key = self.fingerprint_to_hash(&fingerprint);
@@ -112,11 +131,7 @@ impl HotCache {
         }
 
         // Remove old entry if exists
-        if let Some((_, old_entry)) = self.cache.remove(&key) {
-            self.current_size
-                .fetch_sub(old_entry.size(), Ordering::Relaxed);
-            self.eviction.remove(key);
-        }
+        self.remove_entry(key);
 
         // Index by tables for invalidation
         for table in &entry.tables {
@@ -126,15 +141,27 @@ impl HotCache {
                 .insert(key);
         }
 
-        // Track session affinity
-        if let Some(sid) = session {
-            self.session_affinity.entry(sid).or_default().insert(key);
-        }
-
         // Insert entry
         self.cache.insert(key, entry);
         self.current_size.fetch_add(entry_size, Ordering::Relaxed);
         self.eviction.insert(key);
+        let now = self.tick();
+        self.order.insert(
+            key,
+            AccessOrder {
+                inserted: now,
+                last_access: now,
+            },
+        );
+        Ok(())
+    }
+
+    /// Key with the smallest order value under `pick`, if any.
+    fn oldest_by(&self, pick: impl Fn(&AccessOrder) -> u64) -> Option<u64> {
+        self.order
+            .iter()
+            .min_by_key(|e| pick(e.value()))
+            .map(|e| *e.key())
     }
 
     /// Invalidate entries for a table
@@ -157,6 +184,7 @@ impl HotCache {
         if let Some((_, entry)) = self.cache.remove(&key) {
             self.current_size.fetch_sub(entry.size(), Ordering::Relaxed);
             self.eviction.remove(key);
+            self.order.remove(&key);
 
             // Clean up table index
             for table in &entry.tables {
@@ -169,36 +197,19 @@ impl HotCache {
 
     /// Evict one entry based on policy
     fn evict_one(&self) -> bool {
-        match self.policy {
-            EvictionPolicy::LFU | EvictionPolicy::Adaptive => {
-                if let Some(key) = self.eviction.evict_one() {
-                    self.remove_entry(key);
-                    self.evictions.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
+        let victim = match self.policy {
+            EvictionPolicy::LFU => self.eviction.evict_one(),
+            EvictionPolicy::LRU => self.oldest_by(|o| o.last_access),
+            EvictionPolicy::FIFO => self.oldest_by(|o| o.inserted),
+        };
+        match victim {
+            Some(key) => {
+                self.remove_entry(key);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                true
             }
-            EvictionPolicy::LRU => {
-                // Find oldest entry (simplified - would need timestamp tracking)
-                if let Some(entry) = self.cache.iter().next() {
-                    let key = *entry.key();
-                    drop(entry);
-                    self.remove_entry(key);
-                    self.evictions.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-            }
-            EvictionPolicy::FIFO => {
-                // Same as LRU for simplicity
-                if let Some(entry) = self.cache.iter().next() {
-                    let key = *entry.key();
-                    drop(entry);
-                    self.remove_entry(key);
-                    self.evictions.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-            }
+            None => false,
         }
-        false
     }
 
     /// Convert fingerprint to hash key
@@ -233,7 +244,8 @@ impl HotCache {
     pub fn clear(&self) {
         self.cache.clear();
         self.table_index.clear();
-        self.session_affinity.clear();
+        self.order.clear();
+        self.eviction.clear();
         self.current_size.store(0, Ordering::Relaxed);
     }
 
@@ -265,16 +277,19 @@ impl HotCache {
 mod tests {
     use super::*;
 
+    fn fp(table: &str) -> QueryFingerprint {
+        QueryFingerprint::from_query(&format!("SELECT * FROM {}", table))
+    }
+
     #[test]
     fn test_hot_cache_insert_get() {
         let cache = HotCache::new(1024 * 1024, 1024, EvictionPolicy::LFU);
         let fp = QueryFingerprint::from_query("SELECT * FROM users");
-        let session = SessionId::new("sess-1");
 
         let entry = CacheEntry::new(vec![1, 2, 3], vec!["users".to_string()], 1);
-        cache.insert(fp.clone(), entry, Some(session.clone()));
+        cache.insert(fp.clone(), entry).unwrap();
 
-        let result = cache.get(&fp, session);
+        let result = cache.get(&fp);
         assert!(result.is_some());
         assert_eq!(result.unwrap().data, vec![1, 2, 3]);
     }
@@ -289,14 +304,66 @@ mod tests {
             "juliet",
         ];
         for name in &table_names {
-            let fp = QueryFingerprint::from_query(&format!("SELECT * FROM {}", name));
             let entry = CacheEntry::new(vec![0; 50], vec![], 1);
-            cache.insert(fp, entry, None);
+            cache.insert(fp(name), entry).unwrap();
         }
 
         // Should have evicted some entries
         assert!(cache.len() < 10);
         assert!(cache.stats().evictions > 0);
+    }
+
+    /// LRU evicts the entry whose last access is oldest, not an arbitrary one.
+    #[test]
+    fn test_lru_evicts_least_recently_used() {
+        // Each entry is 50 + 32 = 82 bytes; three fit in 250, a fourth does not.
+        let cache = HotCache::new(250, 100, EvictionPolicy::LRU);
+        for name in ["a", "b", "c"] {
+            cache
+                .insert(fp(name), CacheEntry::new(vec![0; 50], vec![], 1))
+                .unwrap();
+        }
+        // Touch "a" and "b": "c" is now the least recently used.
+        assert!(cache.get(&fp("a")).is_some());
+        assert!(cache.get(&fp("b")).is_some());
+
+        cache
+            .insert(fp("d"), CacheEntry::new(vec![0; 50], vec![], 1))
+            .unwrap();
+
+        assert!(
+            !cache.contains(&fp("c")),
+            "LRU must evict the untouched entry"
+        );
+        for name in ["a", "b", "d"] {
+            assert!(cache.contains(&fp(name)), "{name} was evicted");
+        }
+        assert_eq!(cache.stats().evictions, 1);
+    }
+
+    /// FIFO evicts the oldest insertion regardless of later accesses.
+    #[test]
+    fn test_fifo_evicts_oldest_insertion() {
+        let cache = HotCache::new(250, 100, EvictionPolicy::FIFO);
+        for name in ["a", "b", "c"] {
+            cache
+                .insert(fp(name), CacheEntry::new(vec![0; 50], vec![], 1))
+                .unwrap();
+        }
+        // Accesses do not matter for FIFO.
+        assert!(cache.get(&fp("a")).is_some());
+
+        cache
+            .insert(fp("d"), CacheEntry::new(vec![0; 50], vec![], 1))
+            .unwrap();
+
+        assert!(
+            !cache.contains(&fp("a")),
+            "FIFO must evict the first insertion"
+        );
+        for name in ["b", "c", "d"] {
+            assert!(cache.contains(&fp(name)), "{name} was evicted");
+        }
     }
 
     #[test]
@@ -306,16 +373,18 @@ mod tests {
         let fp1 = QueryFingerprint::from_query("SELECT * FROM users WHERE id = 1");
         let fp2 = QueryFingerprint::from_query("SELECT * FROM orders WHERE id = 1");
 
-        cache.insert(
-            fp1.clone(),
-            CacheEntry::new(vec![1], vec!["users".to_string()], 1),
-            None,
-        );
-        cache.insert(
-            fp2.clone(),
-            CacheEntry::new(vec![2], vec!["orders".to_string()], 1),
-            None,
-        );
+        cache
+            .insert(
+                fp1.clone(),
+                CacheEntry::new(vec![1], vec!["users".to_string()], 1),
+            )
+            .unwrap();
+        cache
+            .insert(
+                fp2.clone(),
+                CacheEntry::new(vec![2], vec!["orders".to_string()], 1),
+            )
+            .unwrap();
 
         assert_eq!(cache.len(), 2);
 
@@ -323,22 +392,23 @@ mod tests {
         cache.invalidate_by_table("users");
 
         assert_eq!(cache.len(), 1);
-        assert!(cache.get(&fp2, SessionId::new("")).is_some());
+        assert!(cache.get(&fp2).is_some());
     }
 
     #[test]
     fn test_hot_cache_stats() {
         let cache = HotCache::new(1024 * 1024, 1024, EvictionPolicy::LFU);
         let fp = QueryFingerprint::from_query("SELECT * FROM users");
-        let session = SessionId::new("test");
 
-        cache.insert(fp.clone(), CacheEntry::new(vec![1], vec![], 1), None);
+        cache
+            .insert(fp.clone(), CacheEntry::new(vec![1], vec![], 1))
+            .unwrap();
 
         // Hit
-        cache.get(&fp, session.clone());
+        cache.get(&fp);
         // Miss
         let fp2 = QueryFingerprint::from_query("SELECT * FROM orders");
-        cache.get(&fp2, session);
+        cache.get(&fp2);
 
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
@@ -346,14 +416,16 @@ mod tests {
         assert_eq!(stats.entry_count, 1);
     }
 
+    /// An oversized entry is rejected with an explicit error, not dropped
+    /// silently.
     #[test]
     fn test_max_entry_size() {
         let cache = HotCache::new(1024 * 1024, 100, EvictionPolicy::LFU);
 
-        // Entry larger than max should not be inserted
         let fp = QueryFingerprint::from_query("SELECT *");
         let large_entry = CacheEntry::new(vec![0; 200], vec![], 1);
-        cache.insert(fp.clone(), large_entry, None);
+        let err = cache.insert(fp.clone(), large_entry).unwrap_err();
+        assert!(matches!(err, CacheError::TooLarge(232, 100)), "got {err:?}");
 
         assert!(cache.is_empty());
     }

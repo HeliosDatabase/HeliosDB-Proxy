@@ -418,7 +418,11 @@ impl Stripped {
 
 /// Whether `b` holds the start of a comment, `--` or `/*`, anywhere (in a
 /// literal too): without one the lexer finds no comment.
-#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+#[cfg(any(
+    feature = "query-cache",
+    feature = "edge-proxy",
+    feature = "wasm-plugins"
+))]
 pub(crate) fn has_comment_marker(b: &[u8]) -> bool {
     holds_comment_start(b)
 }

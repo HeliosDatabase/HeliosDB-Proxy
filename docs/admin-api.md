@@ -109,7 +109,7 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `PUT` | `/admin/kv/{plugin}/{key}` | Set a plugin KV value (UTF-8 body; 413 on cap breach) | `wasm-plugins` | token |
 | `DELETE` | `/admin/kv/{plugin}/{key}` | Delete a plugin KV value (idempotent 200) | `wasm-plugins` | token |
 | `GET` | `/anomalies` | Anomaly-detector recent events (`?limit=N`) | `anomaly-detection` | token |
-| `GET` | `/analytics`, `/api/analytics` | Top queries + slow-query log (`?limit=N`) | `query-analytics` | token |
+| `GET` | `/analytics`, `/api/analytics` | Top queries by calls + the slow-query count (`?limit=N`) | `query-analytics` | token |
 | `GET` | `/api/cache/heatmap` | Per-table query-cache heatmap + recommendations (`{"enabled":false}` while off) | `query-cache` | token |
 | `GET` | `/api/mcp/cache` | MCP tool-result cache counters, totals and per-owner (principal, tenant) usage (`{"enabled":false}` while off) | `query-cache` | token |
 | `POST` | `/api/mcp/cache/clear` | Clear the MCP tool-result cache: `{}` all, or the owners `{"principal","tenant"}` select (503 while off) | `query-cache` | token |
@@ -386,13 +386,22 @@ Server metrics in JSON.
   "bytes_sent": 189234567,
   "failovers": 1,
   "startup_waits_total": 0,
-  "startup_wait_timeouts_total": 0
+  "startup_wait_timeouts_total": 0,
+  "copy_input_timeouts": 0,
+  "query_cache_context_bypassed": 0,
+  "sessions_drained": 0,
+  "draining": false
 }
 ```
 
 `startup_waits_total` and `startup_wait_timeouts_total` count client startups that
 waited for an eligible healthy node (`[limits] startup_node_wait_ms`) and the waits that
-expired. The other fields are as in the Prometheus table below.
+expired. `copy_input_timeouts` counts COPY inputs ended by `[limits]
+copy_idle_timeout_secs`, `query_cache_context_bypassed` cacheable reads not looked up
+because their session may have changed its execution context, and `sessions_drained`
+sessions ended by a shutdown or handoff drain; `draining` is `true` once a SIGTERM,
+SIGINT or SIGUSR2 drain has started. With the MCP memory tools on, `mcp_memory` carries
+their counters. The other fields are as in the Prometheus table below.
 
 `connections_active` is computed as `accepted − closed`. `connections_rejected`
 counts connections refused because the `[limits] max_client_connections` cap was
@@ -466,6 +475,22 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_tenant_idle_permit_timeouts_total` | counter | `tenant` | Sessions terminated by `[multi_tenancy] idle_permit_timeout_ms`. |
 | `heliosdb_proxy_tenant_replay_bytes`, `_replay_byte_limit` | gauge | `tenant` | Transaction-replay bytes the tenant's sessions hold now, and its budget (`[multi_tenancy] max_replay_bytes_per_tenant` / `tenant_max_replay_bytes`). Only tenants with a replay-byte budget appear in this and the next row. |
 | `heliosdb_proxy_tenant_replay_budget_refusals_total` | counter | `tenant` | Transactions marked non-replayable by the tenant's replay-byte budget. |
+| `heliosdb_proxy_tenant_journal_bytes`, `_journal_byte_limit` | gauge | `tenant` | Recovery-journal bytes the tenant holds now, and its budget (`[multi_tenancy] max_journal_bytes_per_tenant` / `tenant_max_journal_bytes`). Only tenants with a journal budget appear in this and the next row. |
+| `heliosdb_proxy_tenant_journal_budget_refusals_total` | counter | `tenant` | Recovery-journal reservations refused by the tenant's byte budget (the transaction is then marked incomplete for recovery). |
+| `heliosdb_proxy_sessions_drained_total` | counter | — | Sessions ended with FATAL `57P01` by a SIGTERM / SIGINT shutdown drain or a SIGUSR2 handoff drain. |
+| `heliosdb_proxy_copy_input_timeouts_total` | counter | — | `COPY FROM STDIN` inputs ended by `[limits] copy_idle_timeout_secs` (FATAL `57014`). |
+| `heliosdb_proxy_query_cache_context_bypassed_total` | counter | — | Cacheable reads the query cache did not look up because their session ran a statement that may change its execution context (a write, `SET`, `SET ROLE`, a function call, ...). |
+| `heliosdb_proxy_cache_scope_proofs_total`, `_scope_proofs_reused_total` | counter | — | Backend settings proofs (`SHOW ALL`) taken for result-cache reads, and reads that reused their connection's proof within `[cache] proof_ttl_ms`. |
+| `heliosdb_proxy_cache_gateway_write_invalidations_total` | counter | `gateway` = `http`, `mcp`, `graphql` | Writes through a gateway that retired cached reads. |
+| `heliosdb_proxy_branch_moves_total` | counter | — | Sessions moved to another branch database by a `branch=` hint or a route plugin's `branch` answer (`[branch] route_enabled`). |
+| `heliosdb_proxy_mcp_results_truncated_total` | counter | — | MCP tool results cut at `[mcp] max_result_rows` / `max_result_bytes`. |
+| `heliosdb_proxy_mcp_cache_hits_total`, `_misses_total`, `_stores_total`, `_stale_rejected_total`, `_expired_total`, `_fills_raced_total` | counter | — | MCP tool-result cache activity (`[mcp] tool_cache_enabled`). No principal or tenant labels. |
+| `heliosdb_proxy_mcp_cache_skipped_total` | counter | `reason` | Cacheable MCP calls not cached, by reason. |
+| `heliosdb_proxy_mcp_cache_evictions_total` | counter | `scope` = `principal`, `global` | Entries evicted to stay within the per-owner or overall bounds. |
+| `heliosdb_proxy_mcp_cache_entries`, `_retained_bytes`, `_owners` | gauge | — | Entries, bytes and owners the MCP tool-result cache holds. |
+| `heliosdb_proxy_mcp_memory_ops_total` | counter | `op` | MCP memory tool calls completed, by tool (`[mcp] memory_enabled`). |
+| `heliosdb_proxy_mcp_memory_refused_total` | counter | `reason` | MCP memory tool calls refused, by reason. |
+| `heliosdb_proxy_mcp_memory_entries_quota_hits_total` | counter | — | `memory_put` calls refused by `[mcp] memory_max_entries_per_owner`. |
 | `heliosdb_proxy_tenant_query_wait_seconds` | histogram | — | How long requests waited for a tenant active-query permit (only requests that waited; every wait, whether it ended admitted, refused, cancelled or abandoned). One series for all tenants, not labelled by tenant: its `_count` is the sum of `heliosdb_proxy_tenant_query_waits_total` over all tenants. |
 
 Histogram buckets are `[limits] latency_buckets_ms`, exported in seconds as `_bucket{le="…"}`,
@@ -482,7 +507,7 @@ tier is off; `query_cache.refresh_hint` and `query_cache.refresh_ahead` (`claims
 the server counters carry `cache_excluded`, `cache_catalog_skipped`,
 `cache_time_travel_skipped` and `cache_ambiguous_skipped`.
 
-> This is not directly scrapable as raw Prometheus text — the payload is JSON with the exposition string in `text`, so a scraper must unwrap the `text` field. This endpoint is served unconditionally; there is no separate build flag that changes its format (the `observability` feature only pulls in the `prometheus`/`opentelemetry` crates and wires no exporter — see the feature-flags reference).
+> This is not directly scrapable as raw Prometheus text — the payload is JSON with the exposition string in `text`, so a scraper must unwrap the `text` field. This endpoint is served unconditionally; there is no separate build flag that changes its format (the `observability` feature is a reserved no-op that pulls no dependency — see the feature-flags reference).
 
 ### GET /sessions
 
@@ -497,7 +522,7 @@ Per-node connection pool statistics (active/idle/pending, lifetime created/close
 ### GET /version
 
 ```json
-{ "version": "1.5.0", "build_time": "1.5.0" }
+{ "version": "3.0.0", "build_time": "3.0.0" }
 ```
 
 > Both fields derive from the crate version (`CARGO_PKG_VERSION`); `build_time` is the version string, not a wall-clock timestamp.
@@ -557,7 +582,7 @@ Example (abridged; the example fixture has every field):
 ```json
 {
   "schema_version": 1,
-  "proxy_version": "2.3.0",
+  "proxy_version": "3.0.0",
   "generated_at": "2026-11-06T10:15:02.123Z",
   "uptime_secs": 86400,
   "nodes": {
@@ -863,7 +888,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/anomalies?li
 
 ### GET /analytics (alias /api/analytics)
 
-Top queries by call count plus the slow-query log. Optional `?limit=N` (default 50). **`503` unless built with `--features query-analytics`.**
+Top queries by call count (`fingerprint`, `normalized`, `calls`, `avg_ms`, `p99_ms`, `rows`, `errors`), the number of slow queries (`slow_query_count`) and `analytics_dropped_total`. The slow-query entries themselves, N+1 and intent results are not exposed (planned for a later 3.x release). Optional `?limit=N` (default 50). **`503` unless built with `--features query-analytics`.**
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/api/analytics?limit=50"

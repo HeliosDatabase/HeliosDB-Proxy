@@ -69,7 +69,7 @@ curl -s http://localhost:9090/pools | jq .
 A typical healthy snapshot:
 
 ```json
-{"version":"0.4.1","build_time":"2026-05-01T13:20:05Z"}
+{"version":"3.0.0","build_time":"3.0.0"}
 {"connections_accepted":17234,"connections_closed":17190,"connections_active":44,"queries_processed":982041,"bytes_received":108112334,"bytes_sent":2014223891,"failovers":0}
 {"active_sessions":44}
 [{"node":"pg-primary:5432","active":12,"idle":8,"pending":0},{"node":"pg-replica-1:5432","active":31,"idle":4,"pending":0}]
@@ -138,9 +138,10 @@ curl -s http://localhost:9090/pools | jq '
 curl -s http://localhost:9090/version | jq .
 ```
 
-If the response includes a `features` array, it lists the compiled-in
-feature flags. (Older versions don't expose this — fall back to
-checking `Cargo.toml` of the build.)
+`/version` reports the crate version only (`build_time` is the same
+string). For what is compiled in and enabled, read
+`GET /capabilities`: one row per subsystem (compiled / enabled /
+wired).
 
 If a feature-gated endpoint returns 503 (e.g. `/api/replay`), the
 feature is OFF in the build — see `heliosproxy-install` to rebuild

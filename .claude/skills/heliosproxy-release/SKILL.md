@@ -39,51 +39,54 @@ be re-uploaded. Only yanked.
 
 ## Recipes
 
-### Recipe 1: Standard patch release flow
+### Recipe 1: Standard release flow
 
 ```bash
-cd /home/app/Helios/Proxy
+cd HeliosDB-Proxy            # your clone of HeliosDatabase/HeliosDB-Proxy
 
 # 1. bump version
-# In Cargo.toml: version = "0.4.1" → "0.4.2"
+# In Cargo.toml: version = "3.0.0" → "3.0.1"   (then `cargo update -p heliosdb-proxy`
+# so Cargo.lock carries the new version)
 
-# 2. CHANGELOG
-# Add a new "## [0.4.2] - YYYY-MM-DD" block at the top with a
-# concise summary, sections for Added / Changed / Fixed.
+# 2. CHANGELOG and release notes
+# Move the "## [Unreleased]" entries into "## [3.0.1] - YYYY-MM-DD" with a
+# summary and Upgrade notes / Security / Added / Changed / Fixed sections.
+# Optionally write docs/releases/3.0.1.md: release.yml uses it as the
+# GitHub release body (followed by the generated PR list).
 
-# 3. confirm cargo is happy
-cargo build --lib
-cargo publish --dry-run        # full verify, including upload abort
+# 3. run the quality gates in CLAUDE.md (test matrix, clippy, fmt, MSRV,
+#    benchmarks, and the user-path gate required before every release),
+#    then confirm cargo is happy
+cargo publish --dry-run --locked
 
 # 4. commit
-git add Cargo.toml Cargo.lock CHANGELOG.md
-git commit -m "release: 0.4.2
-
-Patch release: <one sentence>.
-
-Co-Authored-By: ..."
+git add Cargo.toml Cargo.lock CHANGELOG.md docs/releases/
+git commit -m "release: 3.0.1"
 
 # 5. push commit
 git push
 
 # 6. tag
-git tag -a v0.4.2 -m "v0.4.2 — <one sentence>"
-git push origin v0.4.2
+git tag -a v3.0.1 -m "v3.0.1"
+git push origin v3.0.1
 ```
 
-The tag push triggers the workflow. ETA ~1 min.
+The tag push triggers three workflows: `crates-io.yml` (cargo publish),
+`release.yml` (Linux/macOS x86_64 + aarch64 binaries built with
+`all-features,postgres-topology`, `.sha256` files, GitHub release) and
+`docker.yml` (`ghcr.io/heliosdatabase/hdb-heliosdb-proxy:<version>`).
 
 ### Recipe 2: Watch the publish run
 
 ```bash
-gh run watch --workflow crates-io.yml -R HeliosDatabase/HDB-HeliosDB-Proxy
+gh run watch --workflow crates-io.yml -R HeliosDatabase/HeliosDB-Proxy
 ```
 
 Or list recent runs:
 
 ```bash
-gh run list --workflow crates-io.yml -R HeliosDatabase/HDB-HeliosDB-Proxy --limit 3
-# in_progress    release: 0.4.2  Publish to crates.io  v0.4.2  push
+gh run list --workflow crates-io.yml -R HeliosDatabase/HeliosDB-Proxy --limit 3
+# in_progress    release: 3.0.1  Publish to crates.io  v3.0.1  push
 ```
 
 ### Recipe 3: Verify the crate is live
@@ -96,15 +99,15 @@ curl -s https://crates.io/api/v1/crates/heliosdb-proxy | jq '{
 
 ```json
 {
-  "default_version":     "0.4.2",
+  "default_version":     "3.0.1",
   "num_versions":        3,
   "downloads":           42,
-  "max_stable_version":  "0.4.2"
+  "max_stable_version":  "3.0.1"
 }
 ```
 
 `docs.rs` builds asynchronously after publish — typically appears
-within 5-30 minutes at <https://docs.rs/heliosdb-proxy/0.4.2>.
+within 5-30 minutes at <https://docs.rs/heliosdb-proxy/3.0.1>.
 
 ### Recipe 4: Re-run the workflow against an existing tag
 
@@ -113,8 +116,8 @@ without re-tagging:
 
 ```bash
 gh workflow run crates-io.yml \
-  -R HeliosDatabase/HDB-HeliosDB-Proxy \
-  -f tag=v0.4.2
+  -R HeliosDatabase/HeliosDB-Proxy \
+  -f tag=v3.0.1
 ```
 
 The workflow's `workflow_dispatch.inputs.tag` accepts an existing
@@ -125,7 +128,7 @@ recover from a failed first attempt).
 ### Recipe 5: Quickly verify version match before tagging
 
 ```bash
-TAG=v0.4.2
+TAG=v3.0.1
 CARGO=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
 [ "${TAG#v}" = "$CARGO" ] && echo "OK: tag matches Cargo.toml" \
                           || echo "MISMATCH: $TAG vs $CARGO"
@@ -139,27 +142,27 @@ catch it locally before pushing the tag.
 If a published version contains a critical bug:
 
 ```bash
-cargo yank --vers 0.4.2 heliosdb-proxy
+cargo yank --vers 3.0.1 heliosdb-proxy
 ```
 
 Yanked versions stay on crates.io but won't be picked up by `cargo
 add` / dep solvers as a default. Existing pinned consumers continue
-to work. Cut a fixed `0.4.3` ASAP.
+to work. Cut a fixed `3.0.2` ASAP.
 
 To un-yank:
 
 ```bash
-cargo yank --vers 0.4.2 --undo heliosdb-proxy
+cargo yank --vers 3.0.1 --undo heliosdb-proxy
 ```
 
 ## Pitfalls
 
 - **Tag and Cargo.toml MUST match.** The workflow fails loudly if
-  not. `v0.4.2` ↔ `version = "0.4.2"`. No `v` in Cargo.toml; `v`
+  not. `v3.0.1` ↔ `version = "3.0.1"`. No `v` in Cargo.toml; `v`
   in the tag.
 - **Push the commit BEFORE pushing the tag.** Otherwise the tag
   refers to a SHA the workflow can't checkout. The workflow's
-  `actions/checkout@v4` resolves the tag's commit; if the commit
+  `actions/checkout` resolves the tag's commit; if the commit
   isn't on origin, checkout fails.
 - **`cargo publish` is irreversible.** A typo in version number
   burns that number forever. Triple-check before pushing the tag.

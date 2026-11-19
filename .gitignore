@@ -1,4 +1,5 @@
 target/
+/target-*/
 heliosdb-data/
 *.a
 *.rlib

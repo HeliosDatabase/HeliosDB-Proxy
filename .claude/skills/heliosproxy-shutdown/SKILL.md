@@ -44,7 +44,7 @@ clients see refused connections.
 |---|---|
 | `kill -TERM <pid>` | Manual / scripts |
 | `systemctl stop heliosproxy` | systemd — uses SIGTERM by default |
-| `docker stop <container>` | Container — sends SIGTERM, then SIGKILL after 10 s |
+| `docker stop <container>` | Container — sends SIGTERM, then SIGKILL after 10 s (raise with `-t`) |
 | Ctrl-C (foreground) | Dev / interactive runs |
 
 ## Recipes
@@ -75,8 +75,8 @@ timeout 30s pkill -TERM heliosdb-proxy
 pgrep -x heliosdb-proxy && pkill -KILL heliosdb-proxy
 ```
 
-systemd does the same with `TimeoutStopSec=30s` — see
-`heliosproxy-start`.
+systemd does the same with `TimeoutStopSec` — keep it above
+`shutdown_drain_timeout_secs` (default 60); see `heliosproxy-start`.
 
 ### Recipe 3: Restart for config change
 
@@ -104,7 +104,7 @@ on the floor — clients see "server closed the connection" mid-result.
 
 ```bash
 docker stop heliosproxy        # SIGTERM, then SIGKILL after 10s default
-docker stop -t 30 heliosproxy  # extend grace to 30s
+docker stop -t 70 heliosproxy  # grace longer than the 60 s default drain
 docker compose down             # stops + removes containers
 docker compose down -v          # also remove volumes (data loss!)
 ```
@@ -134,11 +134,13 @@ ss -tnlp | grep -E ':6432|:9090'    # Linux: confirm no listeners
 - **`SIGHUP` reloads the config file; it does not restart.** Keys
   that are read at startup only are reported in the log and need a
   `restart`.
-- **Docker default grace is 10 s.** Production deploys should pass
-  `--stop-timeout 30` or set it in the compose file:
-  `stop_grace_period: 30s`. Without it, you'll see corrupted
-  failover-replay journals if `ha-tr` is on and a flush was in
-  flight.
+- **Docker default grace is 10 s, Kubernetes 30 s; the drain
+  allows 60 s.** Pass `--stop-timeout 70` (Compose:
+  `stop_grace_period: 70s`; Kubernetes:
+  `terminationGracePeriodSeconds: 75`), or lower
+  `shutdown_drain_timeout_secs`. Otherwise sessions still in a
+  transaction are killed mid-drain and the recovery journal may not
+  be flushed.
 - **The admin port is open during drain.** That's intentional —
   load balancers need `/health` to flip to "ready: false" before
   the listener actually closes. Don't interpret a successful
@@ -148,7 +150,7 @@ ss -tnlp | grep -E ':6432|:9090'    # Linux: confirm no listeners
 ## See also
 
 - `heliosproxy-start` — what comes after a stop
-- `heliosproxy-config` — there's no live reload; restart is the answer
+- `heliosproxy-config` — SIGHUP reloads what it can; startup-only keys need a restart
 - `heliosproxy-health` — `/health/ready` flips during drain
-- Code: [`src/server.rs:shutdown`](../../src/server.rs) — drain implementation
+- Code: [`src/server/`](../../src/server/) and [`src/gateway_drain.rs`](../../src/gateway_drain.rs) — drain implementation
 - Code: [`src/main.rs`](../../src/main.rs) — signal handlers

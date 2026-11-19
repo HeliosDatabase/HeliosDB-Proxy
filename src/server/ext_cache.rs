@@ -140,6 +140,21 @@ pub(super) struct ExtendedFill {
 }
 
 impl ProxyServer {
+    /// Whether the session may have a batch answered by the query cache at
+    /// this point, from its state alone: checked before the batch is read
+    /// ([`CacheableBatch::of`]), so the batches of a transaction block cost
+    /// nothing here.
+    pub(super) fn extended_cache_open(
+        session: &ClientSession,
+        state: &ServerState,
+        config: &ProxyConfig,
+    ) -> bool {
+        state.query_cache.is_some()
+            && config.cache.extended_protocol
+            && !session.in_transaction.load(Ordering::Relaxed)
+            && !session.cache_ineligible.load(Ordering::Relaxed)
+    }
+
     /// Whether the query cache may look up `batch`'s statement at all: the
     /// conditions a simple query's lookup has, none of which reads the
     /// backend.
@@ -149,11 +164,7 @@ impl ProxyServer {
         state: &ServerState,
         config: &ProxyConfig,
     ) -> bool {
-        if state.query_cache.is_none()
-            || !config.cache.extended_protocol
-            || session.in_transaction.load(Ordering::Relaxed)
-            || session.cache_ineligible.load(Ordering::Relaxed)
-        {
+        if !Self::extended_cache_open(session, state, config) {
             return false;
         }
         if !(config.cache.trust_backend_read_effects

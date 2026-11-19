@@ -85,28 +85,28 @@ The recovery path a live client takes and the journal/operator tooling both ship
 
 | Module | Feature Flag | Source | Responsibility |
 |--------|-------------|--------|----------------|
-| Query Cache | `query-cache` | `src/cache/` | Three-tier result cache (L1 hot, L2 warm, L3 semantic) |
+| Query Cache | `query-cache` | `src/cache/`, `src/server/cache_scope.rs` | Three-tier result cache (L1 hot, L2 warm, L3 semantic) for simple and extended-protocol reads, keyed by startup parameters and the backend's proven settings |
 | Query Routing | `routing-hints` | `src/routing/` | SQL comment-based routing hints, automatic read/write classification |
 | Lag-Aware Routing | `lag-routing` | `src/lag/` | Replication lag monitoring, read-your-writes consistency |
 | Query Rewriter | `query-rewriting` | `src/rewriter/` | Rule-based SQL transformation engine |
-| Query Analytics | `query-analytics` | `src/analytics/` | Query fingerprinting, slow query log, N+1 detection, intent classification |
-| Schema Routing | `schema-routing` | `src/schema_routing/` | Table-level routing rules, data temperature classification |
+| Query Analytics | `query-analytics` | `src/analytics/` | Query fingerprinting and statistics (`/analytics`); slow-query log, N+1 and intent results are library-only |
+| Schema Routing | `schema-routing` | `src/schema_routing/` | Sends analytical reads to `[schema_routing] analytics_node`; table metadata and data temperature are library-only |
 
 ### Security and Access Control
 
 | Module | Feature Flag | Source | Responsibility |
 |--------|-------------|--------|----------------|
-| Auth Proxy | `auth-proxy` | `src/auth/` | JWT, OAuth 2.0, API key, LDAP, and certificate-based authentication |
-| Rate Limiter | `rate-limiting` | `src/rate_limit/` | Token bucket, sliding window, concurrency guards |
-| Circuit Breaker | `circuit-breaker` | `src/circuit_breaker/` | Adaptive circuit breaker with sliding-window failure detection |
+| Auth Proxy | `auth-proxy` | `src/auth/` | Daemon: `[auth] mode = "passthrough" \| "scram"`. Library only: JWT, OAuth 2.0, API key and LDAP modules |
+| Rate Limiter | `rate-limiting` | `src/rate_limit/` | Token bucket, opt-in sliding window, per-bucket concurrency cap |
+| Circuit Breaker | `circuit-breaker` | `src/circuit_breaker/` | Per-node circuit breaker with sliding-window failure detection and half-open recovery |
 
 ### Multi-Tenancy and Extensibility
 
 | Module | Feature Flag | Source | Responsibility |
 |--------|-------------|--------|----------------|
-| Multi-Tenancy | `multi-tenancy` | `src/multi_tenancy/` | Tenant isolation, per-tenant pools, resource quotas |
-| WASM Plugins | `wasm-plugins` | `src/plugins/` | Sandboxed WASM runtime with hot-reload |
-| GraphQL Gateway | `graphql-gateway` | `src/graphql/` | GraphQL-to-SQL translation with DataLoader batching |
+| Multi-Tenancy | `multi-tenancy` | `src/multi_tenancy/`, `src/tenant_slots.rs` | Tenant identification, row-level tenant filter, per-tenant caps and budgets (no per-tenant pools) |
+| WASM Plugins | `wasm-plugins` | `src/plugins/`, `src/plugin_artefact.rs`, `src/bin/helios-plugin.rs` | Sandboxed WASM runtime, signed artefacts, plugin-directory reconciliation (hot reload), `helios-plugin` CLI |
+| GraphQL Gateway | `graphql-gateway` | `src/graphql/`, `src/graphql_gateway.rs` | GraphQL-to-SQL over `[[graphql_gateway.tables]]` |
 
 ### Distributed Caching
 
@@ -118,121 +118,61 @@ The recovery path a live client takes and the journal/operator tooling both ship
 
 ## Data-Flow Pipeline
 
-Every client query traverses a well-defined pipeline. Each stage is optional and only executes when its corresponding feature flag is enabled.
+The order below is the daemon's path for a simple `Query` (`src/server/client.rs`,
+`src/server/relay.rs`). An extended-protocol cycle (`Parse`/`Bind`/`Execute`/`Sync`) runs
+the same statement stages for every `Parse` of the cycle (and the plugin hooks again at a
+later `Bind` of a prepared statement) before anything of it is recorded or forwarded
+(`src/server/ext_hooks.rs`). Each stage runs only when its feature is compiled in and its
+section is enabled.
 
 ```
-Client Connection (TCP, PostgreSQL wire protocol)
+Client connection (TCP / TLS, PostgreSQL wire protocol)
         |
         v
-  +-----------+
-  | Protocol  |  Decode PostgreSQL frontend messages
-  | Decoder   |  (Query, Parse, Bind, Execute, etc.)
-  +-----------+
+  Startup: [limits] admission, [[hba]] rules, [auth] passthrough or SCRAM,
+           Authenticate plugin hook, [multi_tenancy] tenant identification and
+           client cap; waits up to startup_node_wait_ms for an eligible node
+        |
+        v  (per request)
+  [anomaly-detection]   record the statement as the client sent it
+  [wasm-plugins]        pre_query hook: block (42000), rewrite, or a cached answer
+  [multi-tenancy]       take the tenant's active-query permit (waits / 53300)
+  [rate-limiting]       token bucket, optional window, in-flight cap (53400)
+  [wasm-plugins]        route hook: node, branch or block
+  [routing-hints]       /*helios:...*/ hints (route, node, branch, cache)
+  [branch]              move the session to a branch database (route_enabled)
+  [lag-routing]         read-your-writes stamp on writes
+  [query-rewriting]     [query_rewrite] rules
+  [multi-tenancy]       row-level tenant filter, or refusal (42501)
+  [schema-routing]      analytical reads -> analytics_node
+  load balancer         writes -> primary; reads -> standbys (lag-aware)
+  [circuit-breaker]     fast-fail an open circuit; half-open probes
+  pool                  backend connection (session / transaction / statement mode)
+  [query-cache], [edge] settings proof on that connection, then L1 -> L2 -> L3;
+                        a hit is answered without running the read
+        |
+        v  (miss / not cacheable)
+  Backend node: the response is relayed to the client as it arrives, while
+  Transaction Replay records statements and response digests (core)
         |
         v
-  +-----------+
-  | Auth      |  [auth-proxy] JWT / OAuth / API key validation
-  | Proxy     |  Skip if feature not enabled; pass-through auth to backend
-  +-----------+
-        |
-        v
-  +-----------+
-  | Tenant    |  [multi-tenancy] Identify tenant from connection metadata
-  | Identify  |  Apply per-tenant pool and quota limits
-  +-----------+
-        |
-        v
-  +-----------+
-  | Rate      |  [rate-limiting] Token bucket / sliding window check
-  | Limiter   |  Reject with error if rate exceeded
-  +-----------+
-        |
-        v
-  +-----------+
-  | Circuit   |  [circuit-breaker] Check breaker state for target node
-  | Breaker   |  Reject immediately if circuit is open
-  +-----------+
-        |
-        v
-  +-----------+
-  | WASM      |  [wasm-plugins] Execute on_query_start hooks
-  | Plugins   |  Plugins may modify, reject, or annotate the query
-  +-----------+
-        |
-        v
-  +-----------+
-  | Query     |  [query-rewriting] Apply rewrite rules
-  | Rewriter  |  Schema prefixing, query normalization
-  +-----------+
-        |
-        v
-  +-----------+
-  | Query     |  [query-analytics] Fingerprint and classify the query
-  | Analytics |  Record execution start time for latency tracking
-  +-----------+
-        |
-        v
-  +-----------+
-  | Routing   |  Parse SQL hints (/*helios:route=primary*/)
-  | Hints     |  [routing-hints] Override default routing decision
-  +-----------+
-        |
-        v
-  +-----------+
-  | Query     |  [query-cache] Check L1 -> L2 -> L3 cache tiers
-  | Cache     |  Return cached result if hit; skip backend entirely
-  +-----------+
-        |
-        v  (cache miss)
-  +-----------+
-  | Schema    |  [schema-routing] Route based on table metadata
-  | Router    |  and data temperature classification
-  +-----------+
-        |
-        v
-  +-----------+
-  | Lag-Aware |  [lag-routing] Filter replicas by replication lag
-  | Router    |  Enforce read-your-writes consistency
-  +-----------+
-        |
-        v
-  +-----------+
-  | Load      |  Select target node (round-robin, least-conn, latency-based)
-  | Balancer  |  Read/write splitting: writes -> primary, reads -> standbys
-  +-----------+
-        |
-        v
-  +-----------+
-  | Connection|  Acquire backend connection from pool
-  | Pool      |  [pool-modes] Session / Transaction / Statement mode
-  +-----------+
-        |
-        v
-  +-----------+
-  | Pipeline  |  Batch Parse/Bind/Execute for reduced round trips
-  | Engine    |  Record statement + response digest when in a transaction (core)
-  |           |  [TR] Journal statement for operator replay
-  +-----------+
-        |
-        v
-  +-----------+
-  | Batch     |  Coalesce individual INSERTs into multi-row batches
-  | INSERT    |
-  +-----------+
-        |
-        v
-  Backend Node (Primary / Standby / Replica)
-        |
-        v  (response)
-  +-----------+
-  | Query     |  [query-cache] Populate cache on miss
-  | Cache     |  [query-analytics] Record execution time, update statistics
-  | Populate  |  [wasm-plugins] Execute on_query_complete hooks
-  +-----------+
-        |
-        v
-  Client Response (PostgreSQL wire protocol)
+  cache store (on a proven miss), [query-analytics] statistics,
+  [circuit-breaker] outcome, [wasm-plugins] post_query hook,
+  write invalidation of cached reads (table generations)
 ```
+
+The HTTP SQL, MCP and GraphQL gateways run their requests through the same admission,
+tenant, rate-limit, circuit and cache-invalidation policy (`src/gateway_policy.rs`) on
+backend connections of their own.
+
+### Shutdown and signals
+
+SIGHUP reloads the configuration and rescans the plugin directory. SIGTERM and SIGINT
+start a drain: the PG-wire and gateway listeners close, `/health/ready` answers 503, each
+session ends with FATAL `57P01` once nothing of it is in flight, accepted gateway
+requests are answered, the recovery journal is flushed and the process exits 0, at the
+latest after `shutdown_drain_timeout_secs`. SIGUSR2 runs the same drain for a binary
+handoff to a new process bound to the same addresses (`SO_REUSEPORT`).
 
 ---
 
@@ -425,7 +365,10 @@ The admin server runs on a separate TCP listener (default port 9090) and exposes
         +-- GET  /sessions       --> Active session count
         +-- GET  /pools          --> Pool statistics
         +-- GET  /version        --> Proxy version
+        +-- GET  /api/stats      --> Versioned stats document (schema_version 1)
         +-- POST /api/sql        --> SQL execution with TWR routing
+        +-- ...                  --> plugins, cache, edge, chaos, replay, shadow,
+                                     branch, migration: see admin-api.md
 ```
 
 ---

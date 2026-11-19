@@ -1739,10 +1739,13 @@ impl ProxyServer {
         // looked up before anything of it is written, and answered here on a
         // hit. On a miss its response is captured below and stored.
         #[cfg(feature = "query-cache")]
-        let cache_plan = (starts_cycle && wait_ready && backend.response_buf.is_empty())
-            .then(|| super::ext_cache::CacheableBatch::of(batch, unnamed, registry))
-            .flatten()
-            .filter(|plan| Self::extended_cache_candidate(plan.sql, session, state, config));
+        let cache_plan = (starts_cycle
+            && wait_ready
+            && backend.response_buf.is_empty()
+            && Self::extended_cache_open(session, state, config))
+        .then(|| super::ext_cache::CacheableBatch::of(batch, unnamed, registry))
+        .flatten()
+        .filter(|plan| Self::extended_cache_candidate(plan.sql, session, state, config));
         #[cfg(feature = "query-cache")]
         let mut cache_fill = None;
         #[cfg(feature = "query-cache")]

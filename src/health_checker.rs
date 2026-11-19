@@ -2,8 +2,14 @@
 //!
 //! Continuous node health monitoring with configurable checks,
 //! failure detection, and automatic recovery.
+//!
+//! Every check opens a real backend connection, so the checker needs a
+//! backend template ([`HealthChecker::with_backend_template`]). Without one,
+//! [`HealthChecker::start`] and [`HealthChecker::force_check`] fail with
+//! [`ProxyError::HealthCheck`] and a forced check marks the node unhealthy:
+//! a node that could not be checked is never reported as passing a check.
 
-use super::{NodeEndpoint, NodeId, Result};
+use super::{NodeEndpoint, NodeId, ProxyError, Result};
 use crate::backend::{BackendClient, BackendConfig};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -121,6 +127,18 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Why a health check did not succeed.
+#[derive(Debug)]
+enum CheckFailure {
+    /// The check could not run at all (no backend template or no
+    /// registered endpoint). Marks the node unhealthy at once, regardless
+    /// of `failure_threshold`: there is nothing transient to wait out.
+    Unconfigured(String),
+    /// The check ran and failed (connect error, query error, timeout).
+    /// Counted against `failure_threshold`.
+    Failed(String),
+}
+
 /// Health check event
 #[derive(Debug, Clone)]
 pub enum HealthEvent {
@@ -148,11 +166,10 @@ pub struct HealthChecker {
     event_rx: Option<mpsc::Receiver<HealthEvent>>,
     /// Running flag
     running: Arc<RwLock<bool>>,
-    /// Optional backend-connection template. Host/port are overridden
-    /// per-node at check time; auth, TLS, and timeouts are shared. When
-    /// `None`, `perform_check` returns Ok(()) without opening a socket
-    /// — useful for unit tests and for construction-time scenarios
-    /// where the caller does not yet have backend credentials.
+    /// Backend-connection template. Host/port are overridden per-node at
+    /// check time; auth, TLS, and timeouts are shared. When `None`, no
+    /// check can run: `start` and `force_check` fail, and a forced check
+    /// marks the node unhealthy.
     backend_template: Option<BackendConfig>,
     /// Nodes with a probe still running. A tick that finds a node here skips
     /// it instead of stacking a second probe: with
@@ -193,12 +210,11 @@ impl HealthChecker {
         }
     }
 
-    /// Attach a backend-connection template. Required for real health
-    /// checks: the checker clones it, swaps host/port for each node,
-    /// opens a connection, runs `config.check_query`, and reports
-    /// success/failure. Without a template the checker runs a no-op
-    /// success (retained for tests that construct a checker without
-    /// real PG backing).
+    /// Attach a backend-connection template. Required for health checks:
+    /// the checker clones it, swaps host/port for each node, opens a
+    /// connection, runs `config.check_query`, and reports success/failure.
+    /// Without a template no check can run (see [`Self::start`] and
+    /// [`Self::force_check`]).
     pub fn with_backend_template(mut self, template: BackendConfig) -> Self {
         self.backend_template = Some(template);
         self
@@ -231,8 +247,15 @@ impl HealthChecker {
         });
     }
 
-    /// Start health checking
+    /// Start health checking.
+    ///
+    /// Fails with [`ProxyError::HealthCheck`] when no backend template is
+    /// attached: the checker could not run a single check, so it does not
+    /// pretend to monitor anything.
     pub async fn start(&self) -> Result<()> {
+        if self.backend_template.is_none() {
+            return Err(ProxyError::HealthCheck(Self::no_template_reason()));
+        }
         {
             let mut running = self.running.write().await;
             if *running {
@@ -392,6 +415,12 @@ impl HealthChecker {
         self.in_flight.lock().len()
     }
 
+    fn no_template_reason() -> String {
+        "health checker has no backend template, so it cannot connect to any node; \
+         attach one with HealthChecker::with_backend_template"
+            .to_string()
+    }
+
     /// Check a single node's health
     async fn check_node_health(
         node_id: NodeId,
@@ -408,15 +437,39 @@ impl HealthChecker {
 
         let mut health_guard = health.write().await;
         if let Some(node_health) = health_guard.get_mut(&node_id) {
-            node_health.total_checks += 1;
-            node_health.last_check = Some(chrono::Utc::now());
+            if !matches!(check_result, Err(CheckFailure::Unconfigured(_))) {
+                node_health.total_checks += 1;
+                node_health.last_check = Some(chrono::Utc::now());
 
-            // Update average response time (exponential moving average)
-            let alpha = 0.2;
-            node_health.avg_response_ms =
-                alpha * latency_ms + (1.0 - alpha) * node_health.avg_response_ms;
+                // Update average response time (exponential moving average)
+                let alpha = 0.2;
+                node_health.avg_response_ms =
+                    alpha * latency_ms + (1.0 - alpha) * node_health.avg_response_ms;
+            }
 
             match check_result {
+                Err(CheckFailure::Unconfigured(reason)) => {
+                    // No check ran: leave the check counters, timestamps and
+                    // latency alone, but never leave the node reported healthy.
+                    node_health.consecutive_successes = 0;
+                    node_health.last_error = Some(reason.clone());
+                    if node_health.healthy {
+                        node_health.healthy = false;
+                        let _ = event_tx
+                            .send(HealthEvent::NodeUnhealthy {
+                                node_id,
+                                reason: reason.clone(),
+                            })
+                            .await;
+                        tracing::warn!("Node {:?} marked unhealthy: {}", node_id, reason);
+                    }
+                    let _ = event_tx
+                        .send(HealthEvent::CheckFailed {
+                            node_id,
+                            error: reason,
+                        })
+                        .await;
+                }
                 Ok(()) => {
                     node_health.consecutive_failures = 0;
                     node_health.consecutive_successes += 1;
@@ -439,7 +492,7 @@ impl HealthChecker {
                         })
                         .await;
                 }
-                Err(error) => {
+                Err(CheckFailure::Failed(error)) => {
                     node_health.consecutive_successes = 0;
                     node_health.consecutive_failures += 1;
                     node_health.total_failures += 1;
@@ -474,20 +527,20 @@ impl HealthChecker {
     /// `SELECT 1`) via a simple scalar query. The whole operation is
     /// timed-out by `config.check_timeout`.
     ///
-    /// If either `endpoint` or `backend_template` is `None`, returns
-    /// `Ok(())` immediately — this is the skeleton path used by unit
-    /// tests that don't wire a real backend. Production callers are
-    /// expected to supply both via
-    /// `HealthChecker::with_backend_template` + `add_node(endpoint)`.
+    /// If `endpoint` or `backend_template` is `None` no check can run and
+    /// the result is [`CheckFailure::Unconfigured`] — never success.
     async fn perform_check(
         endpoint: Option<&NodeEndpoint>,
         backend_template: Option<&BackendConfig>,
         config: &HealthConfig,
-    ) -> std::result::Result<(), String> {
-        let (endpoint, template) = match (endpoint, backend_template) {
-            (Some(e), Some(t)) => (e, t),
-            _ => return Ok(()), // Skeleton / unit-test path.
-        };
+    ) -> std::result::Result<(), CheckFailure> {
+        let template = backend_template
+            .ok_or_else(|| CheckFailure::Unconfigured(Self::no_template_reason()))?;
+        let endpoint = endpoint.ok_or_else(|| {
+            CheckFailure::Unconfigured(
+                "node has no registered endpoint, so it cannot be checked".to_string(),
+            )
+        })?;
 
         let mut cfg = template.clone();
         cfg.host = endpoint.host.clone();
@@ -508,8 +561,11 @@ impl HealthChecker {
         .await;
 
         match outcome {
-            Ok(inner) => inner,
-            Err(_) => Err(format!("health check exceeded {:?}", config.check_timeout)),
+            Ok(inner) => inner.map_err(CheckFailure::Failed),
+            Err(_) => Err(CheckFailure::Failed(format!(
+                "health check exceeded {:?}",
+                config.check_timeout
+            ))),
         }
     }
 
@@ -549,16 +605,32 @@ impl HealthChecker {
     /// explicit operator/caller-driven probe and it runs inline (awaited by the
     /// caller) rather than being spawned, so it cannot pile up the way detached
     /// per-tick probes could.
+    ///
+    /// `Ok(())` means the check ran; its outcome is in [`Self::get_health`].
+    /// Fails with [`ProxyError::HealthCheck`] when the node is not registered,
+    /// or when no backend template is attached — in that case the node is
+    /// also marked unhealthy with that reason as its `last_error`.
     pub async fn force_check(&self, node_id: &NodeId) -> Result<()> {
         let config = self.config.clone();
         let health = self.health.clone();
         let event_tx = self.event_tx.clone();
         let id = *node_id;
         let endpoint = self.nodes.read().await.get(&id).cloned();
+        if endpoint.is_none() || !health.read().await.contains_key(&id) {
+            return Err(ProxyError::HealthCheck(format!(
+                "node {:?} is not registered with the health checker",
+                id
+            )));
+        }
         let template = self.backend_template.clone();
+        let configured = template.is_some();
 
         Self::check_node_health(id, endpoint, template, &config, &health, &event_tx).await;
-        Ok(())
+        if configured {
+            Ok(())
+        } else {
+            Err(ProxyError::HealthCheck(Self::no_template_reason()))
+        }
     }
 
     /// Mark a node as unhealthy (manual override)
@@ -660,14 +732,133 @@ mod tests {
         assert_eq!(health.last_error, Some("Test failure".to_string()));
     }
 
-    /// Without an endpoint or template, `perform_check` must return
-    /// `Ok(())` immediately — preserves the pre-T0-TR3 test-friendly
-    /// behaviour for unit tests that don't stand up a real backend.
+    fn unreachable_template() -> BackendConfig {
+        use crate::backend::{tls::default_client_config, TlsMode};
+        BackendConfig {
+            host: "unused".into(),
+            port: 0,
+            user: "postgres".into(),
+            password: None,
+            database: None,
+            application_name: Some("helios-health-check".into()),
+            tls_mode: TlsMode::Disable,
+            connect_timeout: Duration::from_millis(200),
+            query_timeout: Duration::from_millis(200),
+            tls_config: default_client_config(),
+        }
+    }
+
+    /// Fail closed: without a template or endpoint no check can run, and
+    /// `perform_check` says so — it never reports success.
     #[tokio::test]
-    async fn test_perform_check_skeleton_path_returns_ok() {
+    async fn test_perform_check_without_template_or_endpoint_is_unconfigured() {
         let config = HealthConfig::default();
-        let result = HealthChecker::perform_check(None, None, &config).await;
-        assert!(result.is_ok());
+        let endpoint = NodeEndpoint::new("127.0.0.1", 1);
+        let template = unreachable_template();
+
+        match HealthChecker::perform_check(Some(&endpoint), None, &config).await {
+            Err(CheckFailure::Unconfigured(msg)) => {
+                assert!(msg.contains("no backend template"), "{msg}")
+            }
+            other => panic!("expected Unconfigured, got {other:?}"),
+        }
+        match HealthChecker::perform_check(None, Some(&template), &config).await {
+            Err(CheckFailure::Unconfigured(msg)) => assert!(msg.contains("endpoint"), "{msg}"),
+            other => panic!("expected Unconfigured, got {other:?}"),
+        }
+    }
+
+    /// `start` refuses to run a checker that cannot check anything.
+    #[tokio::test]
+    async fn test_start_without_template_fails() {
+        let checker = HealthChecker::new(HealthConfig::default());
+        let err = checker
+            .start()
+            .await
+            .expect_err("start without a backend template must fail");
+        assert!(matches!(err, ProxyError::HealthCheck(_)), "got {err:?}");
+        assert!(!*checker.running.read().await);
+        assert!(checker.probe_loop.lock().is_none());
+    }
+
+    /// A forced check without a template fails and marks the node
+    /// unhealthy at once (no `failure_threshold` grace), without counting a
+    /// check that never ran.
+    #[tokio::test]
+    async fn test_force_check_without_template_marks_node_unhealthy() {
+        let mut checker = HealthChecker::new(HealthConfig {
+            failure_threshold: 3,
+            ..Default::default()
+        });
+        let mut events = checker.take_event_receiver().expect("receiver");
+        let endpoint = NodeEndpoint::new("127.0.0.1", 1);
+        let node_id = endpoint.id;
+        checker.add_node(endpoint);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let err = checker
+            .force_check(&node_id)
+            .await
+            .expect_err("forced check without a template must fail");
+        assert!(matches!(err, ProxyError::HealthCheck(_)), "got {err:?}");
+
+        let health = checker.get_health(&node_id).await.expect("health");
+        assert!(!health.healthy, "an unchecked node must not stay healthy");
+        assert!(
+            health
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("no backend template")),
+            "last_error: {:?}",
+            health.last_error
+        );
+        assert_eq!(health.total_checks, 0, "no check ran");
+        assert!(health.last_check.is_none());
+        assert_eq!(checker.healthy_count().await, 0);
+
+        match events.try_recv() {
+            Ok(HealthEvent::NodeUnhealthy { node_id: id, .. }) => assert_eq!(id, node_id),
+            other => panic!("expected NodeUnhealthy, got {other:?}"),
+        }
+    }
+
+    /// A forced check for a node the checker does not know is an error.
+    #[tokio::test]
+    async fn test_force_check_unknown_node_errors() {
+        let checker = HealthChecker::new(HealthConfig::default())
+            .with_backend_template(unreachable_template());
+        let err = checker
+            .force_check(&NodeId::new())
+            .await
+            .expect_err("unknown node");
+        assert!(matches!(err, ProxyError::HealthCheck(_)), "got {err:?}");
+    }
+
+    /// A forced check that runs and fails counts against the threshold
+    /// (real-check behaviour is unchanged).
+    #[tokio::test]
+    async fn test_force_check_failure_counts_against_threshold() {
+        let mut checker = HealthChecker::new(HealthConfig {
+            check_timeout: Duration::from_millis(300),
+            failure_threshold: 2,
+            ..Default::default()
+        })
+        .with_backend_template(unreachable_template());
+        let endpoint = NodeEndpoint::new("127.0.0.1", 1);
+        let node_id = endpoint.id;
+        checker.add_node(endpoint);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        checker.force_check(&node_id).await.expect("check ran");
+        let health = checker.get_health(&node_id).await.unwrap();
+        assert!(health.healthy, "one failure is below the threshold of 2");
+        assert_eq!(health.total_checks, 1);
+        assert_eq!(health.total_failures, 1);
+
+        checker.force_check(&node_id).await.expect("check ran");
+        let health = checker.get_health(&node_id).await.unwrap();
+        assert!(!health.healthy);
+        assert_eq!(health.total_checks, 2);
     }
 
     /// When the endpoint + template point at an unreachable address,
@@ -692,7 +883,7 @@ mod tests {
         // 127.0.0.1:1 — almost always refused (no daemon on port 1).
         let endpoint = NodeEndpoint::new("127.0.0.1", 1);
         let template = BackendConfig {
-            host: "placeholder".into(),
+            host: "unused".into(),
             port: 0,
             user: "postgres".into(),
             password: None,
@@ -705,10 +896,12 @@ mod tests {
         };
 
         let result = HealthChecker::perform_check(Some(&endpoint), Some(&template), &config).await;
-        assert!(result.is_err(), "expected failure, got {:?}", result);
         // Error should mention either "connect" (refused / unreachable)
         // or the timeout message.
-        let msg = result.unwrap_err();
+        let msg = match result {
+            Err(CheckFailure::Failed(msg)) => msg,
+            other => panic!("expected a failed check, got {other:?}"),
+        };
         assert!(
             msg.contains("connect") || msg.contains("exceeded"),
             "unexpected error message: {}",
@@ -723,7 +916,7 @@ mod tests {
     fn hanging_template(timeout: Duration) -> BackendConfig {
         use crate::backend::{tls::default_client_config, TlsMode};
         BackendConfig {
-            host: "placeholder".into(),
+            host: "unused".into(),
             port: 0,
             user: "postgres".into(),
             password: None,

@@ -316,8 +316,10 @@ before a `CALL` or `DO` in the same cycle or query, or more statements than
 (`tr_session_set_untracked_total`) until `DISCARD ALL`. `SET SESSION AUTHORIZATION`
 ends a tracked `SET ROLE`, as in PostgreSQL. At most `tr_max_tracked_savepoints`
 savepoints per transaction are tracked. `SET`s run inside functions, procedures or `DO`
-blocks are not seen. SQL-level `PREPARE`, session temp tables and cursors are not
-restored.
+blocks are not seen. SQL-level `PREPARE`d statements, temporary tables, `WITH HOLD`
+cursors, `LISTEN` registrations and session-level advisory locks are not restored: a
+session holding any of them is ended with `08006` at a failover instead of continuing
+without them (see [transaction-replay.md](transaction-replay.md#session-state-set-is-restored-the-rest-is-not)).
 
 **Backend credentials.** Re-homing a session means opening a *fresh* backend
 connection. In pass-through auth mode the proxy never sees the client's
@@ -425,7 +427,7 @@ skip_clean_reset = false
 
 ## Connection Pool (`[pool]`)
 
-Core per-node connection pool. *(Required section.)*
+Core per-node connection pool. *(Optional section: every key has a default.)*
 
 ```toml
 [pool]
@@ -450,7 +452,7 @@ test_on_acquire = true
 
 ## Load Balancer (`[load_balancer]`)
 
-*(Required section.)*
+*(Optional section: every key has a default.)*
 
 ```toml
 [load_balancer]
@@ -569,7 +571,7 @@ round-robin).
 
 ## Health Checks (`[health]`)
 
-*(Required section.)*
+*(Optional section: every key has a default.)*
 
 ```toml
 [health]
@@ -885,7 +887,7 @@ answered about 4 200 reads per second over the simple protocol and 4 400 over th
 prepared protocol, against 66 000 and 84 000 with `backend_context_immutable = true`
 added (a build from before the proof existed measured 68 000 over the simple protocol
 in the same run). Under the default proof the cache pays off only for reads that cost the backend
-clearly more than two `SHOW ALL` statements; `proof_ttl_ms` (2.3.0) removes most of
+clearly more than two `SHOW ALL` statements; `proof_ttl_ms` (3.0.0) removes most of
 that cost without the immutability contract.
 
 #### Extended-protocol reads
@@ -952,10 +954,10 @@ explicit transaction, without `FOR UPDATE`/`FOR SHARE`, `SELECT … INTO` or vol
 functions (`now()`, `random()`, `nextval()`, `set_config()`, `localtimestamp`, `txid_current()`,
 `pg_backend_pid()`, the `'now'`/`'today'` literals, …; `[cache] extra_volatile_functions` adds
 yours). `VALUES`, `TABLE` and
-`WITH … SELECT` are not cached. Writes and DDL invalidate. Only the **simple query
-protocol** is served from or stored in the cache: extended-protocol reads (prepared
-statements; asyncpg; psycopg 3 with parameters) always reach the backend. A result a
-standby served is never stored.
+`WITH … SELECT` are not cached. Writes and DDL invalidate. Reads sent with the extended
+protocol (prepared statements; asyncpg; psycopg 3 with parameters) are cached in the two
+batch shapes described under [Extended-protocol reads](#extended-protocol-reads); other
+extended batches reach the backend. A result a standby served is never stored.
 
 Never looked up, captured or stored by **any tier** (L1, L2, L3 and `[edge]`):
 
@@ -3217,6 +3219,14 @@ At startup the proxy validates the loaded config and refuses to start if:
    `admin_allow_insecure = false` (see [Admin API Security](#admin-api-security)).
 6. `edge.enabled = true` without the `edge-proxy` feature, or an `edge` role missing its
    `home_url`, or its zero-value timing knobs, or combined with `[cache]`.
+7. An `[ha]` section is present (even with `strict_config = false`), or
+   `[schema_routing] analytics_node` names no `[[nodes]]` entry.
+8. A key is out of its documented range (for example `[cache] proof_ttl_ms` above
+   300000, `[admin] stats_max_items = 0`, `[rate_limit] window_secs = 0`), or
+   `[mcp] memory_enabled = true` without a `[[mcp.principals]]` entry.
+
+The list is not exhaustive: each section's table names the bounds its keys are checked
+against.
 
 Invalid configurations produce a descriptive error and a non-zero exit code. Unknown
 top-level keys are **warned**, not rejected (see
@@ -3341,8 +3351,10 @@ transaction are likewise deferred until commit. `SET LOCAL`, `SET TRANSACTION` a
 by name (`SET TIME ZONE` is `timezone`, `SET SCHEMA` is `search_path`, `SET NAMES`
 is `client_encoding`), so repeated `SET`s of one variable cost one slot; the role and the
 session authorization always fit, because `RESET ALL` keeps them (as in PostgreSQL) while
-`DISCARD ALL` resets them. Extended-protocol `SET`s inside a transaction or batched with
-other statements, `SQL PREPARE`, temporary tables and cursors are not restored.
+`DISCARD ALL` resets them. Extended-protocol `SET`s are tracked as described under
+[Transaction Replay Modes](#transaction-replay-modes-tr_mode). SQL `PREPARE`d statements,
+temporary tables, `WITH HOLD` cursors, `LISTEN` and session-level advisory locks are not
+restored: a session holding them is ended with `08006` at a failover.
 
 ### Replay verification and the recovery deadline (TR-06)
 

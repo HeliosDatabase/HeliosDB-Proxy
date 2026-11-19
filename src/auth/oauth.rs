@@ -34,18 +34,25 @@ pub enum OAuthError {
 
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
+
+    /// The requested OAuth operation is not implemented in this release. It
+    /// fails closed instead of returning fabricated tokens or introspection
+    /// results.
+    #[error("Not supported: {0}")]
+    NotSupported(String),
 }
 
-/// OAuth client for token introspection
+/// OAuth client for token introspection.
+///
+/// RFC 7662 introspection over HTTP is not implemented in this release:
+/// [`OAuthClient::introspect`] and [`OAuthClient::validate_to_identity`] fail
+/// closed with [`OAuthError::NotSupported`] and never accept a token.
 pub struct OAuthClient {
     /// Configuration
     config: OAuthConfig,
 
     /// Token cache
     cache: Arc<RwLock<TokenCache>>,
-
-    /// HTTP client (placeholder - would use reqwest in real impl)
-    client_id: String,
 }
 
 /// Token introspection response
@@ -247,17 +254,21 @@ impl TokenCache {
 impl OAuthClient {
     /// Create a new OAuth client
     pub fn new(config: OAuthConfig) -> Self {
-        let client_id = config.client_id.clone();
         let cache_ttl = config.cache_ttl;
 
         Self {
             config,
             cache: Arc::new(RwLock::new(TokenCache::new(10000, cache_ttl))),
-            client_id,
         }
     }
 
-    /// Introspect a token
+    /// Introspect a token.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`OAuthError::NotSupported`] in this release: token
+    /// introspection over HTTP is not implemented, so no token is accepted and
+    /// nothing is added to the token cache.
     pub async fn introspect(&self, token: &str) -> Result<IntrospectionResponse, OAuthError> {
         // Check cache first
         if let Some(cached) = self.cache.read().get(token) {
@@ -286,48 +297,20 @@ impl OAuthClient {
         Ok(response)
     }
 
-    /// Perform the actual introspection request
-    async fn do_introspect(&self, token: &str) -> Result<IntrospectionResponse, OAuthError> {
-        // In a real implementation, this would make an HTTP POST request to the
-        // introspection endpoint. For demonstration, we return a placeholder.
-        //
-        // Real implementation would look like:
-        //
-        // let response = reqwest::Client::new()
-        //     .post(&self.config.introspection_url)
-        //     .basic_auth(&self.client_id, Some(&self.client_secret))
-        //     .form(&[("token", token)])
-        //     .send()
-        //     .await
-        //     .map_err(|e| OAuthError::NetworkError(e.to_string()))?;
-        //
-        // let body: IntrospectionResponse = response
-        //     .json()
-        //     .await
-        //     .map_err(|e| OAuthError::InvalidResponse(e.to_string()))?;
-
-        // Placeholder: create a demo response
-        // In production, this would be the actual HTTP call
-        let _ = token; // Suppress unused warning
-
-        Ok(IntrospectionResponse {
-            active: true,
-            scope: Some("read write".to_string()),
-            client_id: Some(self.client_id.clone()),
-            username: Some("oauth_user".to_string()),
-            token_type: Some("Bearer".to_string()),
-            exp: Some(chrono::Utc::now().timestamp() + 3600),
-            iat: Some(chrono::Utc::now().timestamp()),
-            nbf: None,
-            sub: Some("user123".to_string()),
-            aud: self.config.audience.clone(),
-            iss: Some(self.config.issuer.clone()),
-            jti: Some("token-id-123".to_string()),
-            extra: HashMap::new(),
-        })
+    /// Perform the introspection request against the configured endpoint.
+    async fn do_introspect(&self, _token: &str) -> Result<IntrospectionResponse, OAuthError> {
+        Err(OAuthError::NotSupported(format!(
+            "OAuth token introspection over HTTP ({}) is not supported in this release",
+            self.config.introspection_url
+        )))
     }
 
-    /// Validate a token and return identity
+    /// Validate a token and return identity.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`OAuthError::NotSupported`] in this release, because
+    /// [`OAuthClient::introspect`] does.
     pub async fn validate_to_identity(&self, token: &str) -> Result<Identity, OAuthError> {
         let response = self.introspect(token).await?;
 
@@ -381,39 +364,35 @@ impl TokenExchange {
         Self { config }
     }
 
-    /// Exchange an authorization code for tokens
+    /// Exchange an authorization code for tokens.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`OAuthError::NotSupported`] in this release: the OAuth
+    /// token endpoint is not called, and no token is fabricated.
     pub async fn exchange_code(
         &self,
-        code: &str,
-        redirect_uri: &str,
+        _code: &str,
+        _redirect_uri: &str,
     ) -> Result<TokenResponse, OAuthError> {
-        // In a real implementation, this would make an HTTP POST to the token endpoint
-        // For demonstration, return a placeholder
-        let _ = (code, redirect_uri);
-
-        Ok(TokenResponse {
-            access_token: "access_token_placeholder".to_string(),
-            token_type: "Bearer".to_string(),
-            expires_in: Some(3600),
-            refresh_token: Some("refresh_token_placeholder".to_string()),
-            scope: Some("read write".to_string()),
-            id_token: None,
-        })
+        Err(self.token_endpoint_unsupported("authorization code exchange"))
     }
 
-    /// Refresh an access token
-    pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenResponse, OAuthError> {
-        // In a real implementation, this would make an HTTP POST to the token endpoint
-        let _ = refresh_token;
+    /// Refresh an access token.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`OAuthError::NotSupported`] in this release: the OAuth
+    /// token endpoint is not called, and no token is fabricated.
+    pub async fn refresh_token(&self, _refresh_token: &str) -> Result<TokenResponse, OAuthError> {
+        Err(self.token_endpoint_unsupported("access token refresh"))
+    }
 
-        Ok(TokenResponse {
-            access_token: "new_access_token".to_string(),
-            token_type: "Bearer".to_string(),
-            expires_in: Some(3600),
-            refresh_token: Some("new_refresh_token".to_string()),
-            scope: Some("read write".to_string()),
-            id_token: None,
-        })
+    fn token_endpoint_unsupported(&self, operation: &str) -> OAuthError {
+        OAuthError::NotSupported(format!(
+            "OAuth {operation} at the token endpoint ({}) is not supported in this release",
+            self.config.token_url.as_deref().unwrap_or("not configured")
+        ))
     }
 
     /// Get authorization URL
@@ -591,33 +570,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oauth_client_introspect() {
+    async fn introspect_fails_closed_without_caching() {
         let client = OAuthClient::new(test_config());
-        let result = client.introspect("test_token").await.unwrap();
 
-        assert!(result.active);
-        assert!(result.is_valid());
+        for _ in 0..2 {
+            let err = client.introspect("test_token").await.unwrap_err();
+            match err {
+                OAuthError::NotSupported(msg) => {
+                    assert!(msg.contains("introspection"), "{msg}");
+                    assert!(msg.contains("https://auth.example.com/introspect"), "{msg}");
+                }
+                other => panic!("expected NotSupported, got {other:?}"),
+            }
+        }
+        assert_eq!(client.cache_size(), 0);
     }
 
     #[tokio::test]
-    async fn test_oauth_client_cache() {
+    async fn validate_to_identity_fails_closed() {
         let client = OAuthClient::new(test_config());
-
-        // First call caches
-        let _ = client.introspect("test_token").await.unwrap();
-        assert_eq!(client.cache_size(), 1);
-
-        // Second call uses cache
-        let _ = client.introspect("test_token").await.unwrap();
-        assert_eq!(client.cache_size(), 1);
-
-        // Different token adds to cache
-        let _ = client.introspect("another_token").await.unwrap();
-        assert_eq!(client.cache_size(), 2);
-
-        // Clear cache
-        client.clear_cache();
+        assert!(matches!(
+            client.validate_to_identity("test_token").await,
+            Err(OAuthError::NotSupported(_))
+        ));
         assert_eq!(client.cache_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn token_exchange_fails_closed() {
+        let exchange = TokenExchange::new(test_config());
+
+        match exchange.exchange_code("code", "https://app/cb").await {
+            Err(OAuthError::NotSupported(msg)) => {
+                assert!(msg.contains("authorization code exchange"), "{msg}");
+                assert!(msg.contains("https://auth.example.com/token"), "{msg}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+        match exchange.refresh_token("refresh").await {
+            Err(OAuthError::NotSupported(msg)) => {
+                assert!(msg.contains("access token refresh"), "{msg}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
     }
 
     #[test]

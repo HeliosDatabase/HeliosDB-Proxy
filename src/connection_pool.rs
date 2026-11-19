@@ -2,6 +2,12 @@
 //!
 //! Manages connection pooling with configurable limits, idle timeout,
 //! and health-aware connection management.
+//!
+//! Every connection the pool hands out carries a live backend socket. A pool
+//! needs a backend template ([`ConnectionPool::with_backend_template`]) and a
+//! per-node endpoint ([`ConnectionPool::add_node_with_endpoint`]) to open one;
+//! without either, [`ConnectionPool::get_connection`] fails with
+//! [`ProxyError::Pool`] instead of returning a connection with no backend.
 
 use crate::backend::{BackendClient, BackendConfig};
 use crate::{NodeId, ProxyError, Result};
@@ -61,11 +67,19 @@ pub struct PooledConnection {
     /// slot back to the per-node semaphore. `None` in unit-test helpers
     /// that construct `PooledConnection` without going through the pool.
     pub(crate) permit: Option<OwnedSemaphorePermit>,
-    /// Live backend connection. `Some` when the pool was constructed
-    /// with a `BackendConfig` template AND the node has a known endpoint.
-    /// `None` in skeleton / unit-test contexts. Pool-modes release uses
-    /// this to run the reset query; validation uses it to run SELECT 1.
+    /// Live backend connection. Always `Some` for a connection handed out
+    /// by [`ConnectionPool::get_connection`]; `None` only for values built
+    /// directly by crate-internal unit tests. Every operation that needs the
+    /// backend (reset query, validation, checkout liveness) treats `None` as
+    /// a failure, never as success.
     pub(crate) client: Option<BackendClient>,
+}
+
+impl PooledConnection {
+    /// Whether this connection carries a live backend client.
+    pub fn has_live_client(&self) -> bool {
+        self.client.is_some()
+    }
 }
 
 // Custom Debug skips the `BackendClient` which doesn't implement Debug.
@@ -124,9 +138,9 @@ struct NodePool {
     total_created: u64,
     /// Total closed connections
     total_closed: u64,
-    /// Endpoint host:port. `None` keeps the pre-T0-TR1 skeleton
-    /// behaviour — pool operates without a live backend, useful for
-    /// unit tests that construct a pool with synthetic `NodeId`s.
+    /// Endpoint host:port. `None` for a node registered with
+    /// [`ConnectionPool::add_node`]: acquisitions on it fail, because the
+    /// pool has nowhere to connect.
     endpoint: Option<(String, u16)>,
 }
 
@@ -154,10 +168,9 @@ pub struct ConnectionPool {
     active_connections: AtomicU64,
     /// Metrics counters (atomics; snapshotted into PoolMetrics on demand)
     metrics: PoolMetricsCounters,
-    /// Optional backend-connection template. Host/port are overridden
-    /// per-node from `NodePool.endpoint`. When `None`, `create_connection`
-    /// produces a `PooledConnection` with `client: None` — the skeleton
-    /// path used by unit tests that don't want to open real sockets.
+    /// Backend-connection template. Host/port are overridden per-node
+    /// from `NodePool.endpoint`. When `None`, every acquisition fails with
+    /// [`ProxyError::Pool`]: the pool cannot open a backend connection.
     backend_template: Option<BackendConfig>,
 }
 
@@ -223,14 +236,20 @@ impl ConnectionPool {
     /// Attach a backend-connection template. With a template *and* a
     /// per-node endpoint (set via `add_node_with_endpoint`), the pool
     /// opens real PG connections via `crate::backend::BackendClient`.
-    /// Without a template the pool stays in skeleton mode — existing
-    /// tests that use synthetic `NodeId`s keep passing unchanged.
+    /// Without a template, [`Self::get_connection`] fails with
+    /// [`ProxyError::Pool`].
     pub fn with_backend_template(mut self, template: BackendConfig) -> Self {
         self.backend_template = Some(template);
         self
     }
 
-    /// Add a node to the pool (skeleton mode — no real backend).
+    /// Register a node without an endpoint.
+    ///
+    /// The node gets its per-node slot accounting (stats, eviction,
+    /// `max_connections` semaphore), but the pool has no address to connect
+    /// to, so [`Self::get_connection`] for it fails with [`ProxyError::Pool`].
+    /// Use [`Self::add_node_with_endpoint`] for a node that serves
+    /// connections.
     pub async fn add_node(&self, node_id: NodeId) {
         let mut pools = self.pools.write().await;
         if let std::collections::hash_map::Entry::Vacant(e) = pools.entry(node_id) {
@@ -290,28 +309,37 @@ impl ConnectionPool {
     /// no check (peek included) is performed and every idle connection is
     /// accepted as-is.
     ///
-    /// * With a live backend client we run the free, non-blocking socket
-    ///   peek — a connection the backend closed while it sat idle must
-    ///   never be handed out.
-    /// * Without a socket to peek at (skeleton connections) we fall back to
-    ///   `validate_connection`.
+    /// With it `true`, [`Self::validate_connection`] runs the free,
+    /// non-blocking socket peek: a connection the backend closed while it
+    /// sat idle, or one without a backend client, is never handed out.
     async fn checkout_liveness_ok(&self, conn: &PooledConnection) -> bool {
         if !self.config.test_on_acquire {
             return true;
         }
-
-        if let Some(client) = conn.client.as_ref() {
-            if client.is_probably_alive() {
-                return true;
-            }
-            self.metrics
-                .validation_failures
-                .fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-
         // `validate_connection` counts its own failures.
         matches!(self.validate_connection(conn).await, Ok(true))
+    }
+
+    /// Why `node_id` cannot serve connections, if it cannot: no backend
+    /// template on the pool, or no endpoint for the node.
+    fn unconfigured_reason(&self, node_id: &NodeId, pool: &NodePool) -> Option<String> {
+        if self.backend_template.is_none() {
+            return Some(format!(
+                "connection pool has no backend template, so it cannot open a backend \
+                 connection for node {:?}; attach one with \
+                 ConnectionPool::with_backend_template",
+                node_id
+            ));
+        }
+        if pool.endpoint.is_none() {
+            return Some(format!(
+                "node {:?} was registered without an endpoint, so the pool cannot open a \
+                 backend connection for it; register it with \
+                 ConnectionPool::add_node_with_endpoint",
+                node_id
+            ));
+        }
+        None
     }
 
     /// Remove a node from the pool
@@ -324,7 +352,11 @@ impl ConnectionPool {
         }
     }
 
-    /// Get a connection from the pool
+    /// Get a connection from the pool.
+    ///
+    /// Fails with [`ProxyError::Pool`] when the pool has no backend template
+    /// or the node no endpoint (see [`Self::add_node`]): the pool never hands
+    /// out a connection without a live backend client.
     pub async fn get_connection(&self, node_id: &NodeId) -> Result<PooledConnection> {
         self.metrics.acquires.fetch_add(1, Ordering::Relaxed);
 
@@ -336,6 +368,12 @@ impl ConnectionPool {
             let pool = pools.get_mut(node_id).ok_or_else(|| {
                 ProxyError::Connection(format!("Node {:?} not found in pool", node_id))
             })?;
+            if let Some(reason) = self.unconfigured_reason(node_id, pool) {
+                self.metrics
+                    .acquire_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ProxyError::Pool(reason));
+            }
 
             let semaphore = pool.semaphore.clone();
             let idle = pool
@@ -468,40 +506,43 @@ impl ConnectionPool {
 
     /// Create a new connection, attaching the given semaphore permit.
     ///
-    /// If the pool has a `backend_template` AND the node has an
-    /// endpoint, a live `BackendClient` is opened via TCP (+ optional
-    /// TLS) and bundled into the returned `PooledConnection`. Otherwise
-    /// the returned connection has `client: None` — the skeleton path
-    /// for tests and for deployments that manage their own wire-level
-    /// forwarding.
+    /// Opens a live `BackendClient` via TCP (+ optional TLS) from the
+    /// pool's `backend_template` and the node's endpoint, and bundles it
+    /// into the returned `PooledConnection`. Fails with
+    /// [`ProxyError::Pool`] when either is missing.
     async fn create_connection(
         &self,
         node_id: NodeId,
         permit: Option<OwnedSemaphorePermit>,
     ) -> Result<PooledConnection> {
-        let endpoint = self
-            .pools
-            .read()
-            .await
-            .get(&node_id)
-            .and_then(|p| p.endpoint.clone());
-
-        let client = match (&self.backend_template, endpoint) {
-            (Some(template), Some((host, port))) => {
-                let mut cfg = template.clone();
-                cfg.host = host;
-                cfg.port = port;
-                match BackendClient::connect(&cfg).await {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        return Err(ProxyError::Connection(format!(
-                            "backend connect for node {:?} failed: {}",
-                            node_id, e
-                        )));
-                    }
+        let cfg = {
+            let pools = self.pools.read().await;
+            let pool = pools.get(&node_id).ok_or_else(|| {
+                ProxyError::Connection(format!("Node {:?} not found in pool", node_id))
+            })?;
+            match (&self.backend_template, &pool.endpoint) {
+                (Some(template), Some((host, port))) => {
+                    let mut cfg = template.clone();
+                    cfg.host = host.clone();
+                    cfg.port = *port;
+                    cfg
+                }
+                _ => {
+                    let reason = self
+                        .unconfigured_reason(&node_id, pool)
+                        .unwrap_or_else(|| format!("node {:?} is not configured", node_id));
+                    return Err(ProxyError::Pool(reason));
                 }
             }
-            _ => None,
+        };
+        let client = match BackendClient::connect(&cfg).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                return Err(ProxyError::Connection(format!(
+                    "backend connect for node {:?} failed: {}",
+                    node_id, e
+                )));
+            }
         };
 
         let now = chrono::Utc::now();
@@ -520,53 +561,51 @@ impl ConnectionPool {
             .connections_created
             .fetch_add(1, Ordering::Relaxed);
 
-        tracing::debug!(
-            "Created connection {:?} for node {:?} (live={})",
-            conn.id,
-            node_id,
-            conn.client.is_some()
-        );
+        tracing::debug!("Created connection {:?} for node {:?}", conn.id, node_id);
 
         Ok(conn)
     }
 
-    /// Validate a connection.
+    /// Validate a connection with a socket-level liveness check.
     ///
-    /// When a live backend client is attached, runs `SELECT 1`. When
-    /// no client is attached, falls back to the pre-T0-TR1 state
-    /// check — useful for tests that don't stand up a real backend.
+    /// Returns `Ok(false)` (and counts a validation failure) for a closed
+    /// connection, for one without a live backend client, and for one
+    /// whose socket the non-blocking peek finds closed, errored or holding
+    /// unexpected unread bytes. This is a peek, not a query round-trip: a
+    /// backend that accepts bytes but no longer answers queries is found
+    /// by the next query, not here.
     pub async fn validate_connection(&self, conn: &PooledConnection) -> Result<bool> {
-        if conn.state == ConnectionState::Closed {
+        let alive = conn.state != ConnectionState::Closed
+            && conn
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_probably_alive());
+        if !alive {
             self.metrics
                 .validation_failures
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
         }
-        // Real ping when a live client is attached. We use a short
-        // dedicated timeout rather than the pool's acquire_timeout to
-        // avoid confusing a slow validation with a slow acquire.
-        if let Some(client) = &conn.client {
-            // We can't mutate `conn` through `&PooledConnection`, so we
-            // only gate on whether the client exists and is over TLS-or-
-            // plain — we don't actually send a ping here, because doing
-            // so would need `&mut`. Callers that want a ping use
-            // `run_reset_query` / `ping_mut`. Returning `true` here
-            // matches the skeleton contract: "this handle looks alive."
-            let _ = client; // acknowledged present
-        }
-        Ok(true)
+        Ok(alive)
     }
 
-    /// Run a reset query on a connection (if live) before returning it
-    /// to the pool. Used by pool-modes `release` for Transaction and
-    /// Statement modes.
+    /// Run a reset query on a connection before returning it to the pool.
+    /// Used by pool-modes `release` for Transaction and Statement modes.
+    ///
+    /// Fails with [`ProxyError::Pool`] when the connection has no live
+    /// backend client (the reset cannot run), and with
+    /// [`ProxyError::Connection`] when the backend rejects or does not
+    /// answer the query.
     pub async fn run_reset_query(&self, conn: &mut PooledConnection, query: &str) -> Result<()> {
-        if let Some(client) = conn.client.as_mut() {
-            client
-                .execute(query)
-                .await
-                .map_err(|e| ProxyError::Connection(format!("reset query failed: {}", e)))?;
-        }
+        let client = conn.client.as_mut().ok_or_else(|| {
+            ProxyError::Pool(format!(
+                "reset query not run on connection {:?}: it has no live backend client",
+                conn.id
+            ))
+        })?;
+        client
+            .execute(query)
+            .await
+            .map_err(|e| ProxyError::Connection(format!("reset query failed: {}", e)))?;
         Ok(())
     }
 
@@ -647,9 +686,204 @@ pub struct NodePoolStats {
     pub total_closed: u64,
 }
 
+/// Minimal in-process PostgreSQL wire backend for unit tests: answers the
+/// startup handshake (trust auth) and simple queries, records every query
+/// text, and can drop every open connection on demand. Shared with the
+/// pool-modes manager tests.
+#[cfg(test)]
+pub(crate) mod test_backend {
+    use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
+
+    pub(crate) struct FakePg {
+        pub(crate) addr: SocketAddr,
+        queries: Arc<Mutex<Vec<String>>>,
+        accepted: Arc<AtomicUsize>,
+        fail_queries: Arc<AtomicBool>,
+        kill: Arc<watch::Sender<u64>>,
+    }
+
+    impl FakePg {
+        pub(crate) async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            let queries = Arc::new(Mutex::new(Vec::new()));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let fail_queries = Arc::new(AtomicBool::new(false));
+            let (kill, _) = watch::channel(0u64);
+            let kill = Arc::new(kill);
+            {
+                let queries = queries.clone();
+                let accepted = accepted.clone();
+                let fail_queries = fail_queries.clone();
+                let kill = kill.clone();
+                tokio::spawn(async move {
+                    while let Ok((sock, _)) = listener.accept().await {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                        let queries = queries.clone();
+                        let fail_queries = fail_queries.clone();
+                        let kill_rx = kill.subscribe();
+                        tokio::spawn(async move {
+                            let _ = serve_conn(sock, queries, fail_queries, kill_rx).await;
+                        });
+                    }
+                });
+            }
+            Self {
+                addr,
+                queries,
+                accepted,
+                fail_queries,
+                kill,
+            }
+        }
+
+        /// A backend template whose host/port the pool overrides per node.
+        pub(crate) fn template(&self) -> BackendConfig {
+            BackendConfig {
+                host: self.addr.ip().to_string(),
+                port: self.addr.port(),
+                user: "postgres".into(),
+                password: None,
+                database: None,
+                application_name: Some("helios-pool-test".into()),
+                tls_mode: TlsMode::Disable,
+                connect_timeout: Duration::from_secs(2),
+                query_timeout: Duration::from_secs(2),
+                tls_config: default_client_config(),
+            }
+        }
+
+        /// Every query text received so far, in order.
+        pub(crate) fn queries(&self) -> Vec<String> {
+            self.queries.lock().expect("queries lock").clone()
+        }
+
+        /// Number of backend connections accepted so far.
+        pub(crate) fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+
+        /// Answer every following query with an ErrorResponse.
+        pub(crate) fn fail_queries(&self, fail: bool) {
+            self.fail_queries.store(fail, Ordering::SeqCst);
+        }
+
+        /// Close every currently open backend connection (new ones are
+        /// still accepted).
+        pub(crate) fn drop_connections(&self) {
+            self.kill.send_modify(|generation| *generation += 1);
+        }
+    }
+
+    async fn serve_conn(
+        mut sock: TcpStream,
+        queries: Arc<Mutex<Vec<String>>>,
+        fail_queries: Arc<AtomicBool>,
+        mut kill_rx: watch::Receiver<u64>,
+    ) -> std::io::Result<()> {
+        // StartupMessage: [len: u32 incl. itself][protocol + parameters].
+        let len = sock.read_u32().await? as usize;
+        let mut startup = vec![0u8; len.saturating_sub(4)];
+        sock.read_exact(&mut startup).await?;
+        // AuthenticationOk, then ReadyForQuery (idle).
+        sock.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+        sock.write_all(&[b'Z', 0, 0, 0, 5, b'I']).await?;
+
+        loop {
+            let tag = tokio::select! {
+                tag = sock.read_u8() => tag?,
+                _ = kill_rx.changed() => return Ok(()),
+            };
+            let len = sock.read_u32().await? as usize;
+            let mut body = vec![0u8; len.saturating_sub(4)];
+            sock.read_exact(&mut body).await?;
+            match tag {
+                b'Q' => {
+                    let text = String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(&body))
+                        .into_owned();
+                    queries.lock().expect("queries lock").push(text);
+                    if fail_queries.load(Ordering::SeqCst) {
+                        let mut fields = Vec::new();
+                        fields.extend_from_slice(b"SERROR\0CXX000\0Mfake backend failure\0\0");
+                        let mut msg = vec![b'E'];
+                        msg.extend_from_slice(&((fields.len() + 4) as u32).to_be_bytes());
+                        msg.extend_from_slice(&fields);
+                        sock.write_all(&msg).await?;
+                    } else {
+                        let tag = b"OK\0";
+                        let mut msg = vec![b'C'];
+                        msg.extend_from_slice(&((tag.len() + 4) as u32).to_be_bytes());
+                        msg.extend_from_slice(tag);
+                        sock.write_all(&msg).await?;
+                    }
+                    sock.write_all(&[b'Z', 0, 0, 0, 5, b'I']).await?;
+                }
+                b'X' => return Ok(()),
+                _ => {}
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_backend::FakePg;
     use super::*;
+
+    /// A pool with a backend template and one node whose endpoint is a
+    /// live fake backend.
+    async fn live_pool(config: PoolConfig) -> (ConnectionPool, NodeId, FakePg) {
+        let backend = FakePg::start().await;
+        let pool = ConnectionPool::new(config).with_backend_template(backend.template());
+        let node_id = NodeId::new();
+        pool.add_node_with_endpoint(node_id, backend.addr.ip().to_string(), backend.addr.port())
+            .await;
+        (pool, node_id, backend)
+    }
+
+    /// Wait until the pool's single parked connection for `node_id` sees its
+    /// socket closed by the backend.
+    async fn wait_until_parked_dead(pool: &ConnectionPool, node_id: &NodeId) {
+        for _ in 0..200 {
+            {
+                let pools = pool.pools.read().await;
+                let parked = &pools.get(node_id).expect("node pool").connections[0];
+                if !parked
+                    .client
+                    .as_ref()
+                    .expect("live client")
+                    .is_probably_alive()
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("socket never observed dead (FIN never arrived) — test is inconclusive");
+    }
+
+    /// A connection value with no backend client, as only crate-internal
+    /// tests can build one.
+    fn detached_connection(node_id: NodeId) -> PooledConnection {
+        let now = chrono::Utc::now();
+        PooledConnection {
+            id: Uuid::new_v4(),
+            node_id,
+            created_at: now,
+            last_used: now,
+            state: ConnectionState::InUse,
+            use_count: 1,
+            permit: None,
+            client: None,
+        }
+    }
 
     #[test]
     fn test_pool_config_default() {
@@ -673,16 +907,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_return_connection() {
-        let pool = ConnectionPool::new(PoolConfig::default());
-        let node_id = NodeId::new();
-
-        pool.add_node(node_id).await;
+        let (pool, node_id, backend) = live_pool(PoolConfig::default()).await;
 
         // Get connection
         let conn = pool.get_connection(&node_id).await.expect("get failed");
         assert_eq!(conn.node_id, node_id);
         assert_eq!(conn.state, ConnectionState::InUse);
+        assert!(conn.has_live_client());
         assert_eq!(pool.active_connections().await, 1);
+        assert_eq!(backend.accepted(), 1);
 
         // Return connection
         pool.return_connection(conn).await;
@@ -691,10 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics() {
-        let pool = ConnectionPool::new(PoolConfig::default());
-        let node_id = NodeId::new();
-
-        pool.add_node(node_id).await;
+        let (pool, node_id, _backend) = live_pool(PoolConfig::default()).await;
 
         let conn = pool.get_connection(&node_id).await.expect("get failed");
         pool.return_connection(conn).await;
@@ -710,14 +940,13 @@ mod tests {
     /// an unlimited number of simultaneously-active connections.
     #[tokio::test]
     async fn test_max_connections_enforced_while_in_use() {
-        let pool = ConnectionPool::new(PoolConfig {
+        let (pool, node_id, _backend) = live_pool(PoolConfig {
             min_connections: 0,
             max_connections: 2,
             acquire_timeout: Duration::from_millis(50),
             ..Default::default()
-        });
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
+        })
+        .await;
 
         let c1 = pool.get_connection(&node_id).await.expect("first acquire");
         let c2 = pool.get_connection(&node_id).await.expect("second acquire");
@@ -753,7 +982,7 @@ mod tests {
         use crate::backend::{tls::default_client_config, TlsMode};
 
         let template = BackendConfig {
-            host: "placeholder".into(),
+            host: "unused".into(),
             port: 0,
             user: "postgres".into(),
             password: None,
@@ -792,19 +1021,151 @@ mod tests {
         }
     }
 
-    /// Without a backend template, `add_node_with_endpoint` still works
-    /// — the resulting connection has `client: None`, same as the
-    /// pre-T0-TR1 skeleton. Preserves test ergonomics for callers that
-    /// don't want real network I/O.
+    /// Fail closed: without a backend template the pool cannot open a
+    /// backend connection, so an acquire is an explicit `Pool` error — it
+    /// never hands out a connection without a live client.
     #[tokio::test]
-    async fn test_add_node_with_endpoint_but_no_template_returns_skeleton_client() {
+    async fn test_acquire_without_template_fails_closed() {
         let pool = ConnectionPool::new(PoolConfig::default());
         let node_id = NodeId::new();
         pool.add_node_with_endpoint(node_id, "127.0.0.1", 5432)
             .await;
 
+        let err = pool
+            .get_connection(&node_id)
+            .await
+            .expect_err("acquire without a backend template must fail");
+        match err {
+            ProxyError::Pool(msg) => assert!(
+                msg.contains("no backend template"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected Pool error, got {other:?}"),
+        }
+        let metrics = pool.metrics().await;
+        assert_eq!(metrics.acquire_failures, 1);
+        assert_eq!(metrics.connections_created, 0);
+        assert_eq!(pool.total_connections().await, 0);
+        assert_eq!(pool.active_connections().await, 0);
+    }
+
+    /// Fail closed: a node registered with `add_node` has no endpoint, so
+    /// even with a template the acquire is an explicit `Pool` error.
+    #[tokio::test]
+    async fn test_acquire_without_endpoint_fails_closed() {
+        let backend = FakePg::start().await;
+        let pool =
+            ConnectionPool::new(PoolConfig::default()).with_backend_template(backend.template());
+        let node_id = NodeId::new();
+        pool.add_node(node_id).await;
+
+        let err = pool
+            .get_connection(&node_id)
+            .await
+            .expect_err("acquire for a node without an endpoint must fail");
+        match err {
+            ProxyError::Pool(msg) => assert!(
+                msg.contains("without an endpoint"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected Pool error, got {other:?}"),
+        }
+        assert_eq!(backend.accepted(), 0, "no backend connection may be opened");
+        assert_eq!(pool.metrics().await.acquire_failures, 1);
+    }
+
+    /// `validate_connection` reports a connection without a backend client
+    /// as not valid (it used to report it as "looks alive").
+    #[tokio::test]
+    async fn test_validate_connection_without_client_is_invalid() {
+        let pool = ConnectionPool::new(PoolConfig::default());
+        let conn = detached_connection(NodeId::new());
+
+        assert!(!pool.validate_connection(&conn).await.expect("validate"));
+        assert_eq!(pool.metrics().await.validation_failures, 1);
+    }
+
+    /// `validate_connection` accepts a live socket and rejects one the
+    /// backend closed.
+    #[tokio::test]
+    async fn test_validate_connection_checks_the_socket() {
+        let (pool, node_id, backend) = live_pool(PoolConfig::default()).await;
         let conn = pool.get_connection(&node_id).await.expect("acquire");
-        assert!(conn.client.is_none(), "no template → no live client");
+        assert!(pool.validate_connection(&conn).await.expect("validate"));
+
+        backend.drop_connections();
+        let mut invalid = false;
+        for _ in 0..200 {
+            if !pool.validate_connection(&conn).await.expect("validate") {
+                invalid = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(invalid, "closed backend socket was still reported valid");
+    }
+
+    /// `run_reset_query` fails when there is no backend to run it on,
+    /// instead of reporting a reset that never ran.
+    #[tokio::test]
+    async fn test_run_reset_query_without_client_errors() {
+        let pool = ConnectionPool::new(PoolConfig::default());
+        let mut conn = detached_connection(NodeId::new());
+
+        let err = pool
+            .run_reset_query(&mut conn, "DISCARD ALL")
+            .await
+            .expect_err("reset without a backend client must fail");
+        match err {
+            ProxyError::Pool(msg) => assert!(
+                msg.contains("no live backend client"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected Pool error, got {other:?}"),
+        }
+    }
+
+    /// `run_reset_query` sends the query to the backend and surfaces a
+    /// backend error.
+    #[tokio::test]
+    async fn test_run_reset_query_runs_on_backend() {
+        let (pool, node_id, backend) = live_pool(PoolConfig::default()).await;
+        let mut conn = pool.get_connection(&node_id).await.expect("acquire");
+
+        pool.run_reset_query(&mut conn, "DISCARD ALL")
+            .await
+            .expect("reset");
+        assert_eq!(backend.queries(), vec!["DISCARD ALL".to_string()]);
+
+        backend.fail_queries(true);
+        let err = pool
+            .run_reset_query(&mut conn, "DISCARD ALL")
+            .await
+            .expect_err("backend error must surface");
+        assert!(matches!(err, ProxyError::Connection(_)), "got {err:?}");
+    }
+
+    /// An idle connection without a backend client is never handed out at
+    /// checkout: it is recycled and replaced with a live one.
+    #[tokio::test]
+    async fn test_idle_connection_without_client_is_not_handed_out() {
+        let (pool, node_id, _backend) = live_pool(PoolConfig {
+            test_on_acquire: true,
+            ..Default::default()
+        })
+        .await;
+        let detached = detached_connection(node_id);
+        let detached_id = detached.id;
+        pool.active_connections.fetch_add(1, Ordering::SeqCst);
+        pool.total_connections.fetch_add(1, Ordering::SeqCst);
+        pool.return_connection(detached).await;
+
+        let conn = pool.get_connection(&node_id).await.expect("acquire");
+        assert_ne!(conn.id, detached_id);
+        assert!(conn.has_live_client());
+        let metrics = pool.metrics().await;
+        assert_eq!(metrics.validation_failures, 1);
+        assert_eq!(metrics.connections_recycled, 1);
     }
 
     /// Regression (gauge leak): a connection that is checked out when its
@@ -814,9 +1175,7 @@ mod tests {
     /// otherwise `total_connections` climbs forever.
     #[tokio::test]
     async fn test_return_after_remove_node_decrements_total_connections() {
-        let pool = ConnectionPool::new(PoolConfig::default());
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
+        let (pool, node_id, _backend) = live_pool(PoolConfig::default()).await;
 
         let conn = pool.get_connection(&node_id).await.expect("acquire");
         assert_eq!(pool.total_connections().await, 1);
@@ -840,9 +1199,7 @@ mod tests {
     /// when `close_all` has already zeroed both.
     #[tokio::test]
     async fn test_return_after_remove_node_does_not_underflow_total() {
-        let pool = ConnectionPool::new(PoolConfig::default());
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
+        let (pool, node_id, _backend) = live_pool(PoolConfig::default()).await;
 
         let conn = pool.get_connection(&node_id).await.expect("acquire");
         pool.remove_node(&node_id).await;
@@ -869,53 +1226,24 @@ mod tests {
     /// by default.
     #[tokio::test]
     async fn test_closed_socket_is_not_handed_out_on_checkout() {
-        use tokio::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-        let client_sock = TcpStream::connect(addr).await.expect("connect");
-        let (server_sock, _) = listener.accept().await.expect("accept");
-
-        let pool = ConnectionPool::new(PoolConfig {
+        let (pool, node_id, backend) = live_pool(PoolConfig {
             min_connections: 0,
             max_connections: 4,
             test_on_acquire: true,
             acquire_timeout: Duration::from_millis(500),
             ..Default::default()
-        });
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
+        })
+        .await;
 
-        // Attach a real socket to the pooled connection, then park it.
-        let mut conn = pool.get_connection(&node_id).await.expect("acquire");
+        // Park a live connection.
+        let conn = pool.get_connection(&node_id).await.expect("acquire");
         let dead_id = conn.id;
-        conn.client = Some(BackendClient::from_tcp_for_test(client_sock));
         pool.return_connection(conn).await;
         assert_eq!(pool.total_connections().await, 1);
 
-        // Backend disappears while the connection sits idle.
-        drop(server_sock);
-        let mut observed_dead = false;
-        for _ in 0..50 {
-            {
-                let pools = pool.pools.read().await;
-                let parked = &pools.get(&node_id).expect("node pool").connections[0];
-                if !parked
-                    .client
-                    .as_ref()
-                    .expect("live client")
-                    .is_probably_alive()
-                {
-                    observed_dead = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            observed_dead,
-            "socket never observed dead (FIN never arrived) — test is inconclusive"
-        );
+        // Backend closes it while the connection sits idle.
+        backend.drop_connections();
+        wait_until_parked_dead(&pool, &node_id).await;
 
         let fresh = pool.get_connection(&node_id).await.expect("re-acquire");
         assert_ne!(
@@ -941,57 +1269,27 @@ mod tests {
     }
 
     /// Regression (spec deviation): `test_on_acquire = false` must skip
-    /// ALL acquire-time validation, including the live-socket peek — not
-    /// just the skeleton-connection `validate_connection` fallback. This
+    /// ALL acquire-time validation, including the live-socket peek. This
     /// is the operator's one on/off switch for the checkout liveness gate.
     #[tokio::test]
     async fn test_on_acquire_false_skips_dead_socket_peek() {
-        use tokio::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-        let client_sock = TcpStream::connect(addr).await.expect("connect");
-        let (server_sock, _) = listener.accept().await.expect("accept");
-
-        let pool = ConnectionPool::new(PoolConfig {
+        let (pool, node_id, backend) = live_pool(PoolConfig {
             min_connections: 0,
             max_connections: 4,
             test_on_acquire: false,
             acquire_timeout: Duration::from_millis(500),
             ..Default::default()
-        });
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
+        })
+        .await;
 
-        // Attach a real socket to the pooled connection, then park it.
-        let mut conn = pool.get_connection(&node_id).await.expect("acquire");
+        // Park a live connection.
+        let conn = pool.get_connection(&node_id).await.expect("acquire");
         let parked_id = conn.id;
-        conn.client = Some(BackendClient::from_tcp_for_test(client_sock));
         pool.return_connection(conn).await;
 
-        // Backend disappears while the connection sits idle.
-        drop(server_sock);
-        let mut observed_dead = false;
-        for _ in 0..50 {
-            {
-                let pools = pool.pools.read().await;
-                let parked = &pools.get(&node_id).expect("node pool").connections[0];
-                if !parked
-                    .client
-                    .as_ref()
-                    .expect("live client")
-                    .is_probably_alive()
-                {
-                    observed_dead = true;
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            observed_dead,
-            "socket never observed dead (FIN never arrived) — test is inconclusive"
-        );
+        // Backend closes it while the connection sits idle.
+        backend.drop_connections();
+        wait_until_parked_dead(&pool, &node_id).await;
 
         // With test_on_acquire = false, the dead connection must still be
         // handed back out — no peek, no validate_connection.
@@ -1016,25 +1314,16 @@ mod tests {
     /// throw away healthy idle connections.
     #[tokio::test]
     async fn test_live_socket_connection_is_reused_on_checkout() {
-        use tokio::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local_addr");
-        let client_sock = TcpStream::connect(addr).await.expect("connect");
-        let (_server_sock, _) = listener.accept().await.expect("accept");
-
-        let pool = ConnectionPool::new(PoolConfig {
+        let (pool, node_id, backend) = live_pool(PoolConfig {
             min_connections: 0,
             max_connections: 4,
             test_on_acquire: true,
             ..Default::default()
-        });
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
+        })
+        .await;
 
-        let mut conn = pool.get_connection(&node_id).await.expect("acquire");
+        let conn = pool.get_connection(&node_id).await.expect("acquire");
         let live_id = conn.id;
-        conn.client = Some(BackendClient::from_tcp_for_test(client_sock));
         pool.return_connection(conn).await;
 
         let reused = pool.get_connection(&node_id).await.expect("re-acquire");
@@ -1042,20 +1331,20 @@ mod tests {
         let metrics = pool.metrics().await;
         assert_eq!(metrics.connections_created, 1);
         assert_eq!(metrics.validation_failures, 0);
+        assert_eq!(backend.accepted(), 1);
     }
 
     /// Returning a connection to the pool keeps the permit attached, so
     /// reusing it should not consume a new permit.
     #[tokio::test]
     async fn test_return_then_reacquire_reuses_permit() {
-        let pool = ConnectionPool::new(PoolConfig {
+        let (pool, node_id, _backend) = live_pool(PoolConfig {
             min_connections: 0,
             max_connections: 1,
             acquire_timeout: Duration::from_millis(50),
             ..Default::default()
-        });
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
+        })
+        .await;
 
         let c1 = pool.get_connection(&node_id).await.expect("first acquire");
         pool.return_connection(c1).await;

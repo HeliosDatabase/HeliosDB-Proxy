@@ -446,7 +446,12 @@ mod journal_benches {
 // ─────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "pool-modes")]
+#[path = "support/fake_pg.rs"]
+mod fake_pg;
+
+#[cfg(feature = "pool-modes")]
 mod pool_mode_benches {
+    use super::fake_pg::FakePg;
     use super::*;
     use heliosdb_proxy::pool::lease::ClientId;
     use heliosdb_proxy::pool::prepared::{parse_deallocate_statement, parse_prepare_statement};
@@ -546,21 +551,25 @@ mod pool_mode_benches {
     }
 
     /// Mode-aware pooling hot path under real client concurrency: K tasks, each
-    /// with its own client id, run acquire -> release against a skeleton-mode
-    /// manager (DashMap lease insert/remove + underlying skeleton pool acquire +
-    /// the transaction-mode reset bookkeeping). No backend needed.
+    /// with its own client id, run acquire -> release against a manager whose
+    /// connections go to a scripted loopback backend ([`FakePg`]): DashMap
+    /// lease insert/remove, pool acquire with its liveness check, and the
+    /// transaction-mode reset (`DISCARD ALL`, one round trip) on release.
     pub fn bench_manager_contention(c: &mut Criterion) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (manager, node_id) = rt.block_on(async {
+        let (manager, node_id, _backend) = rt.block_on(async {
+            let backend = FakePg::start().await;
             let config = PoolModeConfig {
                 max_pool_size: 128,
                 ..PoolModeConfig::transaction_mode()
             };
-            let manager = Arc::new(ConnectionPoolManager::new(config));
-            let node = NodeEndpoint::new("127.0.0.1", 5432);
+            let manager = Arc::new(
+                ConnectionPoolManager::new(config).with_backend_template(backend.template()),
+            );
+            let node = NodeEndpoint::new(backend.addr.ip().to_string(), backend.addr.port());
             let node_id = node.id;
             manager.add_node(&node).await;
-            (manager, node_id)
+            (manager, node_id, backend)
         });
 
         let mut group = c.benchmark_group("pool_mode/manager_acquire_release");
@@ -596,20 +605,23 @@ mod pool_mode_benches {
 
     /// The synchronous per-statement decision: `TransactionEvent::detect` + the
     /// lease state machine + the DashMap statement-counter bump, driven over a
-    /// BEGIN..COMMIT sequence against one skeleton lease held across iterations.
+    /// BEGIN..COMMIT sequence against one lease (on a scripted loopback
+    /// backend) held across iterations.
     pub fn bench_manager_on_statement_complete(c: &mut Criterion) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (manager, mut lease) = rt.block_on(async {
+        let (manager, mut lease, _backend) = rt.block_on(async {
+            let backend = FakePg::start().await;
             let config = PoolModeConfig {
                 max_pool_size: 16,
                 ..PoolModeConfig::transaction_mode()
             };
-            let manager = ConnectionPoolManager::new(config);
-            let node = NodeEndpoint::new("127.0.0.1", 5432);
+            let manager =
+                ConnectionPoolManager::new(config).with_backend_template(backend.template());
+            let node = NodeEndpoint::new(backend.addr.ip().to_string(), backend.addr.port());
             manager.add_node(&node).await;
             let cid = ClientId::new();
             let lease = manager.acquire(cid, &node.id).await.unwrap();
-            (manager, lease)
+            (manager, lease, backend)
         });
 
         let sqls = [

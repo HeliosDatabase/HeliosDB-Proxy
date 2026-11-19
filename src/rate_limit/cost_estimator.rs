@@ -254,12 +254,7 @@ impl QueryCostEstimator {
         }
 
         // DELETE or UPDATE without WHERE
-        if (upper.starts_with("DELETE") || upper.starts_with("UPDATE")) && !upper.contains("WHERE")
-        {
-            return true;
-        }
-
-        false
+        (upper.starts_with("DELETE") || upper.starts_with("UPDATE")) && !upper.contains("WHERE")
     }
 
     /// Extract any cost hint from the query

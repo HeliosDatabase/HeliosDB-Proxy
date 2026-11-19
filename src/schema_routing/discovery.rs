@@ -1,18 +1,18 @@
 //! Schema Auto-Discovery
 //!
-//! Automatically discovers table schemas from database metadata.
-//! Supports PostgreSQL information_schema and system catalogs.
+//! Discovery configuration and inference of table properties (temperature,
+//! access pattern, workload) from table statistics.
+//!
+//! Discovery against a backend database is not supported in this release:
+//! the backend-reading methods of [`SchemaDiscovery`] fail with
+//! [`DiscoveryError::BackendDiscoveryUnsupported`] rather than return
+//! fabricated schemas.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-use super::registry::{IndexType, RelationshipType, StorageType};
-use super::{
-    AccessPattern, ColumnSchema, DataTemperature, IndexSchema, Relationship, TableSchema,
-    WorkloadType,
-};
+use super::{AccessPattern, DataTemperature, IndexSchema, Relationship, TableSchema, WorkloadType};
 
 /// Configuration for schema discovery
 #[derive(Debug, Clone)]
@@ -54,21 +54,21 @@ impl Default for DiscoveryConfig {
 }
 
 /// Schema discovery from database metadata
+///
+/// This release has no backend connection for discovery: the methods that
+/// would read the catalogs of a live database ([`SchemaDiscovery::discover`],
+/// [`SchemaDiscovery::discover_table`], [`SchemaDiscovery::discover_indexes`],
+/// [`SchemaDiscovery::discover_relationships`],
+/// [`SchemaDiscovery::get_statistics`]) fail with
+/// [`DiscoveryError::BackendDiscoveryUnsupported`] instead of returning
+/// fabricated schemas. Register tables explicitly with
+/// `SchemaRegistry::register_table`. The pure inference helpers
+/// (`infer_temperature`, `infer_access_pattern`, `infer_workload`) work on
+/// caller-supplied [`TableStatistics`].
 pub struct SchemaDiscovery {
     config: DiscoveryConfig,
-    /// Cached discovered schemas
-    cache: Arc<RwLock<DiscoveryCache>>,
-    /// Last refresh time
+    /// Last successful refresh time
     last_refresh: Arc<RwLock<Option<std::time::Instant>>>,
-}
-
-/// Cache for discovered schema information
-#[derive(Debug, Default)]
-struct DiscoveryCache {
-    tables: HashMap<String, TableSchema>,
-    indexes: HashMap<String, Vec<IndexSchema>>,
-    relationships: Vec<Relationship>,
-    statistics: HashMap<String, TableStatistics>,
 }
 
 /// Table statistics from database
@@ -103,215 +103,69 @@ impl SchemaDiscovery {
     pub fn new(config: DiscoveryConfig) -> Self {
         Self {
             config,
-            cache: Arc::new(RwLock::new(DiscoveryCache::default())),
             last_refresh: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Discover all table schemas
+    /// Discover all table schemas from the backend.
     ///
-    /// Returns discovered tables with inferred properties
+    /// Always fails with [`DiscoveryError::BackendDiscoveryUnsupported`]:
+    /// discovery against a backend is not supported in this release.
     pub async fn discover(&self) -> Result<Vec<TableSchema>, DiscoveryError> {
-        // Build discovery queries
-        let _queries = self.build_discovery_queries();
-
-        // In a real implementation, these would execute against the database
-        // For now, we return mock data for testing
-        let mut tables = Vec::new();
-
-        // Example discovered table
-        let users_table = TableSchema {
-            name: "users".to_string(),
-            columns: vec![
-                ColumnSchema {
-                    name: "id".to_string(),
-                    data_type: "bigint".to_string(),
-                    nullable: false,
-                    is_primary_key: true,
-                    is_indexed: true,
-                    storage_type: StorageType::Row,
-                },
-                ColumnSchema {
-                    name: "email".to_string(),
-                    data_type: "varchar(255)".to_string(),
-                    nullable: false,
-                    is_primary_key: false,
-                    is_indexed: true,
-                    storage_type: StorageType::Row,
-                },
-                ColumnSchema {
-                    name: "created_at".to_string(),
-                    data_type: "timestamp".to_string(),
-                    nullable: false,
-                    is_primary_key: false,
-                    is_indexed: true,
-                    storage_type: StorageType::Row,
-                },
-            ],
-            access_pattern: AccessPattern::PointLookup,
-            temperature: DataTemperature::Hot,
-            workload: WorkloadType::OLTP,
-            primary_key: vec!["id".to_string()],
-            shard_key: Some("id".to_string()),
-            estimated_rows: 1_000_000,
-            avg_row_size: 100,
-            partition_key: None,
-            preferred_nodes: Vec::new(),
-        };
-        tables.push(users_table);
-
-        // Cache the results
-        let mut cache = self.cache.write().await;
-        for table in &tables {
-            cache.tables.insert(table.name.clone(), table.clone());
-        }
-
-        // Update refresh time
-        let mut last_refresh = self.last_refresh.write().await;
-        *last_refresh = Some(std::time::Instant::now());
-
-        Ok(tables)
+        Err(DiscoveryError::BackendDiscoveryUnsupported("table schemas"))
     }
 
-    /// Discover a specific table's schema
-    pub async fn discover_table(&self, table_name: &str) -> Result<TableSchema, DiscoveryError> {
-        // Check cache first
-        {
-            let cache = self.cache.read().await;
-            if let Some(table) = cache.tables.get(table_name) {
-                return Ok(table.clone());
-            }
-        }
-
-        // Query for specific table
-        let _query = self.build_table_query(table_name);
-
-        // Mock implementation
-        Err(DiscoveryError::TableNotFound(table_name.to_string()))
+    /// Discover a specific table's schema from the backend.
+    ///
+    /// Always fails with [`DiscoveryError::BackendDiscoveryUnsupported`].
+    pub async fn discover_table(&self, _table_name: &str) -> Result<TableSchema, DiscoveryError> {
+        Err(DiscoveryError::BackendDiscoveryUnsupported("table schema"))
     }
 
-    /// Discover indexes for a table
+    /// Discover indexes for a table from the backend.
+    ///
+    /// Returns an empty list when index discovery is disabled in the
+    /// configuration; otherwise fails with
+    /// [`DiscoveryError::BackendDiscoveryUnsupported`].
     pub async fn discover_indexes(
         &self,
-        table_name: &str,
+        _table_name: &str,
     ) -> Result<Vec<IndexSchema>, DiscoveryError> {
         if !self.config.discover_indexes {
             return Ok(Vec::new());
         }
-
-        // Check cache first
-        {
-            let cache = self.cache.read().await;
-            if let Some(indexes) = cache.indexes.get(table_name) {
-                return Ok(indexes.clone());
-            }
-        }
-
-        // Mock implementation - return sample indexes
-        let indexes = vec![
-            IndexSchema {
-                name: format!("{}_pkey", table_name),
-                table: table_name.to_string(),
-                columns: vec!["id".to_string()],
-                is_unique: true,
-                index_type: IndexType::BTree,
-            },
-            IndexSchema {
-                name: format!("{}_email_idx", table_name),
-                table: table_name.to_string(),
-                columns: vec!["email".to_string()],
-                is_unique: true,
-                index_type: IndexType::BTree,
-            },
-        ];
-
-        // Cache the results
-        let mut cache = self.cache.write().await;
-        cache
-            .indexes
-            .insert(table_name.to_string(), indexes.clone());
-
-        Ok(indexes)
+        Err(DiscoveryError::BackendDiscoveryUnsupported("indexes"))
     }
 
-    /// Discover foreign key relationships
+    /// Discover foreign key relationships from the backend.
+    ///
+    /// Returns an empty list when relationship discovery is disabled in the
+    /// configuration; otherwise fails with
+    /// [`DiscoveryError::BackendDiscoveryUnsupported`].
     pub async fn discover_relationships(&self) -> Result<Vec<Relationship>, DiscoveryError> {
         if !self.config.discover_relationships {
             return Ok(Vec::new());
         }
-
-        // Check cache first
-        {
-            let cache = self.cache.read().await;
-            if !cache.relationships.is_empty() {
-                return Ok(cache.relationships.clone());
-            }
-        }
-
-        // Mock implementation
-        let relationships = vec![
-            Relationship {
-                from_table: "orders".to_string(),
-                from_column: "user_id".to_string(),
-                to_table: "users".to_string(),
-                to_column: "id".to_string(),
-                relationship_type: RelationshipType::ManyToOne,
-            },
-            Relationship {
-                from_table: "order_items".to_string(),
-                from_column: "order_id".to_string(),
-                to_table: "orders".to_string(),
-                to_column: "id".to_string(),
-                relationship_type: RelationshipType::ManyToOne,
-            },
-        ];
-
-        // Cache the results
-        let mut cache = self.cache.write().await;
-        cache.relationships = relationships.clone();
-
-        Ok(relationships)
+        Err(DiscoveryError::BackendDiscoveryUnsupported(
+            "foreign key relationships",
+        ))
     }
 
-    /// Get table statistics for temperature inference
+    /// Get table statistics from the backend for temperature inference.
+    ///
+    /// Fails with [`DiscoveryError::StatisticsDisabled`] when statistics
+    /// sampling is disabled, otherwise with
+    /// [`DiscoveryError::BackendDiscoveryUnsupported`].
     pub async fn get_statistics(
         &self,
-        table_name: &str,
+        _table_name: &str,
     ) -> Result<TableStatistics, DiscoveryError> {
         if !self.config.sample_statistics {
             return Err(DiscoveryError::StatisticsDisabled);
         }
-
-        // Check cache first
-        {
-            let cache = self.cache.read().await;
-            if let Some(stats) = cache.statistics.get(table_name) {
-                return Ok(stats.clone());
-            }
-        }
-
-        // Mock implementation
-        let stats = TableStatistics {
-            table_name: table_name.to_string(),
-            row_count: 1_000_000,
-            size_bytes: 100_000_000,
-            index_size_bytes: 20_000_000,
-            seq_scan_count: 100,
-            idx_scan_count: 50_000,
-            n_tup_ins: 1000,
-            n_tup_upd: 500,
-            n_tup_del: 100,
-            last_vacuum: Some("2024-01-15 10:00:00".to_string()),
-            last_analyze: Some("2024-01-15 10:00:00".to_string()),
-        };
-
-        // Cache the results
-        let mut cache = self.cache.write().await;
-        cache
-            .statistics
-            .insert(table_name.to_string(), stats.clone());
-
-        Ok(stats)
+        Err(DiscoveryError::BackendDiscoveryUnsupported(
+            "table statistics",
+        ))
     }
 
     /// Infer data temperature from statistics
@@ -390,7 +244,7 @@ impl SchemaDiscovery {
         WorkloadType::Mixed
     }
 
-    /// Check if cache needs refresh
+    /// Check if a refresh is due (always true until a refresh has succeeded)
     pub async fn needs_refresh(&self) -> bool {
         let last_refresh = self.last_refresh.read().await;
         match *last_refresh {
@@ -399,156 +253,22 @@ impl SchemaDiscovery {
         }
     }
 
-    /// Refresh the discovery cache
+    /// Refresh discovered schemas from the backend.
+    ///
+    /// Fails with [`DiscoveryError::BackendDiscoveryUnsupported`] (see
+    /// [`SchemaDiscovery::discover`]).
     pub async fn refresh(&self) -> Result<(), DiscoveryError> {
         self.discover().await?;
         if self.config.discover_relationships {
             self.discover_relationships().await?;
         }
+        *self.last_refresh.write().await = Some(std::time::Instant::now());
         Ok(())
     }
 
-    /// Clear the discovery cache
+    /// Forget the last refresh time
     pub async fn clear_cache(&self) {
-        let mut cache = self.cache.write().await;
-        *cache = DiscoveryCache::default();
-
-        let mut last_refresh = self.last_refresh.write().await;
-        *last_refresh = None;
-    }
-
-    /// Build SQL queries for discovery
-    fn build_discovery_queries(&self) -> Vec<String> {
-        let mut queries = Vec::new();
-
-        // Tables query
-        let schemas_filter = if self.config.schemas.is_empty() {
-            String::new()
-        } else {
-            let schemas = self
-                .config
-                .schemas
-                .iter()
-                .map(|s| format!("'{}'", s))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("AND table_schema IN ({})", schemas)
-        };
-
-        queries.push(format!(
-            r#"
-            SELECT
-                table_schema,
-                table_name,
-                table_type
-            FROM information_schema.tables
-            WHERE table_type = 'BASE TABLE'
-            {}
-            ORDER BY table_schema, table_name
-            "#,
-            schemas_filter
-        ));
-
-        // Columns query
-        queries.push(
-            r#"
-            SELECT
-                table_schema,
-                table_name,
-                column_name,
-                data_type,
-                is_nullable,
-                column_default
-            FROM information_schema.columns
-            ORDER BY table_schema, table_name, ordinal_position
-            "#
-            .to_string(),
-        );
-
-        // Indexes query (PostgreSQL specific)
-        queries.push(
-            r#"
-            SELECT
-                schemaname,
-                tablename,
-                indexname,
-                indexdef
-            FROM pg_indexes
-            ORDER BY schemaname, tablename, indexname
-            "#
-            .to_string(),
-        );
-
-        // Foreign keys query
-        if self.config.discover_relationships {
-            queries.push(
-                r#"
-                SELECT
-                    tc.table_schema,
-                    tc.table_name,
-                    kcu.column_name,
-                    ccu.table_schema AS foreign_table_schema,
-                    ccu.table_name AS foreign_table_name,
-                    ccu.column_name AS foreign_column_name
-                FROM information_schema.table_constraints AS tc
-                JOIN information_schema.key_column_usage AS kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                JOIN information_schema.constraint_column_usage AS ccu
-                    ON ccu.constraint_name = tc.constraint_name
-                WHERE tc.constraint_type = 'FOREIGN KEY'
-                "#
-                .to_string(),
-            );
-        }
-
-        // Statistics query (PostgreSQL specific)
-        if self.config.sample_statistics {
-            queries.push(
-                r#"
-                SELECT
-                    schemaname,
-                    relname as tablename,
-                    n_live_tup as row_count,
-                    seq_scan,
-                    idx_scan,
-                    n_tup_ins,
-                    n_tup_upd,
-                    n_tup_del,
-                    last_vacuum,
-                    last_analyze
-                FROM pg_stat_user_tables
-                "#
-                .to_string(),
-            );
-        }
-
-        queries
-    }
-
-    /// Build query for a specific table
-    fn build_table_query(&self, table_name: &str) -> String {
-        format!(
-            r#"
-            SELECT
-                c.column_name,
-                c.data_type,
-                c.is_nullable,
-                c.column_default,
-                CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END as is_primary_key
-            FROM information_schema.columns c
-            LEFT JOIN (
-                SELECT kcu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                WHERE tc.constraint_type = 'PRIMARY KEY'
-                    AND tc.table_name = '{}'
-            ) pk ON c.column_name = pk.column_name
-            WHERE c.table_name = '{}'
-            ORDER BY c.ordinal_position
-            "#,
-            table_name, table_name
-        )
+        *self.last_refresh.write().await = None;
     }
 }
 
@@ -565,6 +285,9 @@ pub enum DiscoveryError {
     StatisticsDisabled,
     /// Cache refresh failed
     RefreshFailed(String),
+    /// Reading this information from a backend database is not supported in
+    /// this release (no fabricated data is returned)
+    BackendDiscoveryUnsupported(&'static str),
 }
 
 impl std::fmt::Display for DiscoveryError {
@@ -575,6 +298,12 @@ impl std::fmt::Display for DiscoveryError {
             Self::QueryError(msg) => write!(f, "Query error: {}", msg),
             Self::StatisticsDisabled => write!(f, "Statistics collection is disabled"),
             Self::RefreshFailed(msg) => write!(f, "Cache refresh failed: {}", msg),
+            Self::BackendDiscoveryUnsupported(what) => write!(
+                f,
+                "schema discovery of {} against a backend is not supported in this release; \
+                 register tables explicitly",
+                what
+            ),
         }
     }
 }
@@ -602,53 +331,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_discover_tables() {
-        let config = DiscoveryConfig::default();
-        let discovery = SchemaDiscovery::new(config);
+    async fn test_backend_discovery_fails_closed() {
+        let discovery = SchemaDiscovery::new(DiscoveryConfig::default());
 
-        let tables = discovery.discover().await.unwrap();
-        assert!(!tables.is_empty());
+        assert!(matches!(
+            discovery.discover().await,
+            Err(DiscoveryError::BackendDiscoveryUnsupported(_))
+        ));
+        assert!(matches!(
+            discovery.discover_table("users").await,
+            Err(DiscoveryError::BackendDiscoveryUnsupported(_))
+        ));
+        assert!(matches!(
+            discovery.discover_indexes("users").await,
+            Err(DiscoveryError::BackendDiscoveryUnsupported(_))
+        ));
+        assert!(matches!(
+            discovery.discover_relationships().await,
+            Err(DiscoveryError::BackendDiscoveryUnsupported(_))
+        ));
+        assert!(matches!(
+            discovery.get_statistics("users").await,
+            Err(DiscoveryError::BackendDiscoveryUnsupported(_))
+        ));
+        assert!(matches!(
+            discovery.refresh().await,
+            Err(DiscoveryError::BackendDiscoveryUnsupported(_))
+        ));
+        // A failed refresh never marks the schemas as fresh.
+        assert!(discovery.needs_refresh().await);
 
-        let users = tables.iter().find(|t| t.name == "users").unwrap();
-        assert_eq!(users.temperature, DataTemperature::Hot);
-        assert_eq!(users.workload, WorkloadType::OLTP);
+        let msg = discovery.discover().await.unwrap_err().to_string();
+        assert!(msg.contains("not supported in this release"), "{msg}");
     }
 
     #[tokio::test]
-    async fn test_discover_indexes() {
-        let config = DiscoveryConfig::default();
+    async fn test_disabled_discovery_returns_empty() {
+        let config = DiscoveryConfig {
+            discover_indexes: false,
+            discover_relationships: false,
+            ..Default::default()
+        };
         let discovery = SchemaDiscovery::new(config);
-
-        let indexes = discovery.discover_indexes("users").await.unwrap();
-        assert!(!indexes.is_empty());
-
-        let pkey = indexes.iter().find(|i| i.name.ends_with("_pkey")).unwrap();
-        assert!(pkey.is_unique);
-    }
-
-    #[tokio::test]
-    async fn test_discover_relationships() {
-        let config = DiscoveryConfig::default();
-        let discovery = SchemaDiscovery::new(config);
-
-        let rels = discovery.discover_relationships().await.unwrap();
-        assert!(!rels.is_empty());
-
-        let order_user = rels
-            .iter()
-            .find(|r| r.from_table == "orders" && r.to_table == "users")
-            .unwrap();
-        assert_eq!(order_user.relationship_type, RelationshipType::ManyToOne);
-    }
-
-    #[tokio::test]
-    async fn test_get_statistics() {
-        let config = DiscoveryConfig::default();
-        let discovery = SchemaDiscovery::new(config);
-
-        let stats = discovery.get_statistics("users").await.unwrap();
-        assert_eq!(stats.table_name, "users");
-        assert!(stats.row_count > 0);
+        assert!(discovery
+            .discover_indexes("users")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(discovery.discover_relationships().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -779,25 +509,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_clear() {
-        let config = DiscoveryConfig::default();
-        let discovery = SchemaDiscovery::new(config);
-
-        // Populate cache
-        discovery.discover().await.unwrap();
-        assert!(!discovery.needs_refresh().await);
-
-        // Clear cache
+        let discovery = SchemaDiscovery::new(DiscoveryConfig::default());
         discovery.clear_cache().await;
         assert!(discovery.needs_refresh().await);
-    }
-
-    #[tokio::test]
-    async fn test_table_not_found() {
-        let config = DiscoveryConfig::default();
-        let discovery = SchemaDiscovery::new(config);
-
-        let result = discovery.discover_table("nonexistent_table").await;
-        assert!(matches!(result, Err(DiscoveryError::TableNotFound(_))));
     }
 
     #[tokio::test]

@@ -17,6 +17,10 @@
 #   CLIENTS       pgbench client counts to sweep      (default "16 64")
 #   DUR            seconds per pgbench run              (default 12)
 #   PASSES         interleaved base/cand pass count     (default 3)
+#   ORDER          which arm runs first in each pass     (default fixed = base
+#                  first every pass; alternate = base first in odd passes,
+#                  cand first in even ones, so neither arm always runs on the
+#                  backend state the other one left; use an even PASSES)
 #   MODES          proxy pool modes to test             (default "session transaction")
 #   PGOPTIONS      passed through to pgbench            (default "-c synchronous_commit=off")
 #   PGBENCH_PROTOCOL  pgbench query protocol, -M (simple|extended|prepared;
@@ -71,6 +75,8 @@ IMG="postgres:18.4-bookworm"
 CLIENTS="${CLIENTS:-16 64}"
 DUR="${DUR:-12}"
 PASSES="${PASSES:-3}"
+ORDER="${ORDER:-fixed}"
+case "$ORDER" in fixed|alternate) ;; *) echo "FATAL: ORDER must be fixed or alternate" >&2; exit 2;; esac
 MODES="${MODES:-session transaction}"
 PGOPTIONS="${PGOPTIONS:--c synchronous_commit=off}"
 PGBENCH_PROTOCOL="${PGBENCH_PROTOCOL:-}"
@@ -102,6 +108,7 @@ mkdir -p "$OUT"
   echo "CLIENTS=$CLIENTS"
   echo "DUR=$DUR"
   echo "PASSES=$PASSES"
+  echo "ORDER=$ORDER"
   echo "MODES=$MODES"
   echo "PGOPTIONS=$PGOPTIONS"
   echo "PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple}"
@@ -148,10 +155,15 @@ run_pass(){
     bash "$HERE/regress/bench-usertp.sh" "$bin" "$plabel"
 }
 
-echo "== perf-gate-userpath($LABEL): $PASSES interleaved pass(es), CLIENTS=\"$CLIENTS\" DUR=$DUR MODES=\"$MODES\" PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple} =="
+echo "== perf-gate-userpath($LABEL): $PASSES interleaved pass(es), ORDER=$ORDER, CLIENTS=\"$CLIENTS\" DUR=$DUR MODES=\"$MODES\" PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple} =="
 for p in $(seq 1 "$PASSES"); do
-  run_pass "$BASE_BIN" base "$p"
-  run_pass "$CAND_BIN" cand "$p"
+  if [ "$ORDER" = alternate ] && [ $((p % 2)) = 0 ]; then
+    run_pass "$CAND_BIN" cand "$p"
+    run_pass "$BASE_BIN" base "$p"
+  else
+    run_pass "$BASE_BIN" base "$p"
+    run_pass "$CAND_BIN" cand "$p"
+  fi
 done
 
 echo "== perf-gate-userpath($LABEL): compare (budget ${BUDGET_PCT}%) =="

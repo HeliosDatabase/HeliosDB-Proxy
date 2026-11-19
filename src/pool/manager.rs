@@ -6,9 +6,11 @@ use super::config::PoolModeConfig;
 use super::lease::{ClientId, ConnectionLease, LeaseAction};
 use super::metrics::PoolModeMetrics;
 use super::mode::PoolingMode;
+use crate::backend::BackendConfig;
 use crate::connection_pool::{ConnectionPool, PoolConfig};
 use crate::{NodeEndpoint, NodeId, ProxyError, Result};
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,9 +18,20 @@ use std::time::Instant;
 ///
 /// Manages connection leases across multiple nodes with support for
 /// different pooling modes (session, transaction, statement).
+///
+/// Leases carry live backend connections, which the manager can only open
+/// with a backend template ([`Self::with_backend_template`]). Without one,
+/// [`Self::acquire`] fails with [`ProxyError::Pool`]; node registration,
+/// idle eviction, statistics and metrics still work.
 pub struct ConnectionPoolManager {
     /// Pool mode configuration
     config: PoolModeConfig,
+    /// Backend-connection template handed to every per-node pool; host and
+    /// port come from each node's endpoint. `None`: acquisitions fail.
+    backend_template: Option<BackendConfig>,
+    /// Releases whose reset query could not run because the connection had
+    /// no live backend client (the connection was closed, not pooled).
+    resets_skipped: AtomicU64,
     /// Underlying connection pools per node
     pools: DashMap<NodeId, ConnectionPool>,
     /// Active leases by client ID
@@ -68,13 +81,27 @@ impl ConnectionPoolManager {
     pub fn new(config: PoolModeConfig) -> Self {
         Self {
             config,
+            backend_template: None,
+            resets_skipped: AtomicU64::new(0),
             pools: DashMap::new(),
             active_leases: DashMap::new(),
             metrics: Arc::new(PoolModeMetrics::new()),
         }
     }
 
-    /// Add a node to the pool manager
+    /// Attach a backend-connection template. Nodes added afterwards get a
+    /// pool that opens live connections to the node's `host:port` with the
+    /// template's credentials, TLS mode and timeouts.
+    pub fn with_backend_template(mut self, template: BackendConfig) -> Self {
+        self.backend_template = Some(template);
+        self
+    }
+
+    /// Add a node to the pool manager.
+    ///
+    /// With a backend template the node's pool connects to `node.host` /
+    /// `node.port`; without one the node is registered for accounting only
+    /// and [`Self::acquire`] for it fails with [`ProxyError::Pool`].
     pub async fn add_node(&self, node: &NodeEndpoint) {
         let pool_config = PoolConfig {
             min_connections: self.config.min_idle as usize,
@@ -85,8 +112,19 @@ impl ConnectionPoolManager {
             test_on_acquire: self.config.test_on_acquire,
         };
 
-        let pool = ConnectionPool::new(pool_config);
-        pool.add_node(node.id).await;
+        let pool = match &self.backend_template {
+            Some(template) => {
+                let pool = ConnectionPool::new(pool_config).with_backend_template(template.clone());
+                pool.add_node_with_endpoint(node.id, node.host.clone(), node.port)
+                    .await;
+                pool
+            }
+            None => {
+                let pool = ConnectionPool::new(pool_config);
+                pool.add_node(node.id).await;
+                pool
+            }
+        };
         self.pools.insert(node.id, pool);
 
         tracing::debug!("Added node {:?} to pool manager", node.id);
@@ -201,11 +239,22 @@ impl ConnectionPoolManager {
             if let Some(pool) = self.pools.get(&info.node_id) {
                 let mut connection = lease.into_connection();
 
-                // Reset connection for Transaction / Statement modes.
-                // When the pooled connection has a live backend client,
-                // run the configured reset query (default `DISCARD ALL`).
-                // When no live client is attached (skeleton / test path),
-                // record the reset as if it ran.
+                // Reset connection for Transaction / Statement modes with
+                // the configured reset query (default `DISCARD ALL`). A
+                // connection without a live backend client cannot be reset:
+                // it is closed instead of pooled, and counted as a skipped
+                // reset (`resets_skipped`), never as a reset that ran.
+                if mode != PoolingMode::Session && !connection.has_live_client() {
+                    self.resets_skipped.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        connection = ?connection.id,
+                        "reset query skipped: connection has no live backend client; \
+                         closing it instead of returning it to the pool"
+                    );
+                    pool.close_connection(connection).await;
+                    self.metrics.record_connection_closed();
+                    return;
+                }
                 if mode != PoolingMode::Session {
                     let reset_query = self.config.reset_query.as_str();
                     match pool.run_reset_query(&mut connection, reset_query).await {
@@ -325,6 +374,13 @@ impl ConnectionPoolManager {
         &self.metrics
     }
 
+    /// Releases whose reset query was skipped because the connection had no
+    /// live backend client. Such a connection is closed, not pooled, and is
+    /// not counted in `connection_resets`.
+    pub fn resets_skipped(&self) -> u64 {
+        self.resets_skipped.load(Ordering::Relaxed)
+    }
+
     /// Get configuration
     pub fn config(&self) -> &PoolModeConfig {
         &self.config
@@ -376,6 +432,18 @@ impl std::fmt::Debug for ConnectionPoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_pool::test_backend::FakePg;
+    use crate::connection_pool::{ConnectionState, PooledConnection};
+
+    /// A transaction-mode manager whose node points at a live fake backend.
+    async fn live_manager() -> (ConnectionPoolManager, NodeEndpoint, FakePg) {
+        let backend = FakePg::start().await;
+        let manager = ConnectionPoolManager::new(PoolModeConfig::transaction_mode())
+            .with_backend_template(backend.template());
+        let node = NodeEndpoint::new(backend.addr.ip().to_string(), backend.addr.port());
+        manager.add_node(&node).await;
+        (manager, node, backend)
+    }
 
     #[tokio::test]
     async fn test_manager_creation() {
@@ -405,11 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_acquire_release() {
-        let config = PoolModeConfig::transaction_mode();
-        let manager = ConnectionPoolManager::new(config);
-
-        let node = NodeEndpoint::new("localhost", 5432);
-        manager.add_node(&node).await;
+        let (manager, node, backend) = live_manager().await;
 
         let client_id = ClientId::new();
         let lease = manager.acquire(client_id, &node.id).await.unwrap();
@@ -421,15 +485,21 @@ mod tests {
 
         assert!(!manager.has_active_lease(&client_id));
         assert_eq!(manager.active_lease_count(), 0);
+        // Transaction mode: the reset query ran on the backend.
+        assert_eq!(backend.queries(), vec!["DISCARD ALL".to_string()]);
+        let snapshot = manager.metrics().snapshot();
+        assert_eq!(snapshot.connection_resets, 1);
+        assert_eq!(snapshot.reset_failures, 0);
+        assert_eq!(manager.resets_skipped(), 0);
+        // The reset connection went back to the pool.
+        let stats = manager.get_stats().await;
+        assert_eq!(stats.total_connections, 1);
+        assert_eq!(stats.idle_connections, 1);
     }
 
     #[tokio::test]
     async fn test_metrics_recording() {
-        let config = PoolModeConfig::transaction_mode();
-        let manager = ConnectionPoolManager::new(config);
-
-        let node = NodeEndpoint::new("localhost", 5432);
-        manager.add_node(&node).await;
+        let (manager, node, _backend) = live_manager().await;
 
         let client_id = ClientId::new();
         let lease = manager.acquire(client_id, &node.id).await.unwrap();
@@ -441,5 +511,91 @@ mod tests {
 
         let snapshot = manager.metrics().snapshot();
         assert_eq!(snapshot.releases, 1);
+    }
+
+    /// Fail closed: without a backend template the manager cannot open a
+    /// backend connection, so acquire is an explicit error, counted as an
+    /// acquire failure, and no lease is recorded.
+    #[tokio::test]
+    async fn test_acquire_without_backend_template_fails_closed() {
+        let manager = ConnectionPoolManager::new(PoolModeConfig::transaction_mode());
+        let node = NodeEndpoint::new("localhost", 5432);
+        manager.add_node(&node).await;
+
+        let client_id = ClientId::new();
+        let err = manager
+            .acquire(client_id, &node.id)
+            .await
+            .expect_err("acquire without a backend template must fail");
+        assert!(matches!(err, ProxyError::Pool(_)), "got {err:?}");
+        assert!(!manager.has_active_lease(&client_id));
+        let snapshot = manager.metrics().snapshot();
+        assert_eq!(snapshot.acquires, 0);
+        assert_eq!(snapshot.acquire_failures, 1);
+        assert_eq!(manager.get_stats().await.total_connections, 0);
+    }
+
+    /// A release whose connection has no live backend client must not be
+    /// recorded as a reset that ran: it counts as skipped, the connection is
+    /// closed instead of pooled, and `connection_resets` stays at zero.
+    #[tokio::test]
+    async fn test_release_without_live_client_skips_reset_and_closes() {
+        let manager = ConnectionPoolManager::new(PoolModeConfig::transaction_mode());
+        let node = NodeEndpoint::new("localhost", 5432);
+        manager.add_node(&node).await;
+
+        let now = chrono::Utc::now();
+        let detached = PooledConnection {
+            id: uuid::Uuid::new_v4(),
+            node_id: node.id,
+            created_at: now,
+            last_used: now,
+            state: ConnectionState::InUse,
+            use_count: 1,
+            permit: None,
+            client: None,
+        };
+        let client_id = ClientId::new();
+        manager.active_leases.insert(
+            client_id,
+            LeaseInfo {
+                node_id: node.id,
+                statements: 0,
+            },
+        );
+        let lease = ConnectionLease::new(detached, PoolingMode::Transaction, client_id);
+
+        manager.release(lease).await;
+
+        assert_eq!(manager.resets_skipped(), 1);
+        let snapshot = manager.metrics().snapshot();
+        assert_eq!(snapshot.connection_resets, 0, "no reset ran");
+        assert_eq!(snapshot.reset_failures, 0);
+        assert_eq!(snapshot.connections_closed, 1);
+        assert!(!manager.has_active_lease(&client_id));
+        let stats = manager.get_stats().await;
+        assert_eq!(stats.idle_connections, 0, "connection must not be pooled");
+    }
+
+    /// A reset the backend rejects is recorded as a failed reset and the
+    /// connection is closed, not pooled.
+    #[tokio::test]
+    async fn test_release_with_failing_reset_closes_connection() {
+        let (manager, node, backend) = live_manager().await;
+        let client_id = ClientId::new();
+        let lease = manager.acquire(client_id, &node.id).await.unwrap();
+
+        backend.fail_queries(true);
+        manager.release(lease).await;
+
+        let snapshot = manager.metrics().snapshot();
+        assert_eq!(snapshot.connection_resets, 1);
+        assert_eq!(snapshot.reset_failures, 1);
+        assert_eq!(manager.resets_skipped(), 0);
+        let stats = manager.get_stats().await;
+        assert_eq!(
+            stats.total_connections, 0,
+            "failed-reset connection is closed"
+        );
     }
 }

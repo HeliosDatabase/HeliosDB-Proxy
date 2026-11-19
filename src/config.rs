@@ -2251,7 +2251,7 @@ pub struct CacheToml {
     /// connection (a write, a `SET`, any statement that may change its
     /// settings, a `FunctionCall`) or a ParameterStatus is relayed. A backend
     /// configuration reload reaches cached reads within this time. `0` proves
-    /// before every lookup and again before every fill, as before 2.3.0.
+    /// before every lookup and again before every fill, as before 3.0.0.
     /// Default 1000. Ignored with `backend_context_immutable`. Takes effect
     /// on reload.
     pub proof_ttl_ms: u64,

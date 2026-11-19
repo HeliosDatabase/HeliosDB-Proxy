@@ -62,6 +62,17 @@ tr_mode = "session"   # none | session | select | transaction
 # returning an error to the client.
 write_timeout_secs = 30
 
+# SIGTERM / SIGINT (and the SIGUSR2 binary handoff) drain: listeners close,
+# /health/ready answers 503, each session ends with FATAL 57P01 once nothing of
+# it is in flight. This bounds the drain; env override HELIOS_DRAIN_TIMEOUT_SECS.
+# Give docker / Kubernetes / systemd a longer stop grace period than this.
+# shutdown_drain_timeout_secs = 60
+
+# Legacy FunctionCall (fastpath) messages: "large-objects" (default) forwards the
+# built-in large-object functions (libpq lo_*, JDBC LargeObject, pg_dump) and
+# refuses the rest with 0A000; "any" forwards every function; "refuse" none.
+# function_call = "large-objects"
+
 # -----------------------------------------------------------------------------
 # Authoritative topology (H-01)
 # -----------------------------------------------------------------------------
@@ -263,6 +274,7 @@ max_cacheable_response_bytes = 4194304
 # proof_ttl_ms = 1000                # reuse a connection's settings proof this long; 0 = every read
 # extended_protocol = true           # also answer Parse/Bind/Execute/Sync and prepared-statement reads
 # max_backend_context_bytes = 524288 # complete SHOW ALL proof, also bounded by limits
+# max_dependency_tables = 64         # most tables one entry may depend on; more = not cached
 
 # Tier sizes (the defaults shown) and opt-in L2 payload compression. See
 # docs/configuration.md, "Query Cache".
@@ -402,6 +414,48 @@ max_cacheable_response_bytes = 4194304
 # 08006. 0 refuses at once. Upper bound 600000. Read once at startup.
 # [limits]
 # startup_node_wait_ms = 5000
+# copy_idle_timeout_secs = 0     # >0 ends a COPY FROM STDIN stalled this long (57014)
+
+# -----------------------------------------------------------------------------
+# Other sections with keys new in 3.0.0 (commented, at their defaults). See
+# docs/configuration.md for each one.
+# -----------------------------------------------------------------------------
+# [admin]
+# stats_max_items = 1000          # longest list GET /api/stats reports (>= 1)
+#
+# [rate_limit]                    # needs the rate-limiting feature
+# enabled = false
+# default_qps = 1000              # enforced as configured, also above 1000
+# default_burst = 2000
+# max_concurrent = 0              # >0: requests in flight per bucket (53400 above)
+# key_by = "user"                 # user | client_ip | database | global
+# window_max_requests = 0         # >0: optional sliding window per bucket
+# window_secs = 60
+# cleanup_interval_secs = 60      # how often idle buckets are dropped
+#
+# [plugins]                       # needs the wasm-plugins feature
+# enabled = false
+# plugin_dir = "/etc/heliosproxy/plugins"   # .wasm modules and .tar.gz artefacts
+# trust_root = "/etc/heliosproxy/plugin-keys"   # unset: signatures not checked (warned)
+# hot_reload = false              # also rescanned on SIGHUP and POST /plugins/reload
+# hot_reload_interval_ms = 1000
+# hot_reload_debounce_ms = 500
+# max_artefact_bytes = 67108864
+# require_signed_manifest = false
+#
+# [branch]
+# route_enabled = false           # let branch= hints / route plugins move sessions
+# route_mode = "database"         # "database" (PostgreSQL) or "nano" (<db>@<branch>)
+# route_allow = []                # empty = any valid branch name
+#
+# [multi_tenancy]                 # needs the multi-tenancy feature
+# unknown_tenant = "refuse"       # "passthrough" = 2.2 behaviour for unidentified tenants
+# max_journal_bytes_per_tenant = 0
+# refused_functions = [...]       # default: XML exports, dblink, large-object and
+#                                 # server-file functions (see docs/configuration.md)
+#
+# [anomaly]                       # needs the anomaly-detection feature
+# max_auth_windows = 10000        # (user, address) failed-auth windows kept
 
 # [http_gateway]
 # # Result caps for the HTTP /sql gateway (defaults shown). A result past either cap is

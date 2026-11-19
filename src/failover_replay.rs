@@ -128,14 +128,14 @@ pub struct FailoverReplay {
     completed_replays: Arc<RwLock<Vec<ReplayResult>>>,
     /// Max history size
     max_history: usize,
-    /// Optional backend-connection template. Host/port are swapped to
-    /// each registered node's endpoint at replay time. When `None`,
-    /// `execute_statement` and `wait_for_wal_sync` take the skeleton
-    /// path (record success without touching the network).
+    /// Backend-connection template. Host/port are swapped to each
+    /// registered node's endpoint at replay time. Without it (or without
+    /// an endpoint for the target node) replay fails closed: every
+    /// statement is reported failed and a WAL-sync wait for a real
+    /// position returns `ProxyError::ReplayFailed`.
     backend_template: Option<BackendConfig>,
     /// Per-node endpoints for resolving NodeId → host:port. Populated
-    /// via `register_endpoint`. Empty by default — replay falls back to
-    /// the skeleton path when an endpoint is missing.
+    /// via `register_endpoint`; a target without one cannot be replayed.
     endpoints: Arc<RwLock<HashMap<NodeId, NodeEndpoint>>>,
 }
 
@@ -152,8 +152,8 @@ impl FailoverReplay {
         }
     }
 
-    /// Attach a backend-connection template. Required for real replay;
-    /// without it, all backend-touching calls take the skeleton path.
+    /// Attach a backend-connection template. Required for replay: without
+    /// it every backend-touching call fails with `ProxyError::ReplayFailed`.
     pub fn with_backend_template(mut self, template: BackendConfig) -> Self {
         self.backend_template = Some(template);
         self
@@ -333,11 +333,15 @@ impl FailoverReplay {
                                 Some(expected) => qr.rows_affected() == Some(expected),
                                 None => true,
                             };
-                            // Checksums are not recomputed here; an entry with
-                            // no recorded checksum counts as matched.
+                            // This driver cannot recompute the wire-level result
+                            // checksum, so a recorded checksum counts as
+                            // unverified: under `verify_results` it fails the
+                            // replay rather than being reported as matched.
                             let checksum_matched = entry.result_checksum.is_none();
                             let diverged =
                                 self.config.verify_results && (!rows_matched || !checksum_matched);
+                            let divergence =
+                                diverged.then(|| verification_error(rows_matched, entry));
                             replay.results.push(StatementReplayResult {
                                 sequence: entry.sequence,
                                 success: !diverged,
@@ -350,18 +354,13 @@ impl FailoverReplay {
                                 },
                                 rows_matched: entry.rows_affected.map(|_| rows_matched),
                                 duration_ms: started.elapsed().as_millis() as u64,
-                                error: diverged.then(|| {
-                                    "replay result diverged from the journaled outcome".to_string()
-                                }),
+                                error: divergence.clone(),
                                 retries: 0,
                             });
                             replay.position += 1;
-                            if diverged {
+                            if let Some(divergence) = divergence {
                                 verification_failures += 1;
-                                failed_at = Some((
-                                    i + 1,
-                                    "replay result diverged from the journaled outcome".to_string(),
-                                ));
+                                failed_at = Some((i + 1, divergence));
                                 break;
                             }
                             statements_replayed += 1;
@@ -573,10 +572,26 @@ impl FailoverReplay {
     }
 }
 
+/// Why a replayed statement fails result verification: its affected-row
+/// count differs from the journaled one, or the journal recorded a result
+/// checksum this driver cannot recompute.
+fn verification_error(rows_matched: bool, entry: &JournalEntry) -> String {
+    if !rows_matched {
+        format!(
+            "replay result diverged from the journaled outcome: expected {} affected rows",
+            entry.rows_affected.unwrap_or_default()
+        )
+    } else {
+        "journaled result checksum cannot be verified by FailoverReplay (it does not \
+         recompute result checksums); disable verify_results to replay without it"
+            .to_string()
+    }
+}
+
 /// Parse a PostgreSQL `pg_lsn` text form (e.g. `"16/B3780A90"`) into
 /// its u64 numeric representation: `(hi << 32) | lo`. Returns `None`
 /// on malformed input.
-fn pg_lsn_to_u64(s: &str) -> Option<u64> {
+pub(crate) fn pg_lsn_to_u64(s: &str) -> Option<u64> {
     let (hi, lo) = s.split_once('/')?;
     let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
     let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
@@ -679,6 +694,20 @@ mod tests {
         assert!(pg_lsn_to_u64("0/100000000").is_none());
     }
 
+    /// A recorded checksum is reported as unverifiable, never as matched
+    /// or as a data divergence; a row-count mismatch names the count.
+    #[test]
+    fn test_verification_error_names_the_cause() {
+        let journal = make_journal();
+        let insert = &journal.entries[0];
+        let rows = verification_error(false, insert);
+        assert!(rows.contains("diverged"), "{rows}");
+        assert!(rows.contains("expected 1 affected rows"), "{rows}");
+        let checksum = verification_error(true, insert);
+        assert!(checksum.contains("cannot be verified"), "{checksum}");
+        assert!(checksum.contains("verify_results"), "{checksum}");
+    }
+
     #[tokio::test]
     async fn test_start_replay() {
         let replay = FailoverReplay::new(ReplayConfig::default());
@@ -709,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_replay() {
+    async fn test_execute_replay_without_backend_fails_closed() {
         // TR-07: replay with no backend configured must FAIL, not report a
         // synthetic success. Retries off so the refusal is immediate.
         let replay = FailoverReplay::new(ReplayConfig {
@@ -740,12 +769,49 @@ mod tests {
             .contains("no backend")));
     }
 
+    /// A template alone is not enough: the target node must have a
+    /// registered endpoint, or replay fails rather than guessing one.
+    #[tokio::test]
+    async fn test_execute_replay_without_target_endpoint_fails_closed() {
+        let template = BackendConfig {
+            host: "unused".into(),
+            port: 0,
+            user: "postgres".into(),
+            password: None,
+            database: None,
+            application_name: None,
+            tls_mode: crate::backend::TlsMode::Disable,
+            connect_timeout: std::time::Duration::from_millis(200),
+            query_timeout: std::time::Duration::from_millis(200),
+            tls_config: crate::backend::tls::default_client_config(),
+        };
+        let replay = FailoverReplay::new(ReplayConfig {
+            retry_on_error: false,
+            ..ReplayConfig::default()
+        })
+        .with_backend_template(template);
+        let journal = make_journal();
+        let tx_id = journal.tx_id;
+        replay.start_replay(journal, NodeId::new()).await.unwrap();
+        let result = replay.execute_replay(tx_id).await.unwrap();
+        assert!(!result.success);
+        assert_eq!(result.statements_replayed, 0);
+        assert!(result
+            .statement_results
+            .iter()
+            .all(|r| !r.success && r.error.as_deref().unwrap_or("").contains("no backend")));
+        let history = replay.history().await;
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].success);
+        assert_eq!(replay.stats().await.successful_replays, 0);
+    }
+
     #[tokio::test]
     async fn test_wait_for_wal_sync_without_backend_fails_unless_nothing_to_wait_for() {
         let replay = FailoverReplay::new(ReplayConfig::default());
         let node = NodeId::new();
 
-        // No position to wait for: no-op.
+        // Position 0 is reached by every node: nothing to wait for.
         replay.wait_for_wal_sync(node, 0).await.unwrap();
 
         // A real position with no backend is a false synchronization claim.

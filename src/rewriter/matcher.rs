@@ -148,11 +148,6 @@ impl RuleMatcher {
             AstPattern::Update => parsed.is_update,
             AstPattern::Delete => parsed.is_delete,
             AstPattern::Ddl => parsed.is_ddl,
-            AstPattern::NPlusOne { table } => {
-                // N+1 detection: SELECT ... WHERE id = $1 in loop
-                // Simplified: just check if table is accessed
-                parsed.tables.contains(table) && !parsed.has_limit
-            }
             AstPattern::FullTableScan => parsed.is_select && !parsed.has_where,
             AstPattern::And(patterns) => patterns.iter().all(|p| self.matches_ast(p, parsed)),
             AstPattern::Or(patterns) => patterns.iter().any(|p| self.matches_ast(p, parsed)),

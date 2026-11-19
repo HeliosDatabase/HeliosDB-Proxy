@@ -7,19 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.3.0] - 2026-11-18
+## [3.0.0] - 2026-11-18
 
-Plugin hooks, query rewrite rules and the tenant row filter now cover the extended
-protocol, so prepared statements and ORMs are filtered like simple queries. SIGTERM and
-SIGINT drain the proxy gracefully, and the SIGUSR2 handoff drains the same way. WASM
-plugins ship as signed `.tar.gz` artefacts, reload from the plugin directory without a
-restart, can route a session to a branch database, and are refused at load when they
-could never run. The query cache keeps each connection's backend settings proof for
-`[cache] proof_ttl_ms` (1 s) instead of proving before every read, which restores cheap
-cached reads to the speed of the proxy without the cache. Failover no longer continues a
-session that held state only the failed backend had, statement pooling behaves as
-statement pooling, the rate limiter enforces rates above 1 000 a second, and routing
-targets must be configured nodes.
+This is a major release because the Rust library API has breaking changes (see Library
+API below: configuration and metrics structs gain public fields, and several signatures
+change) and because several defaults and behaviours change for existing deployments (see
+Upgrade notes). The daemon's command line, the PostgreSQL wire protocol and the admin API
+stay compatible: a 2.2 `proxy.toml` loads unchanged (unless its `[schema_routing]
+analytics_node` names no configured node), but read the Upgrade notes before rolling it out.
+
+Highlights: plugin hooks, query rewrite rules and the tenant row filter now cover the
+extended protocol, so prepared statements and ORMs are filtered like simple queries.
+SIGTERM and SIGINT drain the proxy gracefully, and the SIGUSR2 handoff drains the same way.
+WASM plugins ship as signed `.tar.gz` artefacts (`helios-plugin keygen`/`pack`/`sign`/
+`inspect`/`verify`), reload from the plugin directory without a restart, can move a session
+to a branch database, and are refused at load when they could never run. The query cache
+answers extended-protocol reads, proves each backend connection's settings and keeps that
+proof for `[cache] proof_ttl_ms` (1 s), and gains tier sizes, L2 compression,
+refresh-ahead and a per-table heatmap. The MCP gateway gains per-agent principals, a
+tool-result cache and opt-in agent memory tools, and `GET /api/stats` gives pollers one
+versioned document. Failover no longer continues a session that held state only the
+failed backend had, statement pooling behaves as statement pooling, an open circuit
+recovers, the rate limiter enforces rates above 1 000 a second, and routing targets must
+be configured nodes. Several announced capabilities (auth methods beyond passthrough and
+SCRAM, per-tenant pools, view-to-base-table cache dependencies and others) are not part of
+3.0.0 and are planned for later 3.x releases; `docs/releases/3.0.0.md` lists them.
 
 ### Upgrade notes (behaviour changes)
 
@@ -50,9 +62,33 @@ targets must be configured nodes.
 - **`[rate_limit]` has no hidden per-minute window:** a `default_qps` above 1 000 is now
   enforced as configured; the window is opt-in (`window_max_requests`, `window_secs`).
 - **Release binaries are built with `postgres-topology`.**
-- **Library API:** see Library API below: `CacheToml`, `PluginToml`, `BranchConfig`,
-  `RateLimitConfig` and `ServerMetricsSnapshot` gain public fields (struct literals must
-  set them). The daemon's CLI, wire protocol and admin API stay compatible.
+- **The result caches cache only literal scalar reads unless you vouch for the backend:**
+  without `[cache] trust_backend_read_effects = true` the query cache and the `[edge]`
+  cache store only `SELECT <integer literal>`; every other read runs on the backend.
+  Each cached read is keyed by the backend's effective settings (`SHOW ALL`), and a
+  session that runs a write, a `SET`, `SET ROLE` or any statement that may change its
+  execution context stops using the cache. Builtin function names no longer make a read
+  safe to retry or offload: list trusted functions in `tr_read_functions`.
+- **`[multi_tenancy] unknown_tenant` defaults to `"refuse"`:** under row isolation a
+  session with no identified tenant gets `42501` on a statement naming a tenant table;
+  statements of a shape the row filter cannot cover (`WITH`, `INSERT ... SELECT`,
+  `ON CONFLICT ... DO UPDATE`, an alias on a tenant table, ...) are refused as well.
+  `[[hba]]` rules without `@` now also cover `<db>@<branch>`.
+- **Legacy `FunctionCall` messages are checked:** `function_call = "large-objects"` (the
+  default) forwards the built-in large-object functions and refuses every other function
+  with `0A000`; set `"any"` to forward all.
+- **Client startups wait for a healthy node** up to `[limits] startup_node_wait_ms`
+  (default 5000) instead of failing at once; `0` restores the immediate `08006`.
+- **`[rate_limit] max_concurrent` is enforced** (`53400`), where it was ignored.
+- **Gateway results are capped:** HTTP `/sql` and GraphQL refuse a result over 10000 rows
+  or 16 MiB (`max_result_rows`, `max_result_bytes`); the MCP tools truncate it.
+- **The `cache_refresh` hint (and `cache=refresh`) is active:** such reads always go to
+  the backend and refresh the entry.
+- **Library API:** see Library API below: `CacheToml`, `CacheConfig`, `L2Config`,
+  `PluginToml`, `BranchConfig`, `McpConfig`, `MultiTenancyToml`, `LimitsToml`,
+  `RateLimitToml`, `RateLimitConfig`, `ProxyConfig`, `ServerMetricsSnapshot` and other
+  structs gain public fields (struct literals must set them), and some signatures change.
+  The daemon's CLI, wire protocol and admin API stay compatible.
 
 ### Security
 
@@ -683,7 +719,7 @@ targets must be configured nodes.
   42501 when a simple-protocol statement references a tenant table, instead of being
   forwarded unfiltered. A name inside a string literal or a comment does not count; identifiers
   are read as PostgreSQL truncates them (63 bytes), as by the row filter. Extended-protocol
-  `Parse`/`Bind` statements are not covered by this check. **Upgrade note:** this changes behaviour for deployments with
+  statements are checked at their `Parse` (see Security). **Upgrade note:** this changes behaviour for deployments with
   `enabled = true`, non-empty `tenant_tables` and sessions that name no configured tenant;
   set `unknown_tenant = "passthrough"` to keep the previous behaviour. Also, with
   `identify_by = "database"` a session with no `database` parameter now uses its user
@@ -703,7 +739,7 @@ targets must be configured nodes.
   `l2_max_bytes`, the store that won the eviction pass scanned the whole map once for
   every entry it evicted, while concurrent stores kept inserting without evicting. With a
   few hundred thousand entries, one session's query stalled for 20 s to 23 min after a
-  read-heavy run (measured by the 2.3.0 user-path gate with the cache on, 64 clients;
+  read-heavy run (measured by the 3.0.0 user-path gate with the cache on, 64 clients;
   v2.2.0 has the same loop). A pass now scans the map once, selects the least recently
   used entries (expired ones first) until the store fits with
   `[cache] l2_evict_headroom_pct` (default 5) of the budget to spare, and keeps entries
@@ -746,7 +782,7 @@ targets must be configured nodes.
 
 - Compile shared SQL-lexer helpers only for their consuming features and guard the edge-cache regression by its feature, keeping isolated SQL-text test builds warning-free.
 
-- **Query cache on the extended protocol** (`[cache] extended_protocol`, default `true`). The query cache now answers reads sent as `Parse`/`Bind`/`Execute`/`Sync` with an unnamed statement, and the `Bind`/`Execute`/`Sync` of a prepared (named) statement, each optionally with a `Describe` of the portal, under every condition a simple query's lookup has. An entry is keyed by the statement text, the declared parameter types, the bound parameter values and their format codes, the result format codes and the batch's shape, so text and binary results, and different parameter values, never share one; the statement's name is not part of the key. A hit runs nothing on the backend but leaves it holding the unnamed statement the client was told it parsed. Other batch shapes, transactions and sessions that have written go to the backend as before. See "Extended-protocol reads" in `docs/configuration.md`. Like a simple query's lookup, each one runs the backend settings proof (`SHOW ALL`) before the lookup and before the store unless `backend_context_immutable = true`: measured with pgbench's prepared select-only script at 16 clients, 4 400 reads per second with the per-read proof against 84 000 with the proof reused per connection (81 000 with the cache bypassed).
+- **Query cache on the extended protocol** (`[cache] extended_protocol`, default `true`). The query cache now answers reads sent as `Parse`/`Bind`/`Execute`/`Sync` with an unnamed statement, and the `Bind`/`Execute`/`Sync` of a prepared (named) statement, each optionally with a `Describe` of the portal, under every condition a simple query's lookup has. An entry is keyed by the statement text, the declared parameter types, the bound parameter values and their format codes, the result format codes and the batch's shape, so text and binary results, and different parameter values, never share one; the statement's name is not part of the key. A hit runs nothing on the backend but leaves it holding the unnamed statement the client was told it parsed. Other batch shapes, transactions and sessions that have written go to the backend as before. See "Extended-protocol reads" in `docs/configuration.md`. Like a simple query's lookup, each one needs the backend settings proof (`SHOW ALL`), reused per connection for `proof_ttl_ms` (see Changed) or, with `backend_context_immutable = true`, for the connection's life: measured with pgbench's prepared select-only script at 16 clients, 4 400 reads per second with the per-read proof against 84 000 with the proof reused per connection (81 000 with the cache bypassed).
 
 - Borrow existing named-statement references through extended-protocol forwarding and recovery, avoiding a second vector and String clones per batch.
 
@@ -829,8 +865,8 @@ targets must be configured nodes.
   cache: `localtime`/`localtimestamp`, `transaction_timestamp`, `timeofday`,
   `txid_current*`, `pg_current_xact_id*`, `pg_current_snapshot`, `setseed`, `currval`,
   `lastval`, `pg_backend_pid`, `inet_client_*`/`inet_server_*`, the session-state reads
-  `current_setting`, `current_user`, `current_role`, `session_user` (the cache key carries
-  neither `SET ROLE` nor GUCs), and the special timestamp
+  `current_setting`, `current_user`, `current_role`, `session_user` (session state the
+  cache does not read per statement), and the special timestamp
   literals `'now'`, `'today'`, `'tomorrow'`, `'yesterday'` (over-refusal when such a literal
   is plain data only means that read is not cached). The scan is one Aho-Corasick pass over
   the statement with no lower-casing allocation. Sprinter 87c5caf119f8.
@@ -854,16 +890,18 @@ targets must be configured nodes.
   HTTP 413 with `{"error": "result exceeds http_gateway.max_result_rows (N)"}`; a refused
   GraphQL request gets an error with `extensions.code` `RESULT_TOO_LARGE`. The connection
   is kept, and results at or below the caps are served unchanged. Counted in
-  `heliosdb_proxy_gateway_results_refused_total{gateway="http"|"graphql"}`. The
-  one oversized DataRow read whole (a single row larger than the byte cap is still read
-  into memory before it is refused) is not addressed here. Sprinter 2a43c1f4d4d7.
+  `heliosdb_proxy_gateway_results_refused_total{gateway="http"|"graphql"}`. A
+  single DataRow larger than the byte cap is drained without being allocated (see
+  "Bounded backend reads drain an oversized row" above). Sprinter 2a43c1f4d4d7.
   - **Upgrade note:** a `/sql` or GraphQL query that returned more than 10000 rows or
     16 MiB of cell data before now fails with the refusal above. Raise the caps (up to
     1000000 rows and 1 GiB) for such a workload, or narrow the query.
 
 ### Library API (breaking)
 
-- `TenantQueryTransformer::with_refused_functions` and `TransformResult::refused` are new;
+- `TenantQueryTransformer::with_refused_functions`, the `TransformResult::refusal` field
+  and the `TransformResult::refused` constructor are new; `PolicyDenied` gains the variants
+  `TenantStatement` and `TenantQueryLimit` (exhaustive matches must handle them);
   `GatewayPolicy::tenant_sql` now returns `Result<Cow<str>, PolicyDenied>` (it was
   `Cow<str>`), so a refused statement is an `Err` (`PolicyDenied::TenantStatement`, HTTP 403)
   and never a passthrough. Downstream callers must handle the `Err`; the release is a
@@ -879,8 +917,82 @@ targets must be configured nodes.
   cache_scope_proofs, cache_scope_proofs_reused}`; `config::PluginToml::{hot_reload_interval_ms,
   hot_reload_debounce_ms, max_artefact_bytes, require_signed_manifest}`;
   `config::BranchConfig::{route_enabled, route_mode, route_allow}`;
-  `rate_limit::RateLimitConfig::{window_size, window_max_requests}`. New module
-  `plugin_artefact` (artefact format, signing, trust roots).
+  `rate_limit::RateLimitConfig::{window_size, window_max_requests, max_in_flight}`. New
+  module `plugin_artefact` (artefact format, signing, trust roots).
+- Further structs gain public fields (struct literals must set them, or use
+  `..Default::default()`): `config::ProxyConfig::{function_call, admin}`,
+  `config::McpConfig` (`principals`, `max_result_*`, `trust_backend_read_effects`,
+  `tool_cache_*`, `memory_*`), `config::MultiTenancyToml::{refused_functions,
+  max_journal_bytes_per_tenant, tenant_max_journal_bytes, unknown_tenant}`,
+  `config::LimitsToml::{copy_idle_timeout_secs, startup_node_wait_ms}`,
+  `config::AnomalyToml` / `anomaly::AnomalyConfig::max_auth_windows`,
+  `config::RateLimitToml::{window_max_requests, window_secs, cleanup_interval_secs}`,
+  `config::{HttpGatewayConfig, GraphqlGatewayConfig}::{max_result_rows, max_result_bytes}`,
+  `config::CacheToml` (the cache keys listed under Added), `cache::CacheConfig::{refresh_ahead_ratio,
+  refresh_ahead_claim_timeout, heatmap}`, `cache::L2Config::evict_headroom_pct`,
+  `plugins::PluginRuntimeConfig::{hot_reload_interval, hot_reload_debounce,
+  max_artefact_bytes, require_signed_manifest}`, `ServerMetricsSnapshot::{rate_limit_concurrency_refused,
+  startup_waits, startup_wait_timeouts}`, `tenant_slots::TenantBudgetStats` (journal
+  fields), `plugin_registry::VerifyReport::manifest_signed_by`, `admin::AdminState::{mcp_cache,
+  backend_pool}`.
+- Changed signatures: `GatewayPolicy::check_node` returns `Result<NodeAdmission,
+  PolicyDenied>` (hold the admission for the request: it carries a half-open circuit's
+  probe); `plugins::HotReloader::watch_dir` returns `PathBuf`; `L1HotCache::put`,
+  `L2WarmCache::{put_evicting, shed, shed_paced}` return a count. New public modules:
+  `database_name`, `gateway_drain`, `mcp_memory`, `mcp_cache` (with `query-cache`).
+- **Library modules fail closed instead of simulating success.** Several library modules
+  that the daemon does not call used to return made-up values or report success for work
+  that never happened when they had no backend to talk to. In 3.0.0 each one either does
+  the work on a connection it is given or returns an explicit error; none of them
+  fabricates data. The daemon's behaviour is unchanged.
+  - `auth::oauth`: `OAuthClient::introspect` / `validate_to_identity` and
+    `TokenExchange::{exchange_code, refresh_token}` return `OAuthError::NotSupported`
+    (they returned fabricated tokens); nothing is cached. `auth::jwt`:
+    `JwtValidator::refresh_jwks` returns `JwtError::NotSupported` (it installed a dummy
+    key that could replace a configured HS256 key); a validator without a JWKS URL needs
+    no refresh. `auth::credentials`: the Vault and AWS Secrets Manager providers return
+    `CredentialError::NotSupported` (they fabricated credentials);
+    `CredentialManager::list_credentials` returns `Result` and reports provider errors.
+  - `failover_controller`: without a backend template, `initiate_failover`,
+    `manual_failover` and `coordinate_failover_replay` fail with `FailoverFailed` (they
+    reported a failover that promoted nothing); a failed promotion closes its history entry
+    and leaves the state `Failed` (it stayed `InProgress`); the LSN catch-up reads the
+    node's WAL position (it ignored the target LSN); coordinated replay reaches the new
+    primary through the controller's template.
+  - `cursor_restore`: `restore_cursor` / `restore_session_cursors` take the session's
+    connection (`&mut BackendClient`, `in_transaction`) and recreate the cursor on it; the
+    old path declared it on a throwaway connection and closed it, reporting success. New
+    `restore_statements`; `with_backend_template` and `register_endpoint` are removed.
+  - `session_migrate`: `migrate_session` takes the session's connection and runs the
+    restore on it (`set_config` for parameters, `PREPARE`, `CREATE TEMP TABLE`), stopping at
+    the first refused statement; it refuses to drop temp tables or their rows silently.
+    `with_backend_template` / `register_endpoint` are removed.
+  - `failover_replay`: replay without a backend fails every statement (as before), with
+    error text that names the cause.
+  - `upgrade_orchestrator`: the drain stage checks the subscription slot's
+    `confirmed_flush_lsn` against the source WAL (it slept and advanced); retire replays the
+    buffered writes on the new primary (they waited forever); failures and `cancel()` answer
+    buffered writes with `SwitchoverFailed`.
+  - `connection_pool`, `pool::ConnectionPoolManager`, `health_checker`: without a backend
+    template, acquire and health checks fail (`ProxyError::Pool` / `HealthCheck`) instead of
+    handing out connections that only looked alive or reporting nodes healthy;
+    `validate_connection` peeks the socket; `ConnectionPoolManager::with_backend_template`
+    and `resets_skipped()` are new.
+  - `schema_routing::SchemaDiscovery`: discovery against a backend returns
+    `DiscoveryError::BackendDiscoveryUnsupported` (it returned mock tables). `graphql`:
+    `GraphQLEngine` without a backend refuses a query that generates SQL (it returned empty
+    data). `rewriter`: `Condition::{SessionVar, ClientType, TableExists}`,
+    `AstPattern::NPlusOne`, `SqlParser::to_sql`, the `RewriterConfig` fields that were never
+    read (`expand_select_star`, `add_default_limit`, `default_limit`, `max_query_length`,
+    `cache_*`, `agent_safety`) and `AgentSafetyConfig` / `BuiltinRule` are removed.
+    `routing::metrics::RoutingMetrics::target_distribution` returns real counts.
+  - `distribcache`: the L2 tier is documented as the in-memory compressed tier it is
+    (`l2_path` removed); inserts return `CacheResult` (oversize entries were dropped
+    silently); L3 replication and invalidation are awaited and reported per peer
+    (`ReplicationReport`, `PeerOpReport`; the peer protocol acknowledges both, so peers must
+    run the same version); WAL invalidation fails to start when it cannot subscribe and is
+    wired to the tiers; LRU/FIFO eviction is real (`EvictionPolicy::Adaptive` removed); the
+    prefetcher queue is bounded; `invalidate` / `invalidate_table` are async.
 
 ### Development
 

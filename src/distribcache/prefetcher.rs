@@ -1,13 +1,18 @@
 //! Predictive prefetcher for intelligent cache warming
 //!
-//! Uses query sequence patterns and temporal patterns to predict
-//! and pre-warm cache with likely future queries.
+//! Learns query sequence patterns (per session) and temporal patterns (per
+//! hour of day) and turns them into [`PrefetchRequest`]s on a bounded,
+//! priority-ordered [`PrefetchQueue`]. The prefetcher does not execute
+//! queries itself: the caller drains [`PredictivePrefetcher::queue`], runs
+//! each predicted query against the backend and inserts the result into the
+//! cache.
 
 use chrono::{Datelike, Timelike};
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::{DistribCacheConfig, QueryFingerprint, SessionId};
 
@@ -20,24 +25,47 @@ pub struct PrefetchRequest {
     pub priority: u32,
 }
 
-/// Prefetch queue
+/// Bounded prefetch queue, highest priority first.
 pub struct PrefetchQueue {
     /// Queue of pending requests
     queue: std::sync::Mutex<VecDeque<PrefetchRequest>>,
     /// Notifier for new items
     notify: tokio::sync::Notify,
+    /// Maximum queued requests (`DistribCacheConfig::max_prefetch_queue`)
+    capacity: usize,
+    /// Requests dropped because the queue was full
+    dropped: AtomicU64,
 }
 
 impl PrefetchQueue {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             queue: std::sync::Mutex::new(VecDeque::new()),
             notify: tokio::sync::Notify::new(),
+            capacity,
+            dropped: AtomicU64::new(0),
         }
     }
 
-    pub fn enqueue(&self, request: PrefetchRequest) {
+    /// Queue a request by priority (higher first). When the queue is full,
+    /// the lowest-priority request — the new one if it ranks lowest — is
+    /// dropped and counted in [`Self::dropped`]. Returns whether `request`
+    /// was queued.
+    pub fn enqueue(&self, request: PrefetchRequest) -> bool {
         let mut queue = self.queue.lock().unwrap();
+
+        if queue.len() >= self.capacity {
+            match queue.back() {
+                Some(lowest) if lowest.priority < request.priority => {
+                    queue.pop_back();
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            }
+        }
 
         // Insert by priority (higher priority first)
         let pos = queue
@@ -47,6 +75,17 @@ impl PrefetchQueue {
 
         queue.insert(pos, request);
         self.notify.notify_one();
+        true
+    }
+
+    /// Take the highest-priority request without waiting.
+    pub fn try_dequeue(&self) -> Option<PrefetchRequest> {
+        self.queue.lock().unwrap().pop_front()
+    }
+
+    /// Requests dropped because the queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub async fn dequeue(&self) -> Option<PrefetchRequest> {
@@ -128,14 +167,14 @@ pub struct PredictivePrefetcher {
     /// Session-based sequences
     session_sequences: DashMap<SessionId, VecDeque<QueryFingerprint>>,
 
+    /// Last time each session recorded a query
+    session_last_seen: DashMap<SessionId, Instant>,
+
     /// Temporal patterns
     temporal_patterns: TemporalPatternStore,
 
     /// Prefetch queue
     prefetch_queue: Arc<PrefetchQueue>,
-
-    /// Running flag
-    running: AtomicBool,
 
     /// Statistics
     predictions_made: AtomicU64,
@@ -147,12 +186,12 @@ impl PredictivePrefetcher {
     /// Create a new prefetcher
     pub fn new(config: DistribCacheConfig) -> Self {
         Self {
+            prefetch_queue: Arc::new(PrefetchQueue::new(config.max_prefetch_queue)),
             config,
             patterns: DashMap::new(),
             session_sequences: DashMap::new(),
+            session_last_seen: DashMap::new(),
             temporal_patterns: TemporalPatternStore::new(),
-            prefetch_queue: Arc::new(PrefetchQueue::new()),
-            running: AtomicBool::new(false),
             predictions_made: AtomicU64::new(0),
             prefetch_hits: AtomicU64::new(0),
             prefetch_misses: AtomicU64::new(0),
@@ -161,6 +200,9 @@ impl PredictivePrefetcher {
 
     /// Record a query for pattern learning
     pub fn record(&self, session: &SessionId, fingerprint: QueryFingerprint) {
+        self.session_last_seen
+            .insert(session.clone(), Instant::now());
+
         // Get or create session sequence
         let mut seq = self
             .session_sequences
@@ -205,11 +247,12 @@ impl PredictivePrefetcher {
             let predictions = self.get_top_predictions(next_queries.value());
 
             for (fingerprint, confidence) in predictions {
-                if confidence > self.config.prefetch_confidence_threshold {
-                    self.prefetch_queue.enqueue(PrefetchRequest {
+                if confidence > self.config.prefetch_confidence_threshold
+                    && self.prefetch_queue.enqueue(PrefetchRequest {
                         fingerprint,
                         priority: (confidence * 100.0) as u32,
-                    });
+                    })
+                {
                     self.predictions_made.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -223,10 +266,12 @@ impl PredictivePrefetcher {
             .into_iter()
             .take(self.config.prefetch_lookahead as usize)
         {
-            self.prefetch_queue.enqueue(PrefetchRequest {
+            if self.prefetch_queue.enqueue(PrefetchRequest {
                 fingerprint,
                 priority: 50, // Medium priority for temporal
-            });
+            }) {
+                self.predictions_made.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -256,17 +301,10 @@ impl PredictivePrefetcher {
             .collect()
     }
 
-    /// Start the prefetch background worker
-    pub async fn start(&self) {
-        self.running.store(true, Ordering::SeqCst);
-
-        // In production, this would spawn a background task
-        // that processes the prefetch queue
-    }
-
-    /// Stop the prefetcher
-    pub async fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
+    /// The queue of predicted queries. The caller executes them: dequeue,
+    /// run the query against the backend, insert the result into the cache.
+    pub fn queue(&self) -> Arc<PrefetchQueue> {
+        self.prefetch_queue.clone()
     }
 
     /// Record prefetch hit
@@ -294,25 +332,23 @@ impl PredictivePrefetcher {
             },
             patterns_learned: self.patterns.len(),
             sessions_tracked: self.session_sequences.len(),
+            requests_dropped: self.prefetch_queue.dropped(),
         }
     }
 
-    /// Clean up old sessions
-    pub fn cleanup_old_sessions(&self, _max_age: std::time::Duration) {
-        // In production, track timestamps and clean up
-        // For now, just limit total sessions
-        if self.session_sequences.len() > 10000 {
-            // Remove random entries to stay under limit
-            let to_remove: Vec<_> = self
-                .session_sequences
-                .iter()
-                .take(1000)
-                .map(|e| e.key().clone())
-                .collect();
-
-            for key in to_remove {
-                self.session_sequences.remove(&key);
-            }
+    /// Forget the query sequence of every session that has not recorded a
+    /// query for longer than `max_age`. Learned patterns are kept.
+    pub fn cleanup_old_sessions(&self, max_age: Duration) {
+        let now = Instant::now();
+        let expired: Vec<SessionId> = self
+            .session_last_seen
+            .iter()
+            .filter(|e| now.duration_since(*e.value()) > max_age)
+            .map(|e| e.key().clone())
+            .collect();
+        for session in expired {
+            self.session_last_seen.remove(&session);
+            self.session_sequences.remove(&session);
         }
     }
 }
@@ -330,6 +366,8 @@ pub struct PrefetchStats {
     pub patterns_learned: usize,
     /// Number of sessions tracked
     pub sessions_tracked: usize,
+    /// Prefetch requests dropped because the queue was full
+    pub requests_dropped: u64,
 }
 
 #[cfg(test)]
@@ -338,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_prefetch_queue() {
-        let queue = PrefetchQueue::new();
+        let queue = PrefetchQueue::new(10);
 
         let fp1 = QueryFingerprint::from_query("SELECT 1");
         let fp2 = QueryFingerprint::from_query("SELECT 2");
@@ -359,6 +397,59 @@ mod tests {
         });
 
         assert_eq!(queue.len(), 3);
+        assert_eq!(queue.try_dequeue().unwrap().fingerprint, fp2);
+        assert_eq!(queue.try_dequeue().unwrap().fingerprint, fp1);
+        assert_eq!(queue.try_dequeue().unwrap().fingerprint, fp3);
+        assert!(queue.try_dequeue().is_none());
+    }
+
+    /// The queue honours `max_prefetch_queue`: when full, the lowest
+    /// priority request is dropped and counted.
+    #[test]
+    fn test_prefetch_queue_is_bounded() {
+        let queue = PrefetchQueue::new(2);
+        let req = |q: &str, priority| PrefetchRequest {
+            fingerprint: QueryFingerprint::from_query(q),
+            priority,
+        };
+        assert!(queue.enqueue(req("SELECT 1", 50)));
+        assert!(queue.enqueue(req("SELECT 2", 10)));
+        // Higher priority than the lowest queued: evicts "SELECT 2".
+        assert!(queue.enqueue(req("SELECT 3", 90)));
+        // Lower than everything queued: rejected.
+        assert!(!queue.enqueue(req("SELECT 4", 5)));
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.dropped(), 2);
+        assert_eq!(
+            queue.try_dequeue().unwrap().fingerprint,
+            QueryFingerprint::from_query("SELECT 3")
+        );
+        assert_eq!(
+            queue.try_dequeue().unwrap().fingerprint,
+            QueryFingerprint::from_query("SELECT 1")
+        );
+    }
+
+    /// `cleanup_old_sessions` removes exactly the sessions idle longer than
+    /// `max_age`.
+    #[test]
+    fn test_cleanup_old_sessions_honours_max_age() {
+        let prefetcher = PredictivePrefetcher::new(DistribCacheConfig::default());
+        let old = SessionId::new("old");
+        let fresh = SessionId::new("fresh");
+        prefetcher.record(&old, QueryFingerprint::from_query("SELECT 1"));
+        prefetcher.record(&fresh, QueryFingerprint::from_query("SELECT 2"));
+        // Backdate the old session's last activity.
+        prefetcher
+            .session_last_seen
+            .insert(old.clone(), Instant::now() - Duration::from_secs(120));
+
+        prefetcher.cleanup_old_sessions(Duration::from_secs(60));
+
+        assert!(!prefetcher.session_sequences.contains_key(&old));
+        assert!(prefetcher.session_sequences.contains_key(&fresh));
+        assert_eq!(prefetcher.stats().sessions_tracked, 1);
     }
 
     #[test]
