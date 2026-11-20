@@ -1137,6 +1137,7 @@ async fn an_arbitrary_function_call_retires_every_cached_result() {
         let h = Harness::new(0, None, |c| {
             c.function_call = mode;
             c.cache.enabled = true;
+            c.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         })
         .await;
         let mut a = h.connect("acme").await;
@@ -1226,6 +1227,7 @@ const KV_READ: &str = "SELECT v FROM kv WHERE id = $1";
 async fn cache_harness(tweak: impl FnOnce(&mut ProxyConfig)) -> Harness {
     Harness::new(0, None, |c| {
         c.cache.enabled = true;
+        c.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         c.cache.trust_backend_read_effects = true;
         tweak(c);
     })
@@ -1334,6 +1336,77 @@ async fn a_named_extended_read_is_answered_from_the_cache() {
     assert_eq!(backend_saw(&h, b'E'), 2, "the other session's entry");
 }
 
+/// A cached response is kept in an allocation of its own size, not in the
+/// capture buffer it was read into.
+#[cfg(feature = "query-cache")]
+#[test]
+fn a_captured_body_does_not_keep_its_capture_buffer() {
+    for len in [0usize, 60, 2047, 2048, 4000, 4096] {
+        let mut captured = Vec::with_capacity(4096);
+        captured.resize(len, 7u8);
+        let body = ProxyServer::captured_body(captured.clone());
+        assert_eq!(&body[..], &captured[..], "{len}");
+        // Alone in its allocation, `Bytes` hands it back as a vector of the
+        // capacity it holds.
+        let held = Vec::from(body).capacity();
+        assert_eq!(held, len, "{len}");
+    }
+}
+
+/// Under the default `extended_protocol = "hint"` only a statement whose text
+/// carries `helios:cache=on` is looked up, unnamed or prepared; a skip beside
+/// it wins, and `"off"` ignores the hint.
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn an_extended_read_is_cached_under_hint_mode_only_when_its_text_asks() {
+    use crate::config::ExtendedProtocolCache::{Hint, Off};
+    const ASKS: &str = "SELECT v FROM kv WHERE id = $1 /*helios:cache=on*/";
+    const ASKS_AND_SKIPS: &str = "SELECT v FROM kv WHERE id = $1 /*helios:cache=on,cache=skip*/";
+    let unnamed = |sql: &str| [parse("", sql), bind_value("", "1", 0), execute(), sync()].concat();
+    assert_eq!(
+        ProxyConfig::default().cache.extended_protocol,
+        Hint,
+        "the default"
+    );
+    let h = cache_harness(|c| c.cache.extended_protocol = Hint).await;
+    let mut a = h.connect("acme").await;
+    let mut executed = 0;
+    // (statement, whether its second run is a hit)
+    for (sql, cached) in [(KV_READ, false), (ASKS, true), (ASKS_AND_SKIPS, false)] {
+        for run in 0..3 {
+            a.send(&unnamed(sql)).await;
+            assert_eq!(tags(&a.until_ready().await), b"12CZ", "{sql}");
+            if run == 0 || !cached {
+                executed += 1;
+            }
+            assert_eq!(backend_saw(&h, b'E'), executed, "{sql} run {run}");
+        }
+    }
+    // A prepared statement carries the hint for each of its executions.
+    for (name, sql, cached) in [("plain", KV_READ, false), ("asks", ASKS, true)] {
+        a.send(&[parse(name, sql), sync()].concat()).await;
+        assert_eq!(tags(&a.until_ready().await), b"1Z");
+        // Another value than the unnamed runs stored.
+        let run = [bind_value(name, "2", 0), execute(), sync()].concat();
+        for n in 0..3 {
+            a.send(&run).await;
+            assert_eq!(tags(&a.until_ready().await), b"2CZ", "{name}");
+            if n == 0 || !cached {
+                executed += 1;
+            }
+            assert_eq!(backend_saw(&h, b'E'), executed, "{name} run {n}");
+        }
+    }
+
+    let h = cache_harness(|c| c.cache.extended_protocol = Off).await;
+    let mut a = h.connect("acme").await;
+    for expected in [1, 2, 3] {
+        a.send(&unnamed(ASKS)).await;
+        assert_eq!(tags(&a.until_ready().await), b"12CZ");
+        assert_eq!(backend_saw(&h, b'E'), expected, "\"off\" ignores the hint");
+    }
+}
+
 /// A write to the table retires the entries that read it, a transaction's
 /// reads are never cached, and `extended_protocol = false` leaves every
 /// batch to the backend.
@@ -1390,7 +1463,9 @@ async fn extended_cache_entries_follow_writes_transactions_and_the_switch() {
     }
     assert_served(&a.query("COMMIT").await, b'I');
 
-    let h = cache_harness(|c| c.cache.extended_protocol = false).await;
+    let h =
+        cache_harness(|c| c.cache.extended_protocol = crate::config::ExtendedProtocolCache::Off)
+            .await;
     let mut a = h.connect("acme").await;
     for expected in [1, 2, 3] {
         a.send(&read()).await;
@@ -3461,6 +3536,7 @@ async fn the_rate_limiter_never_refuses_a_message_continuing_a_flushed_cycle() {
 async fn a_query_continuing_a_flushed_cycle_is_not_answered_from_the_cache() {
     let h = Harness::new(0, None, |c| {
         c.cache.enabled = true;
+        c.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         c.cache.trust_backend_read_effects = true;
     })
     .await;
@@ -3502,6 +3578,7 @@ async fn delayed_cache_scope_probe_holds_tenant_admission_through_pool_cleanup()
     for pooled in poolings() {
         let h = Harness::new(5000, Some(Duration::from_millis(50)), |c| {
             c.cache.enabled = true;
+            c.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
             c.cache.trust_backend_read_effects = true;
             c.pool_mode.skip_clean_reset = false;
             // Every read proves: the probes below are counted.
@@ -3608,6 +3685,7 @@ async fn delayed_cache_scope_probe_holds_tenant_admission_through_pool_cleanup()
 async fn a_query_continuing_a_flushed_cycle_counts_no_cache_skip() {
     let h = Harness::new(0, None, |c| {
         c.cache.enabled = true;
+        c.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         c.cache.trust_backend_read_effects = true;
     })
     .await;
@@ -5898,6 +5976,49 @@ fn a_named_statements_session_lock_is_classified_once_per_definition() {
     ));
 }
 
+/// What a named statement does to the session-bound state, and whether it
+/// releases the session's advisory locks, is read from its text once per
+/// definition (memoized against the registry's Parse bytes): every Bind is
+/// a lookup, and a redefinition is read afresh.
+#[test]
+fn a_named_statements_text_facts_are_read_once_per_definition() {
+    let parse_of = |sql: &str| bytes::Bytes::from(parse("s1", sql));
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    let mut memo = HashMap::new();
+    assert!(
+        ProxyServer::named_text_facts(&mut memo, &registry, "s1").is_none(),
+        "an unknown statement says nothing"
+    );
+    assert!(memo.is_empty());
+    let listen = "LISTEN jobs";
+    registry.insert("s1".into(), parse_of(listen));
+    let facts = ProxyServer::named_text_facts(&mut memo, &registry, "s1").expect("known");
+    assert_eq!(facts.effect, super::session_bound::text_effect(listen));
+    assert_ne!(facts.effect, super::session_bound::Effect::default());
+    assert!(!facts.unlocks);
+    // The memo answers for these very bytes without a rescan: an answer
+    // planted for them is what comes back.
+    memo.get_mut("s1").expect("memoized").1 = None;
+    assert!(ProxyServer::named_text_facts(&mut memo, &registry, "s1").is_none());
+    // A re-Parse (new bytes, even with the same text) is read again.
+    registry.insert("s1".into(), parse_of(listen));
+    assert_eq!(
+        ProxyServer::named_text_facts(&mut memo, &registry, "s1"),
+        Some(facts)
+    );
+    let unlock = "SELECT pg_advisory_unlock_all()";
+    registry.insert("s1".into(), parse_of(unlock));
+    let facts = ProxyServer::named_text_facts(&mut memo, &registry, "s1").expect("known");
+    assert!(facts.unlocks);
+    assert_eq!(facts.effect, super::session_bound::text_effect(unlock));
+    // Text that is not UTF-8 says nothing (the backend refuses it).
+    let mut invalid = parse("s1", "SELECT 'x'");
+    let at = invalid.iter().position(|&b| b == b'x').expect("literal");
+    invalid[at] = 0xff;
+    registry.insert("s1".into(), bytes::Bytes::from(invalid));
+    assert!(ProxyServer::named_text_facts(&mut memo, &registry, "s1").is_none());
+}
+
 /// The frames the proxy sends `client` up to a ReadyForQuery or the end of
 /// the connection, whichever comes first.
 async fn frames_until_ready_or_closed(client: &mut Client) -> Vec<Vec<u8>> {
@@ -7670,7 +7791,11 @@ mod simple_query_payload_regressions {
     #[cfg(feature = "query-cache")]
     #[tokio::test]
     async fn simple_query_payload_warm_cache_cannot_mask_trailing_bytes() {
-        let h = Harness::new(0, None, |c| c.cache.enabled = true).await;
+        let h = Harness::new(0, None, |c| {
+            c.cache.enabled = true;
+            c.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
+        })
+        .await;
         let mut client = h.connect("acme").await;
         assert_served(&client.query("SELECT 42").await, b'I');
         let hits = || {

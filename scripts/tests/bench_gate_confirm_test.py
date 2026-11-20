@@ -88,6 +88,43 @@ class Decide(unittest.TestCase):
         self.assertEqual([r["full_id"] for r in record["confirmed_regressions"]], ["a/b"])
         self.assertEqual(record["not_reproduced"], ["a/c"])
 
+    def test_a_reproduced_regression_on_function_identical_code_is_reported(self):
+        p = primary([case("a/b", 6.0, True), case("a/c", 3.0, True)])
+        c = confirmation([case("a/b", 5.0, True), case("a/c", 2.5, True)])
+        same = {"classification": "function-identical", "reason": "placement"}
+        verdict, record = confirm.decide(p, c, {"a/b": same, "a/c": same})
+        self.assertEqual(verdict, "PASS")
+        self.assertIn("function-identical", record["reason"])
+        self.assertEqual([r["full_id"] for r in record["function_identical_regressions"]],
+                         ["a/b", "a/c"])
+        self.assertEqual(record["failing_regressions"], [])
+        self.assertEqual(len(record["confirmed_regressions"]), 2)
+
+    def test_changed_unknown_or_unchecked_code_still_fails(self):
+        p = primary([case("a/b", 6.0, True), case("a/c", 3.0, True), case("a/d", 4.0, True)])
+        c = confirmation([case("a/b", 5.0, True), case("a/c", 2.5, True),
+                          case("a/d", 4.0, True)])
+        for other in ({"classification": "code-changed", "reason": "x"},
+                      {"classification": "unknown", "reason": "no samples"}, None):
+            hot = {"a/b": {"classification": "function-identical", "reason": "placement"}}
+            if other is not None:
+                hot["a/c"] = hot["a/d"] = other
+            verdict, record = confirm.decide(p, c, hot)
+            self.assertEqual(verdict, "FAIL")
+            self.assertEqual([r["full_id"] for r in record["failing_regressions"]],
+                             ["a/c", "a/d"])
+            self.assertEqual(record["failing_regressions"][0]["hot"],
+                             other["classification"] if other else "not checked")
+
+    def test_reproduced_lists_the_cases_the_hot_check_must_see(self):
+        cases = [case("a/b", 6.0, True), case("a/c", 3.0, True)]
+        cases[0]["target"], cases[1]["target"] = "relay", "cache"
+        p = primary(cases)
+        c = confirmation([case("a/b", 5.0, True), case("a/c", 2.5, False)])
+        self.assertEqual(confirm.reproduced(p, c), [("relay", "a/b")])
+        self.assertEqual(confirm.reproduced(p, None), [])
+        self.assertEqual(confirm.reproduced(primary(cases, mean=4.0), c), [])
+
     def test_an_unmeasured_or_invalid_confirmation_is_invalid(self):
         p = primary([case("a/b", 6.0, True), case("a/c", 3.0, True)])
         self.assertEqual(confirm.decide(p, None)[0], "INVALID")
@@ -137,6 +174,18 @@ class Cli(unittest.TestCase):
             summary = (tmp / "bench-gate-summary.txt").read_text()
             self.assertIn("final verdict (second-build confirmation): FAIL", summary)
             self.assertIn("reproduced: pool/create/10 +3.00%", summary)
+            listed = self.run_cli("reproduced", str(tmp / "primary.json"),
+                                  str(tmp / "confirm.json"))
+            self.assertEqual(listed.stdout, "\tpool/create/10\n")
+            (tmp / "hot").mkdir()
+            (tmp / "hot" / "0.json").write_text(json.dumps(
+                {"full_id": "pool/create/10", "classification": "function-identical",
+                 "reason": "placement"}))
+            out = self.run_cli("verdict", str(tmp / "primary.json"), str(tmp / "confirm.json"),
+                               str(tmp), str(tmp / "hot"))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("reproduced: pool/create/10 +3.00% [function-identical, reported]",
+                          (tmp / "bench-gate-summary.txt").read_text())
             os.remove(tmp / "confirm.json")
             missing = self.run_cli("verdict", str(tmp / "primary.json"),
                                    str(tmp / "confirm.json"), str(tmp))

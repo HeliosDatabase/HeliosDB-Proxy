@@ -607,7 +607,9 @@ test against the prefix form on plain statements.
 (`read_unless_it_calls`). Neither showed in gate 4 (below); the comments and the
 changelog entry say so. The costs they were aimed at stand.
 
-**Extended-protocol read cache** (`[cache] extended_protocol`, default `true`).
+**Extended-protocol read cache** (`[cache] extended_protocol`; default `"hint"` since
+2026-11-20, owner decision after the 3.0.0 user-path gate: statements opt in with
+`/*helios:cache=on*/`, `"on"` is the former default `true`).
 `src/server/ext_cache.rs`. Served shapes: `Parse("")`/`Bind`/[`Describe` portal]/
 `Execute`/`Sync` where the unnamed `Parse` leads the batch (needs
 `optimize_unnamed_parse`, the default), and `Bind`/[`Describe` portal]/`Execute`/`Sync`

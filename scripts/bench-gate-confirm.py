@@ -13,7 +13,12 @@ not change. The release rule (owner decision, 2026-11-17) is:
   * a separated regression on a `code-changed` (or unclassified) executable
     fails only if it reproduces in a second, independent build of both trees:
     re-measured there over the same interleaved rounds, it is again separated
-    (every candidate round slower than every baseline round) and slower.
+    (every candidate round slower than every baseline round) and slower;
+  * a regression that does reproduce there is reported, not failing, when the
+    case runs `function-identical` code (owner decision, 2026-11-19;
+    scripts/bench-gate-hot.py: sampled in both executables, the case spends
+    its time in functions whose bodies both builds hold, so only their
+    placement differs). `code-changed` or `unknown` there fails.
 
 Subcommands (all paths are files written or read by bench-gate.sh):
 
@@ -24,9 +29,14 @@ Subcommands (all paths are files written or read by bench-gate.sh):
       Keep only the cases whose full ID is listed in IDS_FILE.
   regex IDS_FILE
       Print an anchored Criterion filter matching exactly those IDs.
-  verdict PRIMARY_JSON CONFIRM_JSON OUT_DIR
+  reproduced PRIMARY_JSON CONFIRM_JSON
+      Print "TARGET<TAB>FULL_ID" for every regression the confirmation run
+      separated again (the cases bench-gate-hot.py must look at); nothing
+      when the verdict does not depend on them.
+  verdict PRIMARY_JSON CONFIRM_JSON OUT_DIR [HOT_DIR]
       Decide; write OUT_DIR/bench-gate-final.json and append the decision to
-      OUT_DIR/bench-gate-summary.txt. Exit 0 PASS, 1 FAIL, 2 INVALID.
+      OUT_DIR/bench-gate-summary.txt. HOT_DIR holds one bench-gate-hot.py
+      result (*.json) per reproduced case. Exit 0 PASS, 1 FAIL, 2 INVALID.
 """
 import json
 import os
@@ -54,8 +64,20 @@ def confirmed(confirm):
     return [c for c in confirm["cases"] if c["separated"] and c["delta_pct"] > EPS]
 
 
-def decide(primary, confirm):
-    """(verdict, record) for the primary run and, when one ran, its confirmation."""
+def reproduced(primary, confirm):
+    """(target, full ID) of the regressions the verdict now depends on."""
+    action, ids = plan(primary)
+    if action != "CONFIRM" or confirm is None or confirm.get("invalid_problems") \
+            or confirm.get("verdict") == "INVALID":
+        return []
+    targets = {c["full_id"]: c.get("target", "") for c in primary["cases"]}
+    return [(targets.get(c["full_id"], ""), c["full_id"])
+            for c in confirmed(confirm) if c["full_id"] in set(ids)]
+
+
+def decide(primary, confirm, hot=None):
+    """(verdict, record) for the primary run and, when one ran, its
+    confirmation; `hot` maps a full ID to its bench-gate-hot.py result."""
     action, ids = plan(primary)
     record = {
         "label": primary.get("label"),
@@ -90,8 +112,21 @@ def decide(primary, confirm):
         for c in again
     ]
     record["not_reproduced"] = sorted(set(ids) - {c["full_id"] for c in again})
-    if again:
+    hot = hot or {}
+    placed = [c["full_id"] for c in again
+              if hot.get(c["full_id"], {}).get("classification") == "function-identical"]
+    record["function_identical_regressions"] = [
+        {"full_id": i, "reason": hot[i].get("reason", "")} for i in placed]
+    record["failing_regressions"] = [
+        {"full_id": c["full_id"],
+         "hot": hot.get(c["full_id"], {}).get("classification", "not checked"),
+         "reason": hot.get(c["full_id"], {}).get("reason", "")}
+        for c in again if c["full_id"] not in placed]
+    if record["failing_regressions"]:
         return "FAIL", dict(record, reason="separated regressions reproduced in the second build")
+    if again:
+        return "PASS", dict(record, reason="every reproduced separated regression runs "
+                                           "function-identical code (placement only)")
     return "PASS", dict(record, reason="no separated regression on changed code reproduced")
 
 
@@ -115,16 +150,31 @@ def main(argv):
         ids = [line.strip() for line in open(argv[2]) if line.strip()]
         print("^(" + "|".join(re.escape(i) for i in ids) + ")$")
         return 0
-    if cmd == "verdict" and len(argv) == 5:
+    if cmd == "reproduced" and len(argv) == 4:
+        confirm = json.load(open(argv[3])) if os.path.exists(argv[3]) else None
+        for target, full_id in reproduced(json.load(open(argv[2])), confirm):
+            print(f"{target}\t{full_id}")
+        return 0
+    if cmd == "verdict" and len(argv) in (5, 6):
         primary = json.load(open(argv[2]))
         confirm = json.load(open(argv[3])) if os.path.exists(argv[3]) else None
-        verdict, record = decide(primary, confirm)
+        hot = {}
+        if len(argv) == 6 and os.path.isdir(argv[5]):
+            for name in sorted(os.listdir(argv[5])):
+                if name.endswith(".json"):
+                    result = json.load(open(os.path.join(argv[5], name)))
+                    hot[result["full_id"]] = result
+        verdict, record = decide(primary, confirm, hot)
         record["verdict"] = verdict
         with open(os.path.join(argv[4], "bench-gate-final.json"), "w") as out:
             json.dump(record, out, indent=1)
         lines = [f"final verdict (second-build confirmation): {verdict} — {record['reason']}"]
+        kinds = {c["full_id"]: c["hot"] for c in record.get("failing_regressions", [])}
+        kinds.update({c["full_id"]: "function-identical, reported"
+                      for c in record.get("function_identical_regressions", [])})
         for c in record.get("confirmed_regressions", []):
-            lines.append(f"  reproduced: {c['full_id']} {c['delta_pct']:+.2f}%")
+            lines.append(f"  reproduced: {c['full_id']} {c['delta_pct']:+.2f}%"
+                         f" [{kinds.get(c['full_id'], 'not checked')}]")
         if record.get("not_reproduced"):
             lines.append(f"  not reproduced: {', '.join(record['not_reproduced'])}")
         if record["layout_only_regressions"]:

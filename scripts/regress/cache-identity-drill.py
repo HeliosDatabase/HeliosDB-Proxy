@@ -197,6 +197,7 @@ role = "primary"
 [cache]
 enabled = true
 ttl_secs = 300
+extended_protocol = "on"
 ''')
         proxy = subprocess.Popen([str(Path(args.proxy_binary).resolve()), "--config", str(config),
                                   "--log-level", "warn"], stdout=logfile, stderr=logfile)

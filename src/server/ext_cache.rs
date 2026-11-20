@@ -1,5 +1,9 @@
 //! The query cache on the extended protocol (`[cache] extended_protocol`).
 //!
+//! The option says which reads are looked up: `"on"` every one a simple
+//! query's lookup would take, `"hint"` (the default) only a statement whose
+//! text asks with the cache hint `helios:cache=on`, `"off"` none.
+//!
 //! A batch the cache may answer has one of two exact shapes, each ended by
 //! `Sync` and run outside a transaction block:
 //!
@@ -37,8 +41,13 @@ pub(super) struct CacheableBatch<'a> {
     /// The signature of the unnamed `Parse` held ahead of the batch; `None`
     /// when the batch binds a named statement.
     pub(super) unnamed_sig: Option<&'a bytes::Bytes>,
-    /// Everything of the batch the response depends on beside `sql`.
-    identity: Sha256,
+    /// Whether the portal is described.
+    described: bool,
+    /// The parameter types the `Parse` declares.
+    types: &'a [u8],
+    /// The `Bind` after its two names: parameter format codes, parameter
+    /// values, result format codes.
+    bind_tail: &'a [u8],
 }
 
 use super::frames::{next_frontend_frame as frame, split_cstring as cstring};
@@ -85,26 +94,75 @@ impl<'a> CacheableBatch<'a> {
         let (_, parse_body) = cstring(parse.get(5..)?)?;
         let (sql, types) = cstring(parse_body)?;
         let sql = std::str::from_utf8(sql).ok()?;
-        let mut identity = Sha256::new();
-        identity.update(b"helios-extended-read-v1");
-        identity.update([u8::from(unnamed.is_some()), u8::from(described)]);
-        identity.update((types.len() as u64).to_be_bytes());
-        identity.update(types);
-        identity.update((bind_tail.len() as u64).to_be_bytes());
-        identity.update(bind_tail);
         Some(Self {
             sql,
             unnamed_sig: unnamed.map(|(_, sig)| sig),
-            identity,
+            described,
+            types,
+            bind_tail,
         })
+    }
+
+    /// Whether the statement's text is the same at every execution, so what
+    /// it alone decides is worth remembering ([`crate::cache::text_memo`]): a
+    /// prepared statement, or an unnamed one that binds parameters. An
+    /// unnamed statement without parameters carries its values in its text.
+    pub(super) fn repeats(&self) -> bool {
+        // The Bind after its names: the format codes, then the parameters.
+        let parameters = || {
+            let formats = usize::from(u16::from_be_bytes(
+                self.bind_tail.get(..2)?.try_into().ok()?,
+            ));
+            let count = self.bind_tail.get(2 + 2 * formats..4 + 2 * formats)?;
+            Some(u16::from_be_bytes(count.try_into().ok()?))
+        };
+        self.unnamed_sig.is_none() || parameters().is_some_and(|n| n > 0)
     }
 
     /// The cache namespace of this batch's entry under the session scope
     /// `scope` (the namespace a simple query of the session would use).
+    ///
+    /// Everything of the batch the response depends on beside `sql` is
+    /// hashed here, so a batch that is never looked up pays for none of it.
     pub(super) fn namespace(&self, scope: &[u8; 32]) -> [u8; 32] {
-        let mut hash = self.identity.clone();
+        let mut hash = Sha256::new();
+        hash.update(b"helios-extended-read-v1");
+        hash.update([
+            u8::from(self.unnamed_sig.is_some()),
+            u8::from(self.described),
+        ]);
+        hash.update((self.types.len() as u64).to_be_bytes());
+        hash.update(self.types);
+        hash.update((self.bind_tail.len() as u64).to_be_bytes());
+        hash.update(self.bind_tail);
         hash.update(scope);
         hash.finalize().into()
+    }
+}
+
+/// What a statement's text alone says about caching its result, under one
+/// daemon's volatile-function list and table exclusions.
+#[derive(Debug, Clone, Copy)]
+struct ReadText {
+    /// `SELECT <integer>`: cacheable without `trust_backend_read_effects`.
+    literal_scalar: bool,
+    /// A plain, deterministic, single-statement read.
+    read: bool,
+    /// Why the cache refuses such a read (asked only of one).
+    refusal: Option<crate::sql_text::CacheRefusal>,
+}
+
+impl ReadText {
+    fn of(sql: &str, state: &ServerState) -> Self {
+        let mut facts = StmtFacts::new(sql);
+        let read = !facts.is_write() && facts.is_cacheable_read(&state.volatile_scan);
+        Self {
+            literal_scalar: crate::replay_sql::literal_scalar_select(sql),
+            read,
+            refusal: read
+                .then(|| crate::sql_text::cache_refusal(sql, state.table_exclusions.as_deref()))
+                .flatten(),
+        }
     }
 }
 
@@ -150,7 +208,7 @@ impl ProxyServer {
         config: &ProxyConfig,
     ) -> bool {
         state.query_cache.is_some()
-            && config.cache.extended_protocol
+            && config.cache.extended_protocol != crate::config::ExtendedProtocolCache::Off
             && !session.in_transaction.load(Ordering::Relaxed)
             && !session.cache_ineligible.load(Ordering::Relaxed)
     }
@@ -159,23 +217,46 @@ impl ProxyServer {
     /// conditions a simple query's lookup has, none of which reads the
     /// backend.
     pub(super) fn extended_cache_candidate(
-        sql: &str,
+        plan: &CacheableBatch<'_>,
         session: &ClientSession,
         state: &ServerState,
         config: &ProxyConfig,
     ) -> bool {
+        thread_local! {
+            static MEMO: std::cell::RefCell<crate::cache::text_memo::TextMemo<ReadText>> =
+                std::cell::RefCell::default();
+        }
         if !Self::extended_cache_open(session, state, config) {
             return false;
         }
-        if !(config.cache.trust_backend_read_effects
-            || crate::replay_sql::literal_scalar_select(sql))
+        let Some(cache) = state.query_cache.as_ref() else {
+            return false;
+        };
+        let sql = plan.sql;
+        // `"hint"`: only a statement that asks. (A text without the hint
+        // marker costs one substring search here.)
+        if config.cache.extended_protocol == crate::config::ExtendedProtocolCache::Hint
+            && !crate::cache::parse_cache_hints(sql).opt_in
         {
             return false;
         }
-        let mut facts = StmtFacts::new(sql);
-        !facts.is_write()
-            && facts.is_cacheable_read(&state.volatile_scan)
-            && !Self::cache_refuses(state, sql)
+        // What the text alone decides, under this daemon's volatile-function
+        // list and table exclusions (both built once at startup).
+        let text = if plan.repeats() {
+            crate::cache::text_memo::of(&MEMO, cache.memo_owner(), sql, || ReadText::of(sql, state))
+        } else {
+            ReadText::of(sql, state)
+        };
+        if !(config.cache.trust_backend_read_effects || text.literal_scalar) || !text.read {
+            return false;
+        }
+        match text.refusal {
+            Some(refusal) => {
+                Self::count_cache_refusal(state, refusal);
+                false
+            }
+            None => true,
+        }
     }
 
     /// Give the backend the unnamed statement `sig` describes (a `Parse`
@@ -282,7 +363,11 @@ impl ProxyServer {
         // The exact-text tier keys on the statement text alone.
         context.connection_id = None;
         let namespace = plan.namespace(&scope);
-        let (lookup, prep) = cache.get_scoped(plan.sql, None, &context, &namespace).await;
+        let (lookup, prep) = if plan.repeats() {
+            cache.get_scoped_statement(plan.sql, &context, &namespace)
+        } else {
+            cache.get_scoped(plan.sql, None, &context, &namespace).await
+        };
         let crate::cache::CacheLookup::Hit { result, level } = lookup else {
             return Ok(if prep.storable() {
                 ExtendedLookup::Miss(Box::new(ExtendedFill {
@@ -446,6 +531,38 @@ mod tests {
             let plan = CacheableBatch::of(&batch, None, &registry).expect("named");
             assert_eq!(plan.sql, SQL);
             assert_eq!(plan.unnamed_sig, None);
+        }
+    }
+
+    /// A prepared statement's text and an unnamed one's that binds values
+    /// repeat; an unnamed statement without parameters has them in its text.
+    #[test]
+    fn a_statement_with_bound_values_repeats() {
+        let unnamed = held(SQL, &[23]);
+        let registry = registry();
+        let tail = [execute("", 0), sync()].concat();
+        // A Bind without parameters: no format codes, no values, no result codes.
+        let bare = |statement: &str| {
+            let mut p = vec![0];
+            p.extend_from_slice(statement.as_bytes());
+            p.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+            wire(b'B', &p)
+        };
+        for (what, batch, with_held, repeats) in [
+            ("unnamed, one value", bind("", "", 0, b"7", 0), true, true),
+            ("unnamed, no value", bare(""), true, false),
+            (
+                "prepared, one value",
+                bind("", "s1", 0, b"7", 0),
+                false,
+                true,
+            ),
+            ("prepared, no value", bare("s1"), false, true),
+        ] {
+            let batch = [batch, tail.clone()].concat();
+            let plan = CacheableBatch::of(&batch, with_held.then_some(&unnamed), &registry)
+                .unwrap_or_else(|| panic!("{what}"));
+            assert_eq!(plan.repeats(), repeats, "{what}");
         }
     }
 

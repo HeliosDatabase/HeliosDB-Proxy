@@ -735,6 +735,35 @@ SCRAM, per-tenant pools, view-to-base-table cache dependencies and others) are n
 
 ### Fixed
 
+- **A cached result no longer keeps its 4 KiB capture buffer.** The response of a cache
+  miss is read into a buffer that starts at 4 KiB and doubles, and the entry stored from it
+  kept the whole buffer while `l2_max_bytes` counted only the response's length: a cache of
+  60-byte point reads held 4 KiB per entry (3.5 GB resident for an L2 reporting 268 MB,
+  645 000 entries, in the 3.0.0 miss-path profile). Present since the query cache existed,
+  on the simple protocol too. A response that fills less than half its buffer is now
+  copied into an allocation of its own size; a larger one is shrunk in place.
+- **The query cache no longer keeps a key per stored read in the invalidation index.**
+  Every store registered its key under each table it read, and only a write to that
+  table released the set, so a table that is read but never written collected one key per
+  distinct read ever stored, outside every byte bound. Nothing read those sets: writes
+  retire entries through the table generations. `InvalidationManager::register` and its
+  lookups remain for callers that register keys themselves (see Library API).
+- **A full, large L2 no longer makes room on a client's connection.** The store that
+  found L2 full ran the eviction pass itself: two scans of every entry, the first reading
+  the write generation of each (tens of milliseconds for 645 000 entries, about every
+  30 000 stores). Above 2 048 entries the pass now runs on the `cache-reclaim` thread and
+  reads the generation once per table set; the size bound stays soft while a pass runs, as
+  before. Smaller maps evict inline as before.
+- **An extended-protocol read's statement text is analysed once per worker thread, not at
+  every execution** (normalization and table extraction, the volatile-function and
+  exclusion scans), when the text repeats: a prepared statement, or an unnamed one that
+  binds parameters.
+
+  Together, in the miss-path profile (pgbench prepared select-only over random keys, 64
+  clients, `extended_protocol = "on"`, about half the reads hits): proxy CPU per read
+  72–75 µs before, 54–55 µs after (53–55 µs with the cache not consulted); resident memory
+  after the read phase 3.5 GB before, 0.54 GB after; 130 000 reads per second against
+  98 000 with the cache not consulted (108 000–118 000 before).
 - **A full L2 no longer stalls a session for minutes.** When the shared L2 reached
   `l2_max_bytes`, the store that won the eviction pass scanned the whole map once for
   every entry it evicted, while concurrent stores kept inserting without evicting. With a
@@ -782,7 +811,7 @@ SCRAM, per-tenant pools, view-to-base-table cache dependencies and others) are n
 
 - Compile shared SQL-lexer helpers only for their consuming features and guard the edge-cache regression by its feature, keeping isolated SQL-text test builds warning-free.
 
-- **Query cache on the extended protocol** (`[cache] extended_protocol`, default `true`). The query cache now answers reads sent as `Parse`/`Bind`/`Execute`/`Sync` with an unnamed statement, and the `Bind`/`Execute`/`Sync` of a prepared (named) statement, each optionally with a `Describe` of the portal, under every condition a simple query's lookup has. An entry is keyed by the statement text, the declared parameter types, the bound parameter values and their format codes, the result format codes and the batch's shape, so text and binary results, and different parameter values, never share one; the statement's name is not part of the key. A hit runs nothing on the backend but leaves it holding the unnamed statement the client was told it parsed. Other batch shapes, transactions and sessions that have written go to the backend as before. See "Extended-protocol reads" in `docs/configuration.md`. Like a simple query's lookup, each one needs the backend settings proof (`SHOW ALL`), reused per connection for `proof_ttl_ms` (see Changed) or, with `backend_context_immutable = true`, for the connection's life: measured with pgbench's prepared select-only script at 16 clients, 4 400 reads per second with the per-read proof against 84 000 with the proof reused per connection (81 000 with the cache bypassed).
+- **Query cache on the extended protocol** (`[cache] extended_protocol`: `"hint"`, the default, for statements that carry `/*helios:cache=on*/` after their text; `"on"` for every cacheable read; `"off"` for none; `true`/`false` read as `"on"`/`"off"`). The default leaves unhinted extended batches to the backend as 2.2.0 did, because a looked-up read that misses costs more than an unread one: with pgbench's prepared select-only script over random keys `"on"` raised read p99 by 11–24 % and concurrent write p99 by 4–16 % against 2.2.0. The query cache now answers reads sent as `Parse`/`Bind`/`Execute`/`Sync` with an unnamed statement, and the `Bind`/`Execute`/`Sync` of a prepared (named) statement, each optionally with a `Describe` of the portal, under every condition a simple query's lookup has. An entry is keyed by the statement text, the declared parameter types, the bound parameter values and their format codes, the result format codes and the batch's shape, so text and binary results, and different parameter values, never share one; the statement's name is not part of the key. A hit runs nothing on the backend but leaves it holding the unnamed statement the client was told it parsed. Other batch shapes, transactions and sessions that have written go to the backend as before. See "Extended-protocol reads" in `docs/configuration.md`. Like a simple query's lookup, each one needs the backend settings proof (`SHOW ALL`), reused per connection for `proof_ttl_ms` (see Changed) or, with `backend_context_immutable = true`, for the connection's life: measured with pgbench's prepared select-only script at 16 clients, 4 400 reads per second with the per-read proof against 84 000 with the proof reused per connection (81 000 with the cache bypassed).
 
 - Borrow existing named-statement references through extended-protocol forwarding and recovery, avoiding a second vector and String clones per batch.
 
@@ -899,6 +928,11 @@ SCRAM, per-tenant pools, view-to-base-table cache dependencies and others) are n
 
 ### Library API (breaking)
 
+- `CacheToml::extended_protocol` is the enum `config::ExtendedProtocolCache`
+  (`Off` / `Hint` / `On`, default `Hint`), not a `bool`; `CacheHint` gains the public
+  field `opt_in`. `QueryCache` no longer registers its entries with its
+  `InvalidationManager`: `get_keys_for_table`, `get_tables_for_key` and
+  `InvalidationStats::tracked_keys` report only keys a caller registered.
 - `TenantQueryTransformer::with_refused_functions`, the `TransformResult::refusal` field
   and the `TransformResult::refused` constructor are new; `PolicyDenied` gains the variants
   `TenantStatement` and `TenantQueryLimit` (exhaustive matches must handle them);

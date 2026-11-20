@@ -30,8 +30,10 @@
 #             as -S:
 #               \set aid random(1, 100000 * :scale)
 #               SELECT abalance FROM pgbench_accounts WHERE aid = :aid /*helios:cache=semantic*/;
-#             (The query cache serves the simple protocol and, with
-#             `[cache] extended_protocol`, prepared and unnamed extended reads.)
+#             (The query cache serves the simple protocol. Prepared and unnamed
+#             extended reads it serves when the statement carries
+#             /*helios:cache=on*/, or all of them with
+#             `[cache] extended_protocol = "on"`.)
 #
 # Each proxy mode's GET /metrics JSON is saved, at the end of its cells, as
 # $OUT/$LABEL-<mode>-metrics.json (e.g. to check `tenant_budgets`).

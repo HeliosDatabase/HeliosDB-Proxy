@@ -188,30 +188,34 @@ impl TransactionEvent {
             return TransactionEvent::Statement;
         };
         let is = |keyword: &str| word.eq_ignore_ascii_case(keyword.as_bytes());
-        if is("BEGIN") {
-            return TransactionEvent::Begin;
-        }
-        if is("START") {
-            return match next_word(rest) {
+        // One keyword comparison per statement: the word's length selects
+        // the candidates before any of them is compared.
+        match word.len() {
+            5 if is("BEGIN") => TransactionEvent::Begin,
+            5 if is("START") => match next_word(rest) {
                 Some((next, _)) if next.eq_ignore_ascii_case(b"TRANSACTION") => {
                     TransactionEvent::Begin
                 }
                 _ => TransactionEvent::Statement,
-            };
+            },
+            6 if is("COMMIT") => Self::end_keyword(rest, TransactionEvent::Commit),
+            3 if is("END") => Self::end_keyword(rest, TransactionEvent::Commit),
+            8 if is("ROLLBACK") => Self::end_keyword(rest, TransactionEvent::Rollback),
+            5 if is("ABORT") => Self::end_keyword(rest, TransactionEvent::Rollback),
+            9 if is("SAVEPOINT") => TransactionEvent::Savepoint,
+            7 if is("RELEASE") => TransactionEvent::ReleaseSavepoint,
+            _ => TransactionEvent::Statement,
         }
-        if is("COMMIT") || is("END") {
-            return Self::after_end_keyword(rest, TransactionEvent::Commit);
+    }
+
+    /// [`Self::after_end_keyword`], with the bare keyword (`COMMIT`, the
+    /// form drivers send) decided without the call.
+    #[inline]
+    fn end_keyword(rest: &[u8], end: Self) -> Self {
+        if rest.is_empty() {
+            return end;
         }
-        if is("ROLLBACK") || is("ABORT") {
-            return Self::after_end_keyword(rest, TransactionEvent::Rollback);
-        }
-        if is("SAVEPOINT") {
-            return TransactionEvent::Savepoint;
-        }
-        if is("RELEASE") {
-            return TransactionEvent::ReleaseSavepoint;
-        }
-        TransactionEvent::Statement
+        Self::after_end_keyword(rest, end)
     }
 
     /// What `COMMIT` / `END` / `ROLLBACK` / `ABORT` followed by `rest` is:

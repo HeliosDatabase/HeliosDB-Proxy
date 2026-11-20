@@ -2470,6 +2470,7 @@ fn enabled_capabilities_are_actually_wired() {
     #[cfg(feature = "query-cache")]
     {
         config.cache.enabled = true;
+        config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
     }
     #[cfg(feature = "routing-hints")]
     {

@@ -75,6 +75,7 @@ async fn semantic_probe_runs_only_when_the_endpoint_is_used() {
     drop(closed);
     let mut config = test_config();
     config.cache.enabled = true;
+    config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
     config.cache.semantic_enabled = true;
     config.cache.semantic_embedding_endpoint = endpoint;
     let exact_only = ProxyServer::new(config.clone()).unwrap();
@@ -107,6 +108,7 @@ fn table_exclusions_need_a_running_cache() {
     let server = ProxyServer::new(config.clone()).unwrap();
     assert!(server.state.table_exclusions.is_none());
     config.cache.enabled = true;
+    config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
     config.cache.exclude_tables.clear();
     let server = ProxyServer::new(config).unwrap();
     assert!(server.state.table_exclusions.is_none());
@@ -192,6 +194,7 @@ impl Relay {
         };
         config.add_node(&addr, "primary").unwrap();
         config.cache.enabled = true;
+        config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         config.cache.trust_backend_read_effects = true;
         tune(&mut config);
         let server = ProxyServer::new(config.clone()).unwrap();
@@ -1518,6 +1521,7 @@ fn non_ascii_sql_is_handled_safely() {
 fn a_heliosdb_server_version_sets_the_sticky_flag() {
     let mut config = test_config();
     config.cache.enabled = true;
+    config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
     let server = ProxyServer::new(config).unwrap();
     let state = &server.state;
     let qc = state.query_cache.as_ref().unwrap();
@@ -1559,6 +1563,7 @@ fn a_heliosdb_server_version_sets_the_sticky_flag() {
 fn a_heliosdb_startup_sets_the_cache_flag_when_the_server_flag_is_set() {
     let mut config = test_config();
     config.cache.enabled = true;
+    config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
     let server = ProxyServer::new(config).unwrap();
     let state = &server.state;
     let qc = state.query_cache.as_ref().unwrap();
@@ -1839,6 +1844,7 @@ impl HotKey {
         };
         config.add_node(&addr, "primary").unwrap();
         config.cache.enabled = true;
+        config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         config.cache.trust_backend_read_effects = true;
         tune(&mut config);
         config.validate().unwrap();
@@ -2375,6 +2381,7 @@ mod gateway_writes {
 
         let mut config = test_config();
         config.cache.enabled = true;
+        config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         let on = ProxyServer::new(config).unwrap();
         let generations = on.state.table_generations.as_ref().expect("cache on");
         let qc = on.state.query_cache.as_ref().expect("cache on");
@@ -2432,6 +2439,7 @@ mod mcp_tool_cache {
         Relay::start(
             move |c| {
                 c.cache.enabled = query_cache;
+                c.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
                 c.mcp.enabled = true;
                 c.mcp.tool_cache_enabled = true;
                 c.mcp.trust_backend_read_effects = true;

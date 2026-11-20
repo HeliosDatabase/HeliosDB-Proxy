@@ -56,11 +56,19 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    not failing, and those on changed code are re-measured on a second, independent build
    of both trees (`CONFIRM_TARGET`, default `<tree>/target-confirm`) over the same
    interleaved rounds; one fails the gate only if it is again separated and slower there.
+   **Per-function check** (owner decision 2026-11-19, `HOT_CHECK=1` by default,
+   `scripts/bench-gate-hot.py`): each case that reproduced is then run alone in both
+   primary executables under a cycles sampler (`perf_event_open`, user space only); when
+   at most `HOT_MAX_CHANGED_PCT` (default 0.5) of its samples in either build fall in a
+   function whose body the other build does not hold, the case is `function-identical`
+   (the executable changed elsewhere) and is reported, not failing. A case that runs
+   changed code, or that the sampler could not classify, still fails.
    The mean budget, removed cases and INVALID runs are final as before. The final verdict
    is `bench-gate-final.json` (and the summary's last lines); every reproduced regression
    must still be attributed by the reviewer. Comparator tests:
    `python3 scripts/tests/bench_gate_compare_test.py`,
-   `python3 scripts/tests/bench_gate_confirm_test.py`. The
+   `python3 scripts/tests/bench_gate_confirm_test.py`,
+   `python3 scripts/tests/bench_gate_hot_test.py`. The
    proxy-path scalability harness is `scripts/regress/bench-scalability.sh
    <proxy-binary>` (Dockerized pgbench against an already-running PG 18.4 backend at
    `127.0.0.1:25433`; heavy — see Resource Constraints); its evidence

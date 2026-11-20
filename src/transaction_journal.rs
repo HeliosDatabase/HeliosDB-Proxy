@@ -461,7 +461,42 @@ impl TransactionJournalEntry {
     }
 
     /// Calculate total size of journal
+    ///
+    /// One flat walk on the path the capture produces (no array parameter):
+    /// nothing in it calls out, so it keeps its sum in registers wherever it
+    /// is inlined. An array parameter restarts the sum out of line in
+    /// [`Self::total_size_nested`].
+    #[inline]
     pub fn total_size(&self) -> usize {
+        let mut total = 0usize;
+        let mut nested = false;
+        for entry in &self.entries {
+            total += entry.statement.len();
+            for parameter in &entry.parameters {
+                total += match parameter {
+                    JournalValue::Null | JournalValue::Bool(_) => 1,
+                    JournalValue::Int64(_) | JournalValue::Float64(_) => 8,
+                    JournalValue::Text(text) => text.len(),
+                    JournalValue::Bytes(bytes)
+                    | JournalValue::TextRaw(bytes)
+                    | JournalValue::Binary(bytes) => bytes.len(),
+                    JournalValue::Array(_) => {
+                        nested = true;
+                        0
+                    }
+                };
+            }
+        }
+        if nested {
+            return self.total_size_nested();
+        }
+        total
+    }
+
+    /// [`Self::total_size`] of a journal holding array parameters.
+    #[cold]
+    #[inline(never)]
+    fn total_size_nested(&self) -> usize {
         self.entries.iter().map(JournalEntry::payload_size).sum()
     }
 }

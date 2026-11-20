@@ -63,6 +63,14 @@ pub struct L2WarmCache {
     evicting: AtomicBool,
 }
 
+/// Entries above which the query cache runs an eviction pass on its
+/// `cache-reclaim` thread instead of on the connection whose store found L2
+/// full ([`L2WarmCache::make_room_paced`]). A pass reads every entry twice
+/// (the retired ones, then the least recently used): microseconds for a
+/// small map, but 645 000 entries held one request for tens of
+/// milliseconds every ~30 000 stores in the profile of 2026-11-20.
+pub(crate) const OFFLOAD_SCAN_ENTRIES: usize = 2048;
+
 /// File-backed spill storage. The index, including monotonic entry timing,
 /// lives only in this process; the first write creates/truncates the file.
 #[derive(Debug)]
@@ -278,10 +286,30 @@ impl L2WarmCache {
     pub(crate) fn put_payload_now(
         &self,
         key: CacheKey,
-        mut result: CachedResult,
+        result: CachedResult,
         payload: L2Payload,
         is_stale: impl Fn(&CachedResult) -> bool,
         hand_off: impl FnOnce(Vec<u64>) -> Result<(), Vec<u64>>,
+    ) -> usize {
+        self.put_payload_with(key, result, payload, |l2, entry_size| {
+            l2.make_room(entry_size, is_stale, hand_off)
+        })
+    }
+
+    /// [`Self::put_payload_now`] with the eviction pass left to the caller:
+    /// when the store needs room and no pass is running, `make_room` is
+    /// called with the entry's size, holding the pass. It runs
+    /// [`Self::make_room`] here, or has [`Self::make_room_paced`] run on a
+    /// thread that may block (the query cache does, above
+    /// [`OFFLOAD_SCAN_ENTRIES`]); either ends the pass. It returns the
+    /// entries it evicted before returning. The entry is inserted whatever
+    /// it did: the size bound is soft while a pass runs.
+    pub(crate) fn put_payload_with(
+        &self,
+        key: CacheKey,
+        mut result: CachedResult,
+        payload: L2Payload,
+        make_room: impl FnOnce(&Self, usize) -> usize,
     ) -> usize {
         if !self.config.enabled {
             return 0;
@@ -315,19 +343,7 @@ impl L2WarmCache {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
-            let retired: Vec<u64> = self
-                .memory_entries
-                .iter()
-                .filter(|e| e.is_expired() || is_stale(&e.result))
-                .map(|e| *e.key())
-                .collect();
-            if retired.is_empty() {
-                evicted += self.evict_to_fit(entry_size);
-                self.end_eviction();
-            } else if let Err(retired) = hand_off(retired) {
-                evicted += self.shed(&retired);
-                self.end_eviction();
-            }
+            evicted += make_room(self, entry_size);
         }
 
         let fingerprint = format!("{:016x}", hash);
@@ -336,6 +352,59 @@ impl L2WarmCache {
             None => L2Entry::new(key, fingerprint, result),
         };
         self.insert(hash, entry);
+        evicted
+    }
+
+    /// The hashes of the entries an eviction pass retires before it evicts
+    /// any live one: every expired entry and every entry `is_stale` names.
+    fn retired(&self, is_stale: impl Fn(&CachedResult) -> bool) -> Vec<u64> {
+        self.memory_entries
+            .iter()
+            .filter(|e| e.is_expired() || is_stale(&e.result))
+            .map(|e| *e.key())
+            .collect()
+    }
+
+    /// One eviction pass on the caller's path, for an entry of `entry_size`
+    /// bytes (the caller holds the pass, [`Self::put_payload_with`]): see
+    /// [`Self::put_evicting`]. Returns the entries evicted here; the pass is
+    /// ended here unless `hand_off` took the retired hashes.
+    pub(crate) fn make_room(
+        &self,
+        entry_size: usize,
+        is_stale: impl Fn(&CachedResult) -> bool,
+        hand_off: impl FnOnce(Vec<u64>) -> Result<(), Vec<u64>>,
+    ) -> usize {
+        let retired = self.retired(is_stale);
+        if retired.is_empty() {
+            let evicted = self.evict_to_fit(entry_size);
+            self.end_eviction();
+            evicted
+        } else if let Err(retired) = hand_off(retired) {
+            let evicted = self.shed(&retired);
+            self.end_eviction();
+            evicted
+        } else {
+            0
+        }
+    }
+
+    /// [`Self::make_room`] as a whole on a thread that may block (the
+    /// `cache-reclaim` thread; never an async worker): both scans of the map
+    /// run here, retired entries are shed paced ([`Self::shed_paced`]), and
+    /// the pass is ended. Returns the entries evicted.
+    pub(crate) fn make_room_paced(
+        &self,
+        entry_size: usize,
+        is_stale: impl Fn(&CachedResult) -> bool,
+    ) -> usize {
+        let retired = self.retired(is_stale);
+        let evicted = if retired.is_empty() {
+            self.evict_to_fit(entry_size)
+        } else {
+            self.shed_paced(&retired)
+        };
+        self.end_eviction();
         evicted
     }
 

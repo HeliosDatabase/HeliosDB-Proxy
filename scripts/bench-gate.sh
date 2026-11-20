@@ -34,6 +34,12 @@
 # gate only if it is again separated and slower there. The final verdict is in
 # bench-gate-final.json and at the end of the summary; the primary run's own
 # verdict stays in bench-gate.json. CONFIRM=0 keeps the primary verdict.
+# Per-function check (HOT_CHECK=1, the default; owner decision 2026-11-19,
+# scripts/bench-gate-hot.py): each case that reproduced is then run alone in
+# both primary executables under a cycles sampler. When the functions it
+# spends its time in have the same bodies in both builds (function-identical:
+# the executable changed elsewhere), it is reported, not failing. A case on
+# changed code, or one the sampler could not classify, still fails.
 # The reviewer still attributes every reproduced regression.
 #
 # Everything (per-round Criterion logs, executable list + hashes, declared
@@ -54,6 +60,9 @@
 #   CONFIRM=1              second-build confirmation of separated regressions
 #                          on changed code (see above); 0 = primary verdict only
 #   CONFIRM_TARGET=<tree>/target-confirm   target directory of the second build
+#   HOT_CHECK=1            per-function check of reproduced regressions (see
+#                          above); 0 = every reproduced regression fails
+#   HOT_SECONDS=5          sampling time per case and executable
 #   OUT=$HELIOS_SPRINT/baselines/proxy/<label>   archive directory
 #   LOCK=$HELIOS_SPRINT/coordination/build.lock  fleet build lock
 #   HELIOS_SPRINT=$HOME/HDB/sprint                   the maintainers' sprint tree
@@ -91,6 +100,10 @@ BASE="$(cd "$BASE" && pwd)"; CAND="$(cd "$CAND" && pwd)"
 [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "ROUNDS must be a positive integer"
 [[ "$PAIR_CASES" = 0 || "$PAIR_CASES" = 1 ]] || die "PAIR_CASES must be 0 or 1"
 [[ "$CONFIRM" = 0 || "$CONFIRM" = 1 ]] || die "CONFIRM must be 0 or 1"
+HOT_CHECK="${HOT_CHECK:-1}"
+HOT_SECONDS="${HOT_SECONDS:-5}"
+[[ "$HOT_CHECK" = 0 || "$HOT_CHECK" = 1 ]] || die "HOT_CHECK must be 0 or 1"
+[[ "$HOT_SECONDS" =~ ^[0-9]+$ && "$HOT_SECONDS" -gt 0 ]] || die "HOT_SECONDS must be a positive integer"
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "LABEL may only contain letters, digits, '.', '_' and '-'"
 python3 -c "import sys; [float(x) for x in sys.argv[1:]]" "$BUDGET_PCT" "$SEP_PCT" 2>/dev/null \
   || die "BUDGET_PCT and SEP_PCT must be numbers"
@@ -300,11 +313,29 @@ if [ "$CONFIRM" = 1 ] && [ "$rc" != 2 ]; then
         --base-cases "$CONF_OUT/cases-base.tsv" --cand-cases "$CONF_OUT/cases-cand.tsv" \
         --classes "$OUT/classes.json" --budget 1000000 --sep 0 --start "$CONF_START" \
         --out "$CONF_OUT" --baseline-name "$BASE" --candidate-name "$CAND" >> "$LOG" 2>&1 || true
+      # Per-function check of what reproduced (scripts/bench-gate-hot.py):
+      # each case is sampled alone in both primary executables.
+      if [ "$HOT_CHECK" = 1 ] && [ -f "$CONF_OUT/bench-gate.json" ]; then
+        mkdir -p "$CONF_OUT/hot"
+        python3 "$HERE/bench-gate-confirm.py" reproduced "$OUT/bench-gate.json" \
+          "$CONF_OUT/bench-gate.json" > "$CONF_OUT/reproduced.tsv" 2>> "$LOG" || : > "$CONF_OUT/reproduced.tsv"
+        n=0
+        while IFS=$'\t' read -r target id; do
+          [ -n "$id" ] || continue
+          n=$((n + 1))
+          bexe=$(awk -v t="$target" '$1 == t { print substr($0, index($0, $3)) }' "$OUT/executables-base.txt")
+          cexe=$(awk -v t="$target" '$1 == t { print substr($0, index($0, $3)) }' "$OUT/executables-cand.txt")
+          say "function check $n: $id"
+          heavy python3 "$HERE/bench-gate-hot.py" run --base-exe "$bexe" --cand-exe "$cexe" \
+            --base-cwd "$BASE" --cand-cwd "$CAND" --id "$id" --seconds "$HOT_SECONDS" \
+            --out "$CONF_OUT/hot/$n.json" < /dev/null >> "$LOG" 2>&1 || true
+        done < "$CONF_OUT/reproduced.tsv"
+      fi
       ;;
   esac
   rc=0
   python3 "$HERE/bench-gate-confirm.py" verdict "$OUT/bench-gate.json" \
-    "$CONF_OUT/bench-gate.json" "$OUT" | tee -a "$LOG" || rc=$?
+    "$CONF_OUT/bench-gate.json" "$OUT" "$CONF_OUT/hot" | tee -a "$LOG" || rc=$?
   # `tee` keeps the helper's exit status out of the pipeline's; read it back.
   rc=$(python3 -c 'import json,sys; print({"PASS":0,"FAIL":1,"INVALID":2}[json.load(open(sys.argv[1]))["verdict"]])' \
     "$OUT/bench-gate-final.json") || rc=2

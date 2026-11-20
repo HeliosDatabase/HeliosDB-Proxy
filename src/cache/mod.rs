@@ -69,6 +69,7 @@ pub mod metrics;
 pub mod normalizer;
 pub mod refresh;
 pub mod result;
+pub(crate) mod text_memo;
 
 // Re-exports
 pub use codec::{L2Codec, L2Payload};
@@ -307,6 +308,9 @@ pub struct QueryCache {
     /// Query normalizer
     normalizer: Arc<QueryNormalizer>,
 
+    /// This cache's tag in the per-thread statement memos ([`text_memo`]).
+    memo_owner: u64,
+
     /// Cache invalidation manager
     invalidator: Arc<InvalidationManager>,
 
@@ -322,8 +326,8 @@ pub struct QueryCache {
 
     /// Work for the `cache-reclaim` thread, so bulk deallocation (10^5-10^6
     /// entries after a read-heavy phase) never runs on a connection: key
-    /// sets a purge took out of the invalidation index, and L2 entries an
-    /// eviction pass retired. `None` if that thread could not be started
+    /// sets a purge took out of the invalidation index, L2 entries an
+    /// eviction pass retired, and the pass itself over a large map. `None` if that thread could not be started
     /// (callers then do the work themselves).
     reclaim_tx: Option<std::sync::mpsc::Sender<Reclaim>>,
 
@@ -358,6 +362,32 @@ enum Reclaim {
     /// Hashes of L2 entries an eviction pass retired: shed, then the pass
     /// ends.
     Shed(Vec<u64>),
+    /// A whole L2 eviction pass for an entry of this many bytes
+    /// ([`L2WarmCache::make_room_paced`]).
+    MakeRoom(usize),
+}
+
+/// What an eviction pass on the `cache-reclaim` thread takes for
+/// write-retired: a result whose generation is below the one its tables had
+/// when the pass first met them. One read of the generations per distinct
+/// table set (the map's entries mostly share a few), not one per entry; a
+/// write during the pass retires its entries for the next one. Generations
+/// only grow, so an entry stored during the pass is never below the
+/// remembered value.
+fn retired_scan(generations: &TableGenerations) -> impl Fn(&CachedResult) -> bool + '_ {
+    let seen: std::cell::RefCell<std::collections::HashMap<Vec<String>, u64>> = Default::default();
+    move |result| {
+        let mut seen = seen.borrow_mut();
+        let at_scan = match seen.get(result.tables.as_slice()) {
+            Some(generation) => *generation,
+            None => {
+                let generation = generations.generation_of(&result.tables);
+                seen.insert(result.tables.clone(), generation);
+                generation
+            }
+        };
+        result.generation < at_scan
+    }
 }
 
 impl QueryCache {
@@ -394,6 +424,7 @@ impl QueryCache {
             let (tx, rx) = std::sync::mpsc::channel::<Reclaim>();
             let l2 = l2_cache.clone();
             let metrics = Arc::clone(&metrics);
+            let generations = Arc::clone(&generations);
             std::thread::Builder::new()
                 .name("cache-reclaim".into())
                 .spawn(move || {
@@ -405,6 +436,13 @@ impl QueryCache {
                                     let shed = l2.shed_paced(&hashes);
                                     metrics.record_evictions(CacheLevel::L2Warm, shed);
                                     l2.end_eviction();
+                                }
+                            }
+                            Reclaim::MakeRoom(entry_size) => {
+                                if let Some(l2) = &l2 {
+                                    let evicted =
+                                        l2.make_room_paced(entry_size, retired_scan(&generations));
+                                    metrics.record_evictions(CacheLevel::L2Warm, evicted);
                                 }
                             }
                         }
@@ -425,6 +463,7 @@ impl QueryCache {
             l2_cache,
             l3_cache,
             normalizer: Arc::new(QueryNormalizer::new()),
+            memo_owner: text_memo::next_owner(),
             invalidator,
             metrics,
             generations,
@@ -634,6 +673,47 @@ impl QueryCache {
         self.lookup_scoped(query, client_sql, context, namespace, Instant::now)
     }
 
+    /// [`Self::get_scoped`] for a statement whose text repeats from one
+    /// execution to the next (an extended-protocol read: its values are in
+    /// the `Bind`, and `namespace` separates them): the normalized form is
+    /// taken from the thread's statement memo ([`text_memo`]) instead of
+    /// being derived again.
+    pub(crate) fn get_scoped_statement(
+        &self,
+        query: &str,
+        context: &CacheContext,
+        namespace: &[u8; 32],
+    ) -> (CacheLookup, QueryPrep) {
+        let (hit, mut prep) =
+            self.lookup_inner(query, None, context, namespace, Instant::now, true);
+        prep.namespace = *namespace;
+        (hit, prep)
+    }
+
+    /// This cache's tag in the per-thread statement memos: what a caller
+    /// that memoizes its own reading of a statement under this cache's
+    /// configuration keys it by.
+    pub(crate) fn memo_owner(&self) -> u64 {
+        self.memo_owner
+    }
+
+    /// The normalized form of `query` ([`QueryNormalizer::normalize_with`]),
+    /// from the thread's statement memo when the text `repeats`.
+    fn normalized(&self, query: &str, verbatim: bool, repeats: bool) -> NormalizedQuery {
+        thread_local! {
+            static MEMO: std::cell::RefCell<text_memo::TextMemo<NormalizedQuery>> =
+                std::cell::RefCell::default();
+        }
+        if !repeats {
+            return self.normalizer.normalize_with(query, verbatim);
+        }
+        // The two key modes are two owners: a cache changes mode at most once.
+        let owner = self.memo_owner << 1 | u64::from(verbatim);
+        text_memo::of(&MEMO, owner, query, || {
+            self.normalizer.normalize_with(query, verbatim)
+        })
+    }
+
     fn lookup_scoped(
         &self,
         query: &str,
@@ -642,7 +722,8 @@ impl QueryCache {
         namespace: &[u8; 32],
         clock: impl FnOnce() -> Instant,
     ) -> (CacheLookup, QueryPrep) {
-        let (hit, mut prep) = self.lookup_inner(query, client_sql, context, namespace, clock);
+        let (hit, mut prep) =
+            self.lookup_inner(query, client_sql, context, namespace, clock, false);
         prep.namespace = *namespace;
         (hit, prep)
     }
@@ -691,6 +772,7 @@ impl QueryCache {
         context: &CacheContext,
         namespace: &[u8; 32],
         clock: impl FnOnce() -> Instant,
+        repeats: bool,
     ) -> (CacheLookup, QueryPrep) {
         // Parse cache hints
         let mut hints = parse_cache_hints(query);
@@ -746,7 +828,7 @@ impl QueryCache {
         if hints.refresh {
             self.metrics.record_refresh_hint();
             let keyed_verbatim = self.heliosdb_backend();
-            let mut normalized = self.normalizer.normalize_with(query, keyed_verbatim);
+            let mut normalized = self.normalized(query, keyed_verbatim, repeats);
             if !self.add_dependencies(&mut normalized, &additional) {
                 self.metrics.record_skip();
                 return (CacheLookup::Miss, QueryPrep::skipped(hints));
@@ -826,7 +908,7 @@ impl QueryCache {
         // them before parsing). The mode is carried to the store, which
         // refuses a key made in the other one.
         let keyed_verbatim = self.heliosdb_backend();
-        let mut normalized = self.normalizer.normalize_with(query, keyed_verbatim);
+        let mut normalized = self.normalized(query, keyed_verbatim, repeats);
         if !self.add_dependencies(&mut normalized, &additional) {
             self.metrics.record_skip();
             return (CacheLookup::Miss, QueryPrep::skipped(hints));
@@ -1256,20 +1338,30 @@ impl QueryCache {
         if let (Some(l2), Some(payload)) = (&self.l2_cache, l2_payload) {
             let cache_key = CacheKey::namespaced(normalized, context, prep.namespace);
             // When L2 must make room, one pass sheds every write-retired
-            // entry, on the reclaim thread.
-            let evicted = l2.put_payload_now(
-                cache_key.clone(),
-                result.clone(),
-                payload,
-                |r| !self.is_current(r),
-                |hashes| self.hand_off_shed(hashes),
-            );
+            // entry, on the reclaim thread; so does the pass itself once
+            // the map is large enough for its scans to hold this store.
+            let evicted =
+                l2.put_payload_with(cache_key, result.clone(), payload, |l2, entry_size| {
+                    let offloaded = l2.len() > l2_warm::OFFLOAD_SCAN_ENTRIES
+                        && self
+                            .reclaim_tx
+                            .as_ref()
+                            .is_some_and(|tx| tx.send(Reclaim::MakeRoom(entry_size)).is_ok());
+                    if offloaded {
+                        return 0;
+                    }
+                    l2.make_room(
+                        entry_size,
+                        |r| !self.is_current(r),
+                        |hashes| self.hand_off_shed(hashes),
+                    )
+                });
             self.metrics.record_evictions(CacheLevel::L2Warm, evicted);
-
-            // Register for invalidation
-            for table in &normalized.tables {
-                self.invalidator.register(&cache_key, table);
-            }
+            // The entry is not registered in the invalidation index: a
+            // write retires it through its tables' generations, and nothing
+            // read the per-table key sets, which only a write to the table
+            // emptied (one key per distinct read stored, outside every byte
+            // bound, for a table that is never written).
         }
 
         self.heat
@@ -1332,8 +1424,9 @@ impl QueryCache {
         &self.generations
     }
 
-    /// Release the invalidation index of `tables` — the memory half of
-    /// [`Self::invalidate_tables`]. Serving their entries is already refused
+    /// Release the invalidation index of `tables` (the keys a caller
+    /// registered through [`Self::invalidator`]; the cache registers none) —
+    /// the memory half of [`Self::invalidate_tables`]. Serving their entries is already refused
     /// on every tier once [`Self::mark_written`] moved their generations, so
     /// the entries themselves are not walked: a stale L2 entry is replaced
     /// by the next fill of its key or evicted by the L2 size bound and TTL,
@@ -1369,7 +1462,7 @@ impl QueryCache {
         };
         tx.send(Reclaim::Shed(hashes)).map_err(|e| match e.0 {
             Reclaim::Shed(hashes) => hashes,
-            Reclaim::Keys(_) => Vec::new(),
+            Reclaim::Keys(_) | Reclaim::MakeRoom(_) => Vec::new(),
         })
     }
 
@@ -1513,7 +1606,9 @@ impl QueryCache {
         self.l3_cache.as_ref().map(|l3| l3.health())
     }
 
-    /// Get the invalidation manager (for WAL subscription)
+    /// Get the invalidation manager (for WAL subscription). The cache does
+    /// not register its entries' keys there: its per-table key sets hold only
+    /// what a caller registers itself.
     pub fn invalidator(&self) -> Arc<InvalidationManager> {
         self.invalidator.clone()
     }
@@ -1647,10 +1742,9 @@ mod tests {
         assert!(cache.stale_rejected() >= 2);
     }
 
-    /// A purge only releases the table's index (the set goes to the
-    /// `cache-reclaim` thread): stale L2 entries stay until a refill
-    /// replaces them, are never served meanwhile, and other tables are
-    /// untouched.
+    /// A purge walks no entry, and a store registers none in the
+    /// invalidation index: stale L2 entries stay until a refill replaces
+    /// them, are never served meanwhile, and other tables are untouched.
     #[tokio::test]
     async fn purge_releases_the_index_and_a_refill_replaces_the_stale_entry() {
         let cache = QueryCache::new(CacheConfig::default());
@@ -1670,9 +1764,17 @@ mod tests {
         assert_eq!(l2.stats().entry_count, 51);
         let usage = l2.memory_usage();
 
+        assert_eq!(
+            cache.invalidator.stats().tracked_keys,
+            0,
+            "stores register no key"
+        );
         cache.invalidate_tables(&["accounts".to_string()]).await;
-        assert!(cache.invalidator.get_keys_for_table("accounts").is_empty());
-        assert_eq!(cache.invalidator.get_keys_for_table("users").len(), 1);
+        assert!(cache
+            .invalidator
+            .last_invalidation_time("accounts")
+            .is_some());
+        assert!(cache.invalidator.last_invalidation_time("users").is_none());
         assert_eq!(l2.stats().entry_count, 51, "entries are not walked");
         let q = "SELECT v FROM accounts WHERE id = 7";
         assert!(!is_hit(&cache, q, 2).await, "stale L2 entry refused");
@@ -3336,6 +3438,107 @@ mod tests {
             let (hit, _) = hit_of(&cache, users, 2).await.unwrap();
             assert_eq!(hit, data);
         }
+    }
+
+    /// Past `OFFLOAD_SCAN_ENTRIES` entries the eviction pass runs on the
+    /// reclaim thread: the store that found L2 full evicts nothing itself,
+    /// and the pass brings the tier back under its bound, write-retired
+    /// entries first.
+    #[tokio::test]
+    async fn a_large_l2_makes_room_on_the_reclaim_thread() {
+        let entries = l2_warm::OFFLOAD_SCAN_ENTRIES + 512;
+        let probe = QueryCache::new(CacheConfig::default());
+        fill(&probe, "SELECT v FROM old WHERE id = 100000", 1, b"v").await;
+        let one = probe.l2_cache.as_ref().unwrap().memory_usage();
+        let max_bytes = one * entries + one / 2;
+        let cache = QueryCache::new(CacheConfig {
+            l2: L2Config {
+                max_bytes,
+                ..L2Config::default()
+            },
+            ..CacheConfig::default()
+        });
+        let l2 = cache.l2_cache.clone().unwrap();
+        for id in 0..entries {
+            let table = if id < 100 { "old" } else { "kept" };
+            let sql = format!("SELECT v FROM {table} WHERE id = {}", 100000 + id);
+            fill(&cache, &sql, 1, b"v").await;
+        }
+        assert_eq!(l2.len(), entries, "all fit");
+        assert_eq!(cache.stats().l2.evictions, 0);
+
+        // A write retires the hundred reads of `old`; the next store needs
+        // room and hands the pass over.
+        cache.mark_written(&["old".to_string()]);
+        fill(&cache, "SELECT v FROM kept WHERE id = 1", 1, b"v").await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.stats().l2.evictions < 100 {
+            assert!(Instant::now() < deadline, "the reclaim thread sheds");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(cache.stats().l2.evictions, 100, "the retired ones only");
+        assert_eq!(l2.len(), entries + 1 - 100);
+        assert!(is_hit(&cache, "SELECT v FROM kept WHERE id = 1", 2).await);
+
+        // Nothing retired: the next pass evicts the least recently used, to
+        // the bound and its headroom.
+        let mut id = 0;
+        while l2.memory_usage() <= max_bytes {
+            fill(
+                &cache,
+                &format!("SELECT v FROM kept WHERE id = {}", 300000 + id),
+                1,
+                b"v",
+            )
+            .await;
+            id += 1;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.stats().l2.evictions == 100 || l2.memory_usage() > max_bytes {
+            assert!(Instant::now() < deadline, "the reclaim thread evicts");
+            fill(
+                &cache,
+                &format!("SELECT v FROM kept WHERE id = {}", 300000 + id),
+                1,
+                b"v",
+            )
+            .await;
+            id += 1;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(l2.memory_usage() <= max_bytes);
+    }
+
+    /// The reclaim thread's notion of a retired entry: below the generation
+    /// its tables had when the pass first met them, read once per table set.
+    #[test]
+    fn the_retired_scan_reads_each_table_set_once() {
+        let generations = TableGenerations::new();
+        generations.mark_written(&["a".to_string()]);
+        let result = |tables: &[&str], generation| CachedResult {
+            data: Bytes::new(),
+            row_count: 0,
+            cached_at: Instant::now(),
+            ttl: Duration::from_secs(60),
+            tables: tables.iter().map(|t| t.to_string()).collect(),
+            execution_time: Duration::ZERO,
+            generation,
+        };
+        let now_a = generations.generation_of(&["a".to_string()]);
+        let now_b = generations.generation_of(&["b".to_string()]);
+        let retired = retired_scan(&generations);
+        assert!(retired(&result(&["a"], now_a - 1)));
+        assert!(!retired(&result(&["a"], now_a)));
+        assert!(!retired(&result(&["b"], now_b)));
+        // A write during the pass is the next pass's: the remembered
+        // generation still judges, and an entry stored after it is kept.
+        generations.mark_written(&["a".to_string(), "b".to_string()]);
+        assert!(!retired(&result(&["a"], now_a)));
+        assert!(!retired(&result(
+            &["a"],
+            generations.generation_of(&["a".to_string()])
+        )));
+        assert!(retired_scan(&generations)(&result(&["a"], now_a)));
     }
 
     /// Evictions of every tier reach the metrics: a connection's L1 entry

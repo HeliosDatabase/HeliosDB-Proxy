@@ -117,6 +117,7 @@ role="primary"
 [cache]
 enabled=true
 trust_backend_read_effects=true
+extended_protocol="on"
 ''')
     log = (out / f"proxy-{label}.log").open("w")
     proxy = subprocess.Popen([str(binary), "--config", str(cfg)], stdout=log, stderr=subprocess.STDOUT)

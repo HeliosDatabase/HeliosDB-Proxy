@@ -176,7 +176,7 @@ def main():
         backend_bound=backend_identity(owned,name,pgport)
         for tr in [False,True]:
             px,admin=port(),port();logpath=out/f'proxy-tr-{tr}.log';cfg=out/f'proxy-tr-{tr}.toml'
-            cfg.write_text(f'listen_address="127.0.0.1:{px}"\nadmin_address="127.0.0.1:{admin}"\ntr_enabled={str(tr).lower()}\n[cache]\nenabled=true\nttl_secs=3600\n[[nodes]]\nhost="127.0.0.1"\nport={pgport}\nrole="primary"\n')
+            cfg.write_text(f'listen_address="127.0.0.1:{px}"\nadmin_address="127.0.0.1:{admin}"\ntr_enabled={str(tr).lower()}\n[cache]\nenabled=true\nttl_secs=3600\nextended_protocol="on"\n[[nodes]]\nhost="127.0.0.1"\nport={pgport}\nrole="primary"\n')
             with logpath.open('w') as log:
                 launch_digest=binary_digest(binary)
                 assert launch_digest==initial_digest,'binary changed before launch'

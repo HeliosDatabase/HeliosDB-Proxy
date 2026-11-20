@@ -2221,6 +2221,76 @@ pub const REFRESH_AHEAD_CLAIM_TIMEOUT_MS_CEILING: u64 = 3_600_000;
 /// tracked; a table's slots are allocated when it is first seen).
 pub const CACHE_HEATMAP_MAX_SLOTS: usize = 1 << 22;
 
+/// `[cache] extended_protocol`: which extended-protocol reads the query cache
+/// answers. Written `"off"`, `"hint"` or `"on"`; `false` and `true` read as
+/// `"off"` and `"on"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtendedProtocolCache {
+    /// None: every extended batch goes to the backend.
+    Off,
+    /// Only a statement whose text carries the cache hint `helios:cache=on`
+    /// (also `yes`, `true`, `enable`, `all`).
+    #[default]
+    Hint,
+    /// Every read a simple query's lookup would take.
+    On,
+}
+
+impl ExtendedProtocolCache {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Hint => "hint",
+            Self::On => "on",
+        }
+    }
+}
+
+impl Serialize for ExtendedProtocolCache {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtendedProtocolCache {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Mode;
+        impl serde::de::Visitor<'_> for Mode {
+            type Value = ExtendedProtocolCache;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"off\", \"hint\", \"on\", false or true")
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                on: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(if on {
+                    ExtendedProtocolCache::On
+                } else {
+                    ExtendedProtocolCache::Off
+                })
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                word: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                match word {
+                    "off" => Ok(ExtendedProtocolCache::Off),
+                    "hint" => Ok(ExtendedProtocolCache::Hint),
+                    "on" => Ok(ExtendedProtocolCache::On),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+        deserializer.deserialize_any(Mode)
+    }
+}
+
 /// Query-result cache configuration (TOML-friendly, always present). Converted
 /// to `crate::cache::CacheConfig` at startup (L1 hot / L2 warm, and the L3
 /// semantic tier when `semantic_enabled`) and only active when the
@@ -2255,14 +2325,15 @@ pub struct CacheToml {
     /// Default 1000. Ignored with `backend_context_immutable`. Takes effect
     /// on reload.
     pub proof_ttl_ms: u64,
-    /// Answer extended-protocol reads (a prepared statement's
-    /// Bind/Execute/Sync, or an unnamed Parse/Bind/Execute/Sync) from the
-    /// query cache as well. An entry is keyed by the statement text, its
-    /// declared parameter types, the bound parameter values and their format
-    /// codes, and the result format codes, so a text and a binary result
-    /// never share one. Default `true`; `false` leaves every extended batch
-    /// to the backend. Startup only.
-    pub extended_protocol: bool,
+    /// Which extended-protocol reads (a prepared statement's
+    /// Bind/Execute/Sync, or an unnamed Parse/Bind/Execute/Sync) the query
+    /// cache answers as well: `"hint"` (the default) only a statement whose
+    /// text asks with `/*helios:cache=on*/`, `"on"` (or `true`) every read a
+    /// simple query's lookup would take, `"off"` (or `false`) none. An entry
+    /// is keyed by the statement text, its declared parameter types, the
+    /// bound parameter values and their format codes, and the result format
+    /// codes, so a text and a binary result never share one. Startup only.
+    pub extended_protocol: ExtendedProtocolCache,
     /// Maximum bytes accepted for the complete backend settings proof, also
     /// capped by limits.max_pending_bytes. Default 512 KiB; must be positive.
     pub max_backend_context_bytes: usize,
@@ -3170,7 +3241,7 @@ impl Default for CacheToml {
             trust_backend_read_effects: false,
             backend_context_immutable: false,
             proof_ttl_ms: 1000,
-            extended_protocol: true,
+            extended_protocol: ExtendedProtocolCache::Hint,
             max_backend_context_bytes: 512 * 1024,
             ttl_secs: 300,
             max_result_bytes: 1024 * 1024,
@@ -8567,11 +8638,30 @@ max_dependency_tables = 2
     }
 
     #[test]
-    fn the_extended_protocol_cache_is_on_unless_switched_off() {
+    fn the_extended_protocol_cache_asks_for_a_hint_unless_told_otherwise() {
+        use ExtendedProtocolCache::{Hint, Off, On};
         let parsed: CacheToml = toml::from_str("").unwrap();
-        assert!(parsed.extended_protocol);
-        let parsed: CacheToml = toml::from_str("extended_protocol = false\n").unwrap();
-        assert!(!parsed.extended_protocol);
+        assert_eq!(parsed.extended_protocol, Hint);
+        for (text, expected) in [
+            ("false", Off),
+            ("\"off\"", Off),
+            ("\"hint\"", Hint),
+            ("true", On),
+            ("\"on\"", On),
+        ] {
+            let parsed: CacheToml =
+                toml::from_str(&format!("extended_protocol = {text}\n")).unwrap();
+            assert_eq!(parsed.extended_protocol, expected, "{text}");
+            let written = toml::to_string(&parsed).unwrap();
+            let again: CacheToml = toml::from_str(&written).unwrap();
+            assert_eq!(again.extended_protocol, expected, "{written}");
+        }
+        for text in ["\"yes\"", "\"ON\"", "1"] {
+            assert!(
+                toml::from_str::<CacheToml>(&format!("extended_protocol = {text}\n")).is_err(),
+                "{text}"
+            );
+        }
     }
 
     #[test]

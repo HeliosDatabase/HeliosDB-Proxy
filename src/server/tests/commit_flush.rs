@@ -49,6 +49,7 @@ fn server() -> ProxyServer {
     #[cfg(feature = "query-cache")]
     {
         config.cache.enabled = true;
+        config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         config.cache.trust_backend_read_effects = true;
     }
     ProxyServer::new(config).unwrap()

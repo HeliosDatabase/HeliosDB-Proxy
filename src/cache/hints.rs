@@ -6,6 +6,7 @@
 //!
 //! ```sql
 //! /* helios:cache=skip */          -- Neither look up nor store this read
+//! /* helios:cache=on */            -- Ask for caching (extended protocol, "hint" mode)
 //! /* helios:cache_refresh */       -- Look up nothing; store the fresh result
 //! /* helios:cache_ttl=60 */        -- A shorter TTL (seconds, or 5m, 1h, ...)
 //! /* helios:cache=semantic */      -- Use the semantic tier (L3) too
@@ -67,6 +68,11 @@ pub struct CacheHint {
 
     /// Specific cache level to use
     pub level: Option<CacheLevelHint>,
+
+    /// The statement asks to be cached (`cache=on`, also `yes`, `true`,
+    /// `enable`, `all`): what `[cache] extended_protocol = "hint"` waits for
+    /// before it looks an extended-protocol read up. A skip wins over it.
+    pub opt_in: bool,
 }
 
 impl CacheHint {
@@ -79,6 +85,7 @@ impl CacheHint {
         self.skip |= other.skip;
         self.semantic_cache |= other.semantic_cache;
         self.refresh |= other.refresh;
+        self.opt_in |= other.opt_in;
         if let Some(ttl) = other.ttl {
             self.limit_ttl(ttl);
         }
@@ -271,6 +278,7 @@ fn apply_hint(hint: &mut CacheHint, key: &str, value: Option<&str>) {
                         hint.restrict_level(CacheLevelHint::L2Only);
                     }
                     "all" | "yes" | "on" | "true" | "enable" => {
+                        hint.opt_in = true;
                         hint.restrict_level(CacheLevelHint::All);
                     }
                     _ => {}
@@ -403,6 +411,29 @@ pub fn is_write_operation(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_statement_can_ask_to_be_cached() {
+        for word in ["on", "yes", "true", "enable", "all", "ON"] {
+            let hint = parse_cache_hints(&format!("SELECT 1 /*helios:cache={word}*/"));
+            assert!(hint.opt_in && !hint.skip, "{word}");
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT 1 /*helios:cache=semantic*/",
+            "SELECT 1 /*helios:cache=l2*/",
+            "SELECT 1 /*helios:cache_ttl=30*/",
+            "SELECT 'helios:cache=on'",
+        ] {
+            assert!(!parse_cache_hints(sql).opt_in, "{sql}");
+        }
+        // A skip beside it wins; the rewriter's text and the client's fold.
+        let hint = parse_cache_hints("SELECT 1 /*helios:cache=on,cache=skip*/");
+        assert!(hint.opt_in && hint.skip);
+        let mut forwarded = parse_cache_hints("SELECT 1");
+        forwarded.merge(parse_cache_hints("SELECT 1 /*helios:cache=on*/"));
+        assert!(forwarded.opt_in);
+    }
 
     #[test]
     fn test_parse_skip_hint() {

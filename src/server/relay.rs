@@ -1030,9 +1030,9 @@ impl ProxyServer {
                         let _ = rows; // row count only feeds the query-cache
                         #[cfg(feature = "circuit-breaker")]
                         Self::circuit_record(state, &target, true, "");
-                        // One zero-copy conversion; both caches then share the
+                        // One conversion; both caches then share the
                         // refcounted buffer (no per-miss memcpy, F20).
-                        let body = bytes::Bytes::from(captured);
+                        let body = Self::captured_body(captured);
                         // A backend reload may have changed effective context
                         // between the pre-lookup probe and native execution.
                         // Publish only when the post-execution proof agrees.
@@ -1745,7 +1745,7 @@ impl ProxyServer {
             && Self::extended_cache_open(session, state, config))
         .then(|| super::ext_cache::CacheableBatch::of(batch, unnamed, registry))
         .flatten()
-        .filter(|plan| Self::extended_cache_candidate(plan.sql, session, state, config));
+        .filter(|plan| Self::extended_cache_candidate(plan, session, state, config));
         #[cfg(feature = "query-cache")]
         let mut cache_fill = None;
         #[cfg(feature = "query-cache")]
@@ -1982,7 +1982,7 @@ impl ProxyServer {
                             },
                             plan,
                             fill,
-                            bytes::Bytes::from(body),
+                            Self::captured_body(body),
                             rows,
                         )
                         .await;
@@ -2734,6 +2734,25 @@ impl ProxyServer {
             metrics,
         )
         .await
+    }
+
+    /// A captured response as the caches keep it: in an allocation of about
+    /// its own length. The capture buffer starts at 4 KiB and grows by
+    /// doubling, and `Bytes::from(Vec)` keeps the whole capacity alive for
+    /// the entry's life, where the byte bounds of the tiers count only the
+    /// length: a cache of 60-byte point reads held 4 KiB for each (3.5 GB
+    /// resident under a 256 MiB L2 in the profile of 2026-11-20). A response
+    /// that fills less than half its buffer is copied out, so the buffer is
+    /// freed whole (shrinking it in place left a 4 KiB hole per entry that
+    /// no later capture buffer fits: 2.6 GB resident in the same profile);
+    /// a larger one is shrunk in place, which copies nothing.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn captured_body(captured: Vec<u8>) -> bytes::Bytes {
+        if captured.len() < captured.capacity() / 2 {
+            bytes::Bytes::copy_from_slice(&captured)
+        } else {
+            bytes::Bytes::from(captured.into_boxed_slice())
+        }
     }
 
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]

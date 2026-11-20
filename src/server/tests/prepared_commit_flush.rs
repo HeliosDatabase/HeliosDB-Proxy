@@ -12,6 +12,7 @@ fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
 fn cached_server() -> ProxyServer {
     let mut config = test_config();
     config.cache.enabled = true;
+    config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
     config.tr_enabled = false;
     ProxyServer::new(config).unwrap()
 }

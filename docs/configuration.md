@@ -892,12 +892,29 @@ that cost without the immutability contract.
 
 #### Extended-protocol reads
 
-`[cache] extended_protocol` (default `true`; restart to change it) lets the query
-cache answer reads sent with the extended protocol, under every condition a simple
-query's lookup has (`trust_backend_read_effects`, the backend settings proof,
-`exclude_tables`, cache hints, never inside a transaction block, never for a
-session that has written or changed its execution context). A batch is looked up
-when it has one of two exact shapes, ended by `Sync`:
+`[cache] extended_protocol` (restart to change it) says which reads sent with the
+extended protocol the query cache answers:
+
+| Value | Reads looked up |
+|---|---|
+| `"hint"` (default) | Only a statement whose text asks for it with the cache hint `/*helios:cache=on*/` (also `yes`, `true`, `enable`, `all`), placed after the statement: `SELECT abalance FROM accounts WHERE aid = $1 /*helios:cache=on*/`. Every other extended batch goes to the backend untouched, as in 2.2.0. |
+| `"on"` (or `true`) | Every read a simple query's lookup would take. |
+| `"off"` (or `false`) | None; the hint is ignored. |
+
+The hint is part of the statement's text, so an application chooses per statement
+(a prepared statement carries it for every execution on its connection), and
+`cache=skip` still wins over it. `"hint"` is the default because a looked-up read
+that misses costs more than an unread one (a lookup, a captured response and a
+store), which pays off only for statements whose results repeat: with pgbench's
+prepared select-only script over random keys (nearly every read a miss) `"on"`
+raised read p99 latency by 11–24 % and the p99 of concurrent writes by 4–16 %
+against 2.2.0, while leaving those reads to the backend stayed inside 3 %.
+
+A looked-up read is under every condition a simple query's lookup has
+(`trust_backend_read_effects`, the backend settings proof, `exclude_tables`, cache
+hints, never inside a transaction block, never for a session that has written or
+changed its execution context). A batch is looked up when it has one of two exact
+shapes, ended by `Sync`:
 
 - `Parse` (unnamed, first in the batch), `Bind`, optionally `Describe` of the
   portal, `Execute` — what libpq `PQexecParams`, pgbench `-M extended` and most
@@ -1688,7 +1705,11 @@ the tenant filter the proxy appends to a SELECT without `WHERE`. The cache acts 
 
 `cache=l1` / `cache=l2` restrict both lookup and store to that tier; an L2 hit
 under `cache=l2` is not promoted into L1. `cache=all` permits the normal hierarchy
-(L3 still requires its semantic hint). `cache_tables=a,b` adds declared relations
+(L3 still requires its semantic hint). `cache=on` (also `yes`, `true`, `enable`,
+`all`) is also what an extended-protocol read needs under the default
+`[cache] extended_protocol = "hint"` (see
+[Extended-protocol reads](#extended-protocol-reads)); on the simple protocol it
+changes nothing. `cache_tables=a,b` adds declared relations
 to inferred dependencies; it never removes inferred ones. Declarations must be
 present on every dependent read. Malformed or oversized dependency lists and
 incompatible client/rewriter tier restrictions bypass caching.

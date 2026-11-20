@@ -1391,6 +1391,7 @@ async fn tr07_admin_post(addr: &str, path: &str, body: &str) -> (u16, serde_json
 async fn test_c02_commit_aware_cache_invalidation_serves_no_stale_reads() {
     let Some(fx) = fixture::start_proxy_with(|c| {
         c.cache.enabled = true;
+        c.cache.extended_protocol = heliosdb_proxy::config::ExtendedProtocolCache::On;
         c.cache.ttl_secs = 300;
         // This test deliberately writes directly to PostgreSQL and expects
         // the subsequent read to hit the proxy cache. Enable the documented

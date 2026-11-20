@@ -492,16 +492,26 @@ impl ProxyServer {
     /// a cache would look up.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) fn cache_refuses(state: &ServerState, sql: &str) -> bool {
+        match crate::sql_text::cache_refusal(sql, state.table_exclusions.as_deref()) {
+            None => false,
+            Some(refusal) => {
+                Self::count_cache_refusal(state, refusal);
+                true
+            }
+        }
+    }
+
+    /// Count one read the result cache refused for `refusal`.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn count_cache_refusal(state: &ServerState, refusal: crate::sql_text::CacheRefusal) {
         use crate::sql_text::CacheRefusal;
-        let counter = match crate::sql_text::cache_refusal(sql, state.table_exclusions.as_deref()) {
-            None => return false,
-            Some(CacheRefusal::SystemCatalog) => &state.metrics.cache_catalog_skipped,
-            Some(CacheRefusal::TimeTravelComment) => &state.metrics.cache_time_travel_skipped,
-            Some(CacheRefusal::AmbiguousText) => &state.metrics.cache_ambiguous_skipped,
-            Some(CacheRefusal::ExcludedTable) => &state.metrics.cache_excluded,
+        let counter = match refusal {
+            CacheRefusal::SystemCatalog => &state.metrics.cache_catalog_skipped,
+            CacheRefusal::TimeTravelComment => &state.metrics.cache_time_travel_skipped,
+            CacheRefusal::AmbiguousText => &state.metrics.cache_ambiguous_skipped,
+            CacheRefusal::ExcludedTable => &state.metrics.cache_excluded,
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        true
     }
 
     /// Unknown functions, writes (including triggers), and context-control

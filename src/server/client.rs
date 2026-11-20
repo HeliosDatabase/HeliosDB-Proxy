@@ -8,6 +8,16 @@ use crate::tenant_slots::{QueryHold, QueryWait, TenantBudget, TenantQueryRefusal
 /// whole-word match.
 const SESSION_LOCK_STEM: &str = "advisory_lock";
 
+/// What the text of a named prepared statement says about each of its
+/// executions (`ProxyServer::named_text_facts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NamedTextFacts {
+    /// Its effect on the session-bound state.
+    pub(super) effect: super::session_bound::Effect,
+    /// Whether it ends every session-level advisory lock.
+    pub(super) unlocks: bool,
+}
+
 /// How the slow path of a tenant's active-query gate ended (ac858d61400b).
 pub(super) enum QueryGateWait<'g> {
     /// A permit came free (`true`: after a wait).
@@ -780,6 +790,33 @@ impl ProxyServer {
         let locks = Self::parse_msg_sql_bytes(parse).is_some_and(Self::takes_session_lock);
         memo.insert(name.to_string(), (parse.clone(), locks));
         locks
+    }
+
+    /// What every execution of the session's named statement `name` does to
+    /// the state only its backend has ([`super::session_bound::text_effect`])
+    /// and whether it ends every session-level advisory lock
+    /// ([`Self::releases_session_locks`]), read from the registry's canonical
+    /// `Parse` once per definition and memoized exactly as
+    /// [`Self::named_takes_session_lock`] is, so a Bind costs a lookup and
+    /// not a rescan of the stored SQL. `None` for an unknown name and for
+    /// SQL that is not UTF-8 (the backend refuses that statement).
+    pub(super) fn named_text_facts(
+        memo: &mut HashMap<String, (bytes::Bytes, Option<NamedTextFacts>)>,
+        registry: &HashMap<String, bytes::Bytes>,
+        name: &str,
+    ) -> Option<NamedTextFacts> {
+        let parse = registry.get(name)?;
+        if let Some((seen, facts)) = memo.get(name) {
+            if seen.as_ptr() == parse.as_ptr() && seen.len() == parse.len() {
+                return *facts;
+            }
+        }
+        let facts = Self::parse_msg_sql(parse).map(|sql| NamedTextFacts {
+            effect: super::session_bound::text_effect(sql),
+            unlocks: Self::releases_session_locks(sql),
+        });
+        memo.insert(name.to_string(), (parse.clone(), facts));
+        facts
     }
 
     /// Park every idle backend connection of the session under
@@ -2189,6 +2226,11 @@ impl ProxyServer {
         // memoized against the registry's Parse bytes
         // (`named_takes_session_lock`); kept only while tracking.
         let mut stmt_locks: HashMap<String, (bytes::Bytes, bool)> = HashMap::new();
+        // What each named statement does to the session-bound state and
+        // whether it releases the session's advisory locks, memoized the
+        // same way (`named_text_facts`).
+        let mut stmt_facts: HashMap<String, (bytes::Bytes, Option<NamedTextFacts>)> =
+            HashMap::new();
         // Read offload (`[load_balancer] standby_reads`): on when reads may
         // leave the primary and a standby can serve them. Mirroring the
         // session's settings onto standby connections needs the SET tracker.
@@ -3619,6 +3661,7 @@ impl ProxyServer {
                                     if track_session_locks {
                                         stmt_locks.remove(&name);
                                     }
+                                    stmt_facts.remove(&name);
                                     if tr.tx_aborted {
                                         aborted_undo.push((name.clone(), previous));
                                     }
@@ -3839,29 +3882,26 @@ impl ProxyServer {
                                 {
                                     batch_locks = true;
                                 }
+                                let facts = stmt_ref.and_then(|name| {
+                                    Self::named_text_facts(&mut stmt_facts, &stmt_registry, name)
+                                });
                                 // One that releases them all. (The unnamed
                                 // statement of an earlier cycle is not read
                                 // here: its locks are taken to stay.)
                                 if track_session_locks
                                     && !batch_unlocks
-                                    && stmt_ref.is_some_and(|name| {
-                                        stmt_registry
-                                            .get(name)
-                                            .and_then(|p| Self::parse_msg_sql(p))
-                                            .is_some_and(Self::releases_session_locks)
-                                    })
+                                    && facts.is_some_and(|f| f.unlocks)
                                 {
                                     batch_unlocks = true;
                                 }
                                 // A named statement of an earlier cycle runs
                                 // again: what it does counts again.
-                                if let Some(sql) = stmt_ref
-                                    .filter(|name| !batch_defines.iter().any(|d| d == name))
-                                    .and_then(|name| stmt_registry.get(name))
-                                    .and_then(|p| Self::parse_msg_sql(p))
-                                {
-                                    batch_bound =
-                                        batch_bound.then(super::session_bound::text_effect(sql));
+                                if let Some(facts) = facts.filter(|_| {
+                                    stmt_ref.is_some_and(|name| {
+                                        !batch_defines.iter().any(|d| d == name)
+                                    })
+                                }) {
+                                    batch_bound = batch_bound.then(facts.effect);
                                 }
                                 // Unnamed statement: not tracked in
                                 // batch_refs, but the edge invalidation must
@@ -4047,6 +4087,9 @@ impl ProxyServer {
                                         for (name, _) in &aborted_undo {
                                             stmt_locks.remove(name);
                                         }
+                                    }
+                                    for (name, _) in &aborted_undo {
+                                        stmt_facts.remove(name);
                                     }
                                     Self::undo_map_writes(
                                         &mut stmt_registry,
@@ -4700,6 +4743,7 @@ impl ProxyServer {
                             if track_session_locks {
                                 stmt_locks.remove(name);
                             }
+                            stmt_facts.remove(name);
                         }
                         // ...and the session's other backend connections may
                         // still hold their own copies (F2).

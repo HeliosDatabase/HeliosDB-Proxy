@@ -136,6 +136,7 @@ impl Harness {
         config.nodes.clear();
         config.add_node(&addr, "primary").unwrap();
         config.cache.enabled = query_cache;
+        config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         #[cfg(feature = "edge-proxy")]
         {
             config.edge.enabled = edge;
@@ -306,6 +307,7 @@ fn cache_effects_contract_mcp_factory_is_independent_of_pg_cache_trust() {
         for mcp_trust in [false, true] {
             let mut config = test_config();
             config.cache.enabled = true;
+            config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
             config.mcp.enabled = true;
             config.mcp.tool_cache_enabled = true;
             set_contract(&mut config, "cache", pg_trust);
@@ -360,6 +362,7 @@ async fn cache_effects_contract_scope_rejection_publication_is_bounded() {
         config.nodes.clear();
         config.add_node(&addr, "primary").unwrap();
         config.cache.enabled = true;
+        config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         config.cache.max_backend_context_bytes = 4 * 1024 * 1024;
         config.limits.client_write_timeout_secs = 1;
         set_contract(&mut config, "cache", true);
@@ -444,6 +447,7 @@ async fn cache_effects_contract_reload_keeps_both_running_contracts() {
         let path = dir.path().join("proxy.toml");
         let mut config = test_config();
         config.cache.enabled = true;
+        config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
         config.mcp.enabled = true;
         config.mcp.tool_cache_enabled = true;
         config.cache.trust_backend_read_effects = initial;
