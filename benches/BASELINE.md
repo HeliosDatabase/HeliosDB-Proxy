@@ -17,6 +17,22 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-11-20 — L2 store into a full tier (1 new case)
+
+`benches/cache.rs` `cache/l2/store_at_capacity_256b`: one 256-byte store into an L2 memory
+tier that is already at its 16 MiB bound, so the eviction passes that make room are
+amortized over the stores. NEW in `scripts/bench-gate.sh` (no base arm: v2.2.0 has no such
+case). Value: the candidate arm of the 3.0.0 release gate run
+`rel-3.0.0-r2-criterion-admin-20261120` (base v2.2.0, candidate a2fce9e clean; host gpc001ca,
+governor performance, toolchain rustc 1.95.0 as bench-gate ran it, 3 interleaved rounds),
+the median of the three rounds' Criterion median estimates (4,942.6 / 4,838.7 / 4,728.7 ns).
+The gate archive is under
+/home/admin/HDB/sprint/baselines/proxy/rel-3.0.0-r2-criterion-admin-20261120/.
+
+| Benchmark | Metric | Value | Date | Host | Features | Commit |
+|---|---|---:|---|---|---|---|
+| `cache/l2/store_at_capacity_256b` | median ns | 4,838.7 | 2026-11-20 | gpc001ca | `all-features` | a2fce9e |
+
 ## 2026-11-16 — journal append under the per-tenant memory cap (2 new cases)
 
 `benches/relay.rs` `bench_append_entry`: one statement appended (`TransactionJournal::append_entry`,
