@@ -1516,7 +1516,7 @@ Hint the reads that repeat, not every read.
 
 Other limits: simple query protocol only; a standby-served result is never stored, so
 with read offload (`[load_balancer] standby_reads`) hinted reads that a standby serves
-never fill the tier; and HeliosDB-Nano through 4.41 answers a statement that starts with
+never fill the tier; and HeliosDB-Nano before 4.42.0 answers a statement that starts with
 a block comment with no rows — leading hints therefore only work through the
 `[routing_hints]` strip, which forwards the statement without the comment.
 

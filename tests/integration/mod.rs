@@ -1605,7 +1605,7 @@ async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
         return;
     };
     if fx.backend.kind == fixture::BackendKind::Nano {
-        // Nano (through 4.41.0) describes the bigint[] parameter with an unknown
+        // Nano (through 4.42.1) describes the bigint[] parameter with an unknown
         // type, so the client cannot bind it (Sprinter nano ca8e186c9c49).
         eprintln!("[tr07] skipped on Nano: array parameters are not described");
         return;

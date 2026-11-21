@@ -150,13 +150,31 @@ The feature modules operate at the PostgreSQL wire protocol level. They inspect,
 
 ### Supported Backends
 
-| Backend | Status | Notes |
-|---------|--------|-------|
-| **PostgreSQL** 12+ | Fully supported | Including Aurora, RDS, Cloud SQL |
-| **CockroachDB** | Compatible | PostgreSQL wire protocol |
-| **YugabyteDB** | Compatible | PostgreSQL wire protocol |
-| **TimescaleDB** | Compatible | PostgreSQL extension |
-| **Citus** | Compatible | PostgreSQL extension |
+What each release is tested against, and what is only expected to work. "Tested" means
+the integration suite runs it through a live proxy against that backend on every pull
+request (`.github/workflows/ci.yml`).
+
+| | **PostgreSQL 18** | **HeliosDB-Nano 4.42.1** | Other PostgreSQL-wire backends |
+|---|---|---|---|
+| CI job | Blocking, primary + standby | Non-blocking, primary + standby | None |
+| Authentication, simple and extended protocol | Tested | Tested | Not tested |
+| Read/write split and standby routing | Tested | Tested | Not tested |
+| Routing hints (`/* route=primary */`) | Tested | Tested (Nano 4.42.0 or newer) | Not tested |
+| Lag-aware routing | Tested | Tested | Not tested |
+| Query cache with commit-aware invalidation | Tested | Tested (Nano 4.42.1 or newer) | Not tested |
+| Transaction journal | Tested | Tested | Not tested |
+| Committed-history replay (`/api/replay`) | Tested | Not tested: Nano does not describe array parameters | Not tested |
+| Session restore on another connection | Tested | Not available: needs SQL `PREPARE`/`EXECUTE` and `RESET ALL` as PostgreSQL answers them | Not tested |
+| Admin UI and REST | Tested | Tested | Not tested |
+
+- **PostgreSQL** 12 and newer, including Aurora, RDS and Cloud SQL, is the reference
+  backend. CI runs PostgreSQL 18 only; older majors and the managed services are expected
+  to work and are not run in CI.
+- **HeliosDB-Nano** before 4.42.1 works as a backend with the query cache bypassed: the
+  cache is used only when the backend answers `SHOW ALL` in PostgreSQL's form.
+- **CockroachDB, YugabyteDB, TimescaleDB, Citus** speak the PostgreSQL wire protocol and
+  are expected to work for pooling and routing. This project does not test them, and the
+  query cache stays bypassed on any backend whose `SHOW ALL` differs from PostgreSQL's.
 
 ---
 
