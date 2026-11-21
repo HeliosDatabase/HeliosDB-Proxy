@@ -288,7 +288,7 @@ jobs:
 
     services:
       nano:
-        image: ghcr.io/heliosdatabase/heliosdb-nano:4.42.0
+        image: ghcr.io/heliosdatabase/heliosdb-nano:4.42.1
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
@@ -304,7 +304,7 @@ jobs:
           --health-start-period 5s
       # ── HA standby (modules 06/08/09/10) ───────────────────────────
       nano-standby:
-        image: ghcr.io/heliosdatabase/heliosdb-nano:4.42.0
+        image: ghcr.io/heliosdatabase/heliosdb-nano:4.42.1
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
