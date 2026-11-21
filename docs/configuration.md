@@ -952,7 +952,10 @@ whose `Parse` was not the first message of its batch).
 bounds the complete probe response along with `[limits] max_pending_bytes` and
 `max_backend_frame_bytes`. The whole exchange uses `[limits] reprepare_timeout_secs`.
 Both keys are startup settings. A clean unsupported or incomplete `SHOW ALL` result
-bypasses both caches and executes natively. Cancellation, permission and resource
+bypasses both caches and executes natively. A result is complete when it holds
+`search_path`, `row_security`, `DateStyle`, `TimeZone`, `client_encoding`,
+`standard_conforming_strings` and `server_version`, each once; names are compared
+ignoring case, as PostgreSQL does. Cancellation, permission and resource
 errors terminate the pending business request with the backend's error; the business
 SQL is neither executed nor automatically retried. A wire fault, timeout or exceeded
 budget abandons that socket. Internal proof rows and RFQ are hidden; asynchronous backend

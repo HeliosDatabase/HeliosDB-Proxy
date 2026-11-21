@@ -52,7 +52,8 @@ const MIN_PROOF_BUFFER: usize = 8 * 1024;
 
 /// The settings the proof requires: standard PostgreSQL settings a partial
 /// `SHOW ALL` implementation lacks. A reply without all of them executes
-/// natively.
+/// natively. Names are matched ignoring ASCII case (PostgreSQL reports
+/// `DateStyle`, HeliosDB-Nano 4.42 `datestyle`).
 const REQUIRED_SETTINGS: [&str; 7] = [
     "search_path",
     "row_security",
@@ -62,6 +63,13 @@ const REQUIRED_SETTINGS: [&str; 7] = [
     "standard_conforming_strings",
     "server_version",
 ];
+
+/// Order of two setting names ignoring ASCII case.
+fn cmp_setting_name(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes()
+        .map(|b| b.to_ascii_lowercase())
+        .cmp(b.bytes().map(|b| b.to_ascii_lowercase()))
+}
 
 /// A `SHOW ALL` reply as it is read: its rows are ranges of the buffer the
 /// frames were read into (`frames` below), the name and the setting of each.
@@ -172,13 +180,22 @@ impl ScopeReply {
         }
         // Nearly sorted already: the stable sort runs in about linear time.
         rows.sort_by(|a, b| a.0.cmp(b.0));
-        if rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        // Setting names are case-insensitive in PostgreSQL: a name sent twice
+        // in different case is the same setting twice, and a required setting
+        // is present in whatever case the backend reports it.
+        let mut names: Vec<&str> = rows.iter().map(|row| row.0).collect();
+        names.sort_by(|a, b| cmp_setting_name(a, b));
+        if names
+            .windows(2)
+            .any(|pair| pair[0].eq_ignore_ascii_case(pair[1]))
+        {
             return None;
         }
-        if REQUIRED_SETTINGS
-            .iter()
-            .any(|key| rows.binary_search_by(|row| row.0.cmp(key)).is_err())
-        {
+        if REQUIRED_SETTINGS.iter().any(|key| {
+            names
+                .binary_search_by(|name| cmp_setting_name(name, key))
+                .is_err()
+        }) {
             return None;
         }
         let mut hash = Sha256::new();
@@ -546,6 +563,10 @@ mod tests {
             bad.frame(tag, &body);
             assert!(bad.namespace(&[0; 32], "n").is_none());
         }
+        // The same setting twice in different case.
+        let mut entries = SETTINGS.to_vec();
+        entries.push(("datestyle", "ISO, DMY"));
+        assert!(reading(&entries, "").namespace(&[0; 32], "n").is_none());
         let partial: Vec<_> = SETTINGS
             .iter()
             .copied()
@@ -564,6 +585,21 @@ mod tests {
             open.frame(b'D', &row(name, setting, ""));
         }
         assert!(open.namespace(&[0; 32], "n").is_none());
+    }
+
+    #[test]
+    fn required_settings_are_found_in_any_case() {
+        // HeliosDB-Nano 4.42 reports `datestyle` and `timezone`.
+        let lower: Vec<(String, &str)> = SETTINGS
+            .iter()
+            .map(|(name, setting)| (name.to_ascii_lowercase(), *setting))
+            .collect();
+        let lower: Vec<(&str, &str)> = lower.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let proved = reading(&lower, "").namespace(&[0; 32], "n");
+        assert!(proved.is_some());
+        // The namespace is over the names as sent: another spelling is
+        // another namespace, never a shared one.
+        assert_ne!(proved, reading(&SETTINGS, "").namespace(&[0; 32], "n"));
     }
 
     #[test]

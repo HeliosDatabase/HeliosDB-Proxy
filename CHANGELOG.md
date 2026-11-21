@@ -735,6 +735,10 @@ SCRAM, per-tenant pools, view-to-base-table cache dependencies and others) are n
 
 ### Fixed
 
+- **The query cache's backend-settings proof matches setting names ignoring case.** A
+  backend that reports `datestyle` / `timezone` (HeliosDB-Nano 4.42) where PostgreSQL
+  reports `DateStyle` / `TimeZone` no longer has every cached read refused; the same
+  name twice in different case is still refused as a duplicate.
 - **A cached result no longer keeps its 4 KiB capture buffer.** The response of a cache
   miss is read into a buffer that starts at 4 KiB and doubles, and the entry stored from it
   kept the whole buffer while `l2_max_bytes` counted only the response's length: a cache of

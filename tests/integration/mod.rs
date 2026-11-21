@@ -745,12 +745,6 @@ async fn test_module_14_routing_hints_passthrough() {
     let Some(fx) = fixture::start_proxy().await else {
         return;
     };
-    if fx.backend.kind == fixture::BackendKind::Nano {
-        // Nano (through 4.41.0) answers any statement that starts with a block
-        // comment with no rows, directly as well (Sprinter nano 07a5ee1772ed).
-        eprintln!("[module_14] skipped on Nano: a leading comment returns no rows");
-        return;
-    }
     let conn_str = format!(
         "host=127.0.0.1 port={} user={} password={} dbname={}",
         fx.proxy_port, fx.backend.user, fx.backend.password, fx.backend.dbname
