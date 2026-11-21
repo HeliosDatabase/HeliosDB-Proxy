@@ -153,8 +153,6 @@ The feature modules operate at the PostgreSQL wire protocol level. They inspect,
 | Backend | Status | Notes |
 |---------|--------|-------|
 | **PostgreSQL** 12+ | Fully supported | Including Aurora, RDS, Cloud SQL |
-| **HeliosDB-Lite** | Fully supported | PostgreSQL wire protocol; the native topology adapter is a library API (`heliosdb-topology`) |
-| **HeliosDB-Full** | Fully supported | PostgreSQL wire protocol |
 | **CockroachDB** | Compatible | PostgreSQL wire protocol |
 | **YugabyteDB** | Compatible | PostgreSQL wire protocol |
 | **TimescaleDB** | Compatible | PostgreSQL extension |
