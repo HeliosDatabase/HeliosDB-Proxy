@@ -264,7 +264,7 @@ jobs:
           --features "all-features,postgres-topology"
           -- --include-ignored
 
-  # ── Integration tests: HeliosDB Nano 4.41 primary + standby ─────────
+  # ── Integration tests: HeliosDB Nano 4.42 primary + standby ─────────
   # NON-BLOCKING (continue-on-error): Nano is a separately released engine, so a
   # Nano regression shows here without blocking Proxy merges.
   #
@@ -279,7 +279,7 @@ jobs:
   # port 5433 / standby 5435). Tests that hit a known Nano bug skip themselves
   # when HELIOS_TEST_BACKEND=nano and name the Nano issue.
   integrate-nano:
-    name: Integration — HeliosDB Nano 4.41 (primary + standby)
+    name: Integration — HeliosDB Nano 4.42 (primary + standby)
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test]
     continue-on-error: true
@@ -288,7 +288,7 @@ jobs:
 
     services:
       nano:
-        image: ghcr.io/heliosdatabase/heliosdb-nano:4.41.0
+        image: ghcr.io/heliosdatabase/heliosdb-nano:4.42.0
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
@@ -304,7 +304,7 @@ jobs:
           --health-start-period 5s
       # ── HA standby (modules 06/08/09/10) ───────────────────────────
       nano-standby:
-        image: ghcr.io/heliosdatabase/heliosdb-nano:4.41.0
+        image: ghcr.io/heliosdatabase/heliosdb-nano:4.42.0
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
@@ -334,7 +334,7 @@ jobs:
       - name: Build proxy binary
         run: cargo build --features "all-features,postgres-topology"
 
-      - name: Integration tests against HeliosDB Nano 4.41
+      - name: Integration tests against HeliosDB Nano 4.42
         continue-on-error: false
         env:
           HELIOS_TEST_BACKEND: nano
@@ -349,7 +349,7 @@ jobs:
           -- --include-ignored
 
       # ── HA tests: modules 06 / 08 / 09 / 10 with live standby ─────
-      - name: HA integration tests — Nano 4.41 primary + standby (modules 06/08/09/10)
+      - name: HA integration tests — Nano 4.42 primary + standby (modules 06/08/09/10)
         continue-on-error: false
         env:
           HELIOS_TEST_BACKEND: nano
