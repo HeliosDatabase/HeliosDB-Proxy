@@ -74,7 +74,7 @@ use frames::RelayLimits;
 use frames::{backend_frame_len, read_budget, validate_backend_frame_len};
 
 mod session;
-use session::{BackendConn, DrainSignal, SessionGuard, UnnamedStale};
+use session::{BackendConn, ConnMap, DrainSignal, SessionGuard, UnnamedStale};
 pub use session::{ClientSession, ExtendedBatchLog, StatementLog, TransactionState};
 
 mod stmt_facts;

@@ -1020,7 +1020,7 @@ async fn tr_replay_transaction_replays_in_order_and_reports_rejections() {
     tokio::spawn(fake_backend(listener, seen.clone()));
     let server = ProxyServer::new(test_config()).unwrap();
     let state = server.state.clone();
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     let mut bc = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
     // A socket the session kept, holding an unnamed statement.
     bc.unnamed_sig = Some(bytes::Bytes::from_static(b"select 1\0\0\0"));
@@ -4136,7 +4136,7 @@ async fn a_home_that_lost_the_leadership_is_reported_moved() {
     let state = &server.state;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     conns.insert(
         "pg-a:5432".to_string(),
         BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
@@ -4154,7 +4154,7 @@ async fn a_home_that_lost_the_leadership_is_reported_moved() {
     );
     // No open connection there (it already went), or no home: nothing to move.
     assert_eq!(
-        ProxyServer::home_moved(&HashMap::new(), Some("pg-a:5432"), state, &config),
+        ProxyServer::home_moved(&ConnMap::default(), Some("pg-a:5432"), state, &config),
         None
     );
     assert_eq!(ProxyServer::home_moved(&conns, None, state, &config), None);
@@ -4662,7 +4662,7 @@ async fn tr08_replay_redefines_outside_statements_from_the_snapshot() {
     });
     let server = ProxyServer::new(test_config()).unwrap();
     let state = server.state.clone();
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     conns.insert(
         addr.clone(),
         BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
@@ -5064,7 +5064,7 @@ async fn f2_fake_backend(
 /// turns stale.
 #[tokio::test]
 async fn f2_closes_prune_the_target_and_mark_other_connections_stale() {
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     for addr in ["primary:5432", "standby:5432"] {
         let mut bc = BackendConn::new(pair().await.0);
         bc.prepared.extend(["keep", "s1", "s2"].map(String::from));
@@ -5140,7 +5140,7 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
         let session = make_test_session();
         let (client_raw, mut client_peer) = pair().await;
         let mut client = ClientStream::Plain(client_raw);
-        let mut conns: HashMap<String, BackendConn> = HashMap::new();
+        let mut conns: ConnMap = ConnMap::default();
         let mut bc = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
         bc.stale.insert("s1".to_string());
         conns.insert(addr.clone(), bc);
@@ -5208,7 +5208,7 @@ async fn f2_replay_closes_a_stale_statement_first() {
     let fake = tokio::spawn(f2_fake_backend(listener, b"INSERT 0 1\0"));
     let server = ProxyServer::new(test_config()).unwrap();
     let state = server.state.clone();
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     let mut bc = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
     bc.stale.insert("ins".to_string());
     conns.insert(addr.clone(), bc);

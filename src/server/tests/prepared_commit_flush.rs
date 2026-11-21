@@ -130,7 +130,7 @@ async fn commit_fragment_survives_flush_watch_and_sync_handoffs() {
     fill(&server).await;
     let session = make_test_session();
     let (backend, mut source) = pair().await;
-    let mut conns = HashMap::from([("a".to_string(), BackendConn::new(backend))]);
+    let mut conns = ConnMap::from_iter([("a".to_string(), BackendConn::new(backend))]);
     let (client, mut recipient) = pair().await;
     let mut client = ClientStream::Plain(client);
     let commit = frame(b'C', b"COMMIT PREPARED\0");
@@ -285,7 +285,7 @@ async fn backend_frame_tail_is_isolated_by_socket_and_dropped_on_loss() {
     let (b, mut source_b) = pair().await;
     let (client, mut recipient) = pair().await;
     let mut client = ClientStream::Plain(client);
-    let mut conns = HashMap::from([
+    let mut conns = ConnMap::from_iter([
         ("a".to_string(), BackendConn::new(a)),
         ("b".to_string(), BackendConn::new(b)),
     ]);
@@ -415,7 +415,7 @@ async fn replay_refuses_pending_frame_before_sending_statements() {
     let (stream, source) = pair().await;
     let mut backend = BackendConn::new(stream);
     backend.response_buf.extend_from_slice(&[b'N', 0, 0]);
-    let mut conns = HashMap::from([("a".to_string(), backend)]);
+    let mut conns = ConnMap::from_iter([("a".to_string(), backend)]);
     let entries = vec![StatementLog {
         sql: "BEGIN".into(),
         params: Vec::new(),
@@ -453,7 +453,7 @@ async fn recovery_waits_for_a_promotion_in_progress() {
     config.add_node(&address, "primary").unwrap();
     let server = ProxyServer::new(config.clone()).unwrap();
     let session = make_test_session();
-    let mut conns = HashMap::new();
+    let mut conns = ConnMap::default();
     let serving = tokio::spawn(async move {
         let mut sockets = Vec::new();
         for standby in ["on", "off"] {
@@ -535,7 +535,7 @@ async fn recovery_redials_cached_socket_with_unpublished_tail() {
     let (old, mut old_peer) = pair().await;
     let mut old = BackendConn::new(old);
     old.response_buf.extend_from_slice(&[b'N', 0, 0]);
-    let mut conns = HashMap::from([(address.clone(), old)]);
+    let mut conns = ConnMap::from_iter([(address.clone(), old)]);
     let serving = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let length = socket.read_u32().await.unwrap();
@@ -593,7 +593,7 @@ async fn a_restore_on_a_reused_socket_forgets_its_unnamed_statement() {
     bc.gucs_synced = Some(1);
     bc.unnamed_sig = Some(bytes::Bytes::from_static(b"select 1\0\0\0"));
     bc.unnamed_stale = UnnamedStale::STATEMENT;
-    let mut conns = HashMap::from([(address.clone(), bc)]);
+    let mut conns = ConnMap::from_iter([(address.clone(), bc)]);
     let serving = tokio::spawn(async move {
         let mut header = [0u8; 5];
         peer.read_exact(&mut header).await.unwrap();

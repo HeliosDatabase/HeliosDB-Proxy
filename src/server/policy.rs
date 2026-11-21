@@ -110,7 +110,7 @@ impl ProxyServer {
             match limiter.try_acquire_in_flight(key) {
                 Ok(permit) => {
                     took_slot = permit.holds_slot();
-                    *session.rate_permit.lock() = Some(permit);
+                    session.hold_rate_permit(permit);
                 }
                 Err(refusal) => {
                     state

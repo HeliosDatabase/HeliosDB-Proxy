@@ -189,7 +189,7 @@ pub(super) enum InFlight<'a> {
 /// `&mut tr`, so it never carries a `ReadRouting` (which borrows `tr.gucs`).
 pub(super) struct TrRecovery<'a> {
     pub(super) client: &'a mut ClientStream,
-    pub(super) conns: &'a mut HashMap<String, BackendConn>,
+    pub(super) conns: &'a mut ConnMap,
     /// Written by the recovery (the replacement node, or `None`).
     pub(super) current_node: &'a mut Option<String>,
     pub(super) tr: &'a mut TrSession,
@@ -2747,7 +2747,7 @@ impl ProxyServer {
     /// dies during restore is demoted and the wait continues until the
     /// deadline; a backend that *rejects* a restore statement aborts at once.
     pub(super) async fn tr_acquire_replacement(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         tr: &TrSession,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
@@ -2907,7 +2907,7 @@ impl ProxyServer {
     /// connection) already holds them. Leaves the connection inside the
     /// replayed (uncommitted) transaction on success.
     pub(super) async fn tr_replay_transaction(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         node: &str,
         entries: &[StatementLog],
         registry: &HashMap<String, bytes::Bytes>,

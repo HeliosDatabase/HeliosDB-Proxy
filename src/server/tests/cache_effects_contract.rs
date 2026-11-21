@@ -88,7 +88,7 @@ struct Harness {
     config: ProxyConfig,
     addr: String,
     session: Arc<ClientSession>,
-    conns: HashMap<String, BackendConn>,
+    conns: ConnMap,
     client: ClientStream,
     peer: TcpStream,
 }
@@ -154,7 +154,7 @@ impl Harness {
                 config,
                 addr: addr.clone(),
                 session: make_test_session(),
-                conns: HashMap::from([(addr, connection)]),
+                conns: ConnMap::from_iter([(addr, connection)]),
                 client: ClientStream::Plain(client),
                 peer,
             },
@@ -368,7 +368,7 @@ async fn cache_effects_contract_scope_rejection_publication_is_bounded() {
         set_contract(&mut config, "cache", true);
         let server = ProxyServer::new(config.clone()).unwrap();
         let connection = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
-        let mut conns = HashMap::from([(addr.clone(), connection)]);
+        let mut conns = ConnMap::from_iter([(addr.clone(), connection)]);
         let (client, peer) = pair().await;
         socket2::SockRef::from(&client)
             .set_send_buffer_size(4096)

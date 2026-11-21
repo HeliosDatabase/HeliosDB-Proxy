@@ -78,7 +78,7 @@ impl ProxyServer {
     pub(super) async fn switch_branch(
         name: &str,
         at_boundary: bool,
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,

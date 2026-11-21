@@ -42,7 +42,7 @@ pub(super) struct GateCtx<'a, 'g> {
     pub(super) gate: &'g TenantBudget,
     pub(super) client: &'a mut ClientStream,
     pub(super) buffer: &'a mut BytesMut,
-    pub(super) conns: &'a mut HashMap<String, BackendConn>,
+    pub(super) conns: &'a mut ConnMap,
     pub(super) tr: &'a mut TrSession,
     /// The session's home node and current node.
     pub(super) nodes: [&'a mut Option<String>; 2],
@@ -61,7 +61,7 @@ pub(super) struct GateCtx<'a, 'g> {
 /// and its hold on its tenant's active-query cap. Dropped in that order, so
 /// the permit returns after the connections close.
 pub(super) struct SessionHeld<'a> {
-    pub(super) conns: HashMap<String, BackendConn>,
+    pub(super) conns: ConnMap,
     pub(super) tr: TrSession,
     pub(super) cycle_node: Option<String>,
     pub(super) hold: Option<QueryHold<'a>>,
@@ -741,7 +741,7 @@ impl ProxyServer {
     /// one of its cached backend connections took one
     /// (`BackendConn::session_locks`). Locks a lost or replaced connection
     /// held ended with it, so they no longer count.
-    pub(super) fn session_locks_held(track: bool, conns: &HashMap<String, BackendConn>) -> bool {
+    pub(super) fn session_locks_held(track: bool, conns: &ConnMap) -> bool {
         track && conns.values().any(|bc| bc.session_locks)
     }
 
@@ -760,7 +760,7 @@ impl ProxyServer {
         tr: &TrSession,
         refused_open: bool,
         cycle_node: Option<&str>,
-        conns: &HashMap<String, BackendConn>,
+        conns: &ConnMap,
     ) -> bool {
         partial
             || ((tr.ext_dispatched || tr.ext_copy_end.is_some())
@@ -834,7 +834,7 @@ impl ProxyServer {
     /// cycle back), as a connection mid-transaction is.
     #[cfg(feature = "pool-modes")]
     async fn park_idle_conns(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         tr: &TrSession,
         cycle_node: Option<&str>,
         session: &Arc<ClientSession>,
@@ -866,7 +866,7 @@ impl ProxyServer {
     /// backend cancellation can disarm the input deadline. Otherwise COPY
     /// keeps the default client-only wait. None without a cached connection.
     fn watch_target<'n>(
-        conns: &HashMap<String, BackendConn>,
+        conns: &ConnMap,
         home_node: Option<&'n str>,
         current_node: Option<&'n str>,
         cycle: Option<&'n str>,
@@ -942,7 +942,7 @@ impl ProxyServer {
     /// on a dead socket.
     async fn probe_watched_backend(
         stream: &mut ClientStream,
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         node: &str,
         state: &Arc<ServerState>,
         watch: IdleWatch<'_>,
@@ -1184,7 +1184,7 @@ impl ProxyServer {
     /// portal) was destroyed by a request that reached none of `conns`: each
     /// closes what it still holds of them before a later batch could use it
     /// (see [`UnnamedStale`]).
-    pub(super) fn orphan_unnamed(conns: &mut HashMap<String, BackendConn>, which: UnnamedStale) {
+    pub(super) fn orphan_unnamed(conns: &mut ConnMap, which: UnnamedStale) {
         for bc in conns.values_mut() {
             bc.unnamed_stale.statement |= which.statement;
             bc.unnamed_stale.portal |= which.portal;
@@ -1289,6 +1289,8 @@ impl ProxyServer {
             rate_limit_key: std::sync::OnceLock::new(),
             #[cfg(feature = "rate-limiting")]
             rate_permit: parking_lot::Mutex::new(None),
+            #[cfg(feature = "rate-limiting")]
+            rate_permit_held: std::sync::atomic::AtomicBool::new(false),
             startup_slot: parking_lot::Mutex::new(None),
             reads_pinned: std::sync::atomic::AtomicBool::new(false),
             read_node: parking_lot::Mutex::new(None),
@@ -1646,7 +1648,7 @@ impl ProxyServer {
     /// there, so its connection is cancelled before it is dropped
     /// (`abandon_conn`).
     async fn rehome_if_moved(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         nodes: [&mut Option<String>; 2],
         offload_on: bool,
         tr: &mut TrSession,
@@ -1794,7 +1796,7 @@ impl ProxyServer {
     pub(super) async fn read_next_client_message(
         stream: &mut ClientStream,
         buffer: &mut BytesMut,
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         watch_node: Option<&str>,
         idle_deadline: Option<tokio::time::Instant>,
         state: &Arc<ServerState>,
@@ -1948,7 +1950,7 @@ impl ProxyServer {
         config: &ProxyConfig,
     ) -> Result<()> {
         let mut held = SessionHeld {
-            conns: HashMap::new(),
+            conns: ConnMap::default(),
             tr: TrSession::new(session.tr_mode),
             cycle_node: None,
             hold: session
@@ -1989,7 +1991,7 @@ impl ProxyServer {
     /// cancelling what that cycle may still run there (`abandon_conn`). A
     /// connection already gone has nothing left to cancel.
     pub(super) async fn abandon_cycle_conn(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         cycle_node: Option<&str>,
         session: &ClientSession,
         state: &ServerState,

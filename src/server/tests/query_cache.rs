@@ -162,7 +162,7 @@ struct Relay {
     config: ProxyConfig,
     addr: String,
     session: Arc<ClientSession>,
-    conns: HashMap<String, BackendConn>,
+    conns: ConnMap,
     client: crate::client_tls::ClientStream,
     peer: TcpStream,
 }
@@ -213,7 +213,7 @@ impl Relay {
             )
             .await;
         }
-        let mut conns = HashMap::new();
+        let mut conns = ConnMap::default();
         let mut backend_conn = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
         // This fixture implements only business-query replies. Its scope is
         // an explicit test proof; production must obtain a backend proof.
@@ -1812,7 +1812,7 @@ async fn counting_backend(listener: TcpListener, delay: Duration, reads: Arc<Ato
 /// client socket.
 struct HotClient {
     session: Arc<ClientSession>,
-    conns: HashMap<String, BackendConn>,
+    conns: ConnMap,
     client: crate::client_tls::ClientStream,
     peer: TcpStream,
 }
@@ -1868,7 +1868,7 @@ impl HotKey {
             .await;
         let mut hot_clients = Vec::with_capacity(clients);
         for _ in 0..clients {
-            let mut conns = HashMap::new();
+            let mut conns = ConnMap::default();
             let mut backend_conn = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
             backend_conn.cache_scope_test_override = Some([0; 32]);
             conns.insert(addr.clone(), backend_conn);

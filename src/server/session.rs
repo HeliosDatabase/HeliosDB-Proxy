@@ -188,6 +188,12 @@ pub struct ClientSession {
     /// in flight), and when the session ends.
     #[cfg(feature = "rate-limiting")]
     pub(crate) rate_permit: parking_lot::Mutex<Option<crate::rate_limit::BucketPermit>>,
+    /// Whether `rate_permit` holds a permit. Only the task serving the
+    /// session stores and takes the permit, so the per-request release reads
+    /// this flag and leaves the lock alone when there is nothing to give back
+    /// (always, without `[rate_limit] max_concurrent`).
+    #[cfg(feature = "rate-limiting")]
+    pub(crate) rate_permit_held: std::sync::atomic::AtomicBool,
     /// The node slot (H-05) of the backend connection opened during startup,
     /// handed to that connection's `BackendConn` once the session starts.
     pub(crate) startup_slot: parking_lot::Mutex<crate::node_slots::Slot>,
@@ -224,14 +230,28 @@ impl ClientSession {
     /// Give back the in-flight slot the session's request holds, if any.
     #[cfg(feature = "rate-limiting")]
     pub(crate) fn release_rate_permit(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.rate_permit_held.load(Relaxed) {
+            return;
+        }
         let permit = self.rate_permit.lock().take();
+        self.rate_permit_held.store(false, Relaxed);
         drop(permit);
+    }
+
+    /// Hold `permit` until the session's request ends.
+    #[cfg(feature = "rate-limiting")]
+    pub(crate) fn hold_rate_permit(&self, permit: crate::rate_limit::BucketPermit) {
+        *self.rate_permit.lock() = Some(permit);
+        self.rate_permit_held
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the session's request holds an in-flight slot.
     #[cfg(feature = "rate-limiting")]
     pub(crate) fn holds_rate_permit(&self) -> bool {
-        self.rate_permit.lock().is_some()
+        self.rate_permit_held
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The session's tenant request budgets, if its tenant has any.
@@ -384,6 +404,112 @@ pub struct ExtendedBatchLog {
     /// Replay redefines them (Close + Parse) before re-sending the cycle, so a
     /// later redefinition of the name in the session cannot leak into it.
     pub outside: Vec<(String, bytes::Bytes)>,
+}
+
+/// The backend connections a session holds, by node address.
+pub(super) type ConnMap = NodeMap<BackendConn>;
+
+/// A map from node address to `V` for the few entries one session has: its
+/// home connection and, with read offload or a moved home, one or two more.
+/// The relay looks a connection up several times per statement, so a lookup
+/// is a scan that compares addresses, with no hashing; the entries have no
+/// order a caller may rely on.
+pub(super) struct NodeMap<V> {
+    entries: Vec<(String, V)>,
+}
+
+impl<V> Default for NodeMap<V> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<V> NodeMap<V> {
+    #[inline]
+    fn position(&self, node: &str) -> Option<usize> {
+        self.entries.iter().position(|(addr, _)| addr == node)
+    }
+
+    #[inline]
+    pub(super) fn contains_key<K: AsRef<str> + ?Sized>(&self, node: &K) -> bool {
+        self.position(node.as_ref()).is_some()
+    }
+
+    #[inline]
+    pub(super) fn get<K: AsRef<str> + ?Sized>(&self, node: &K) -> Option<&V> {
+        let node = node.as_ref();
+        self.entries
+            .iter()
+            .find(|(addr, _)| addr == node)
+            .map(|(_, value)| value)
+    }
+
+    #[inline]
+    pub(super) fn get_mut<K: AsRef<str> + ?Sized>(&mut self, node: &K) -> Option<&mut V> {
+        let node = node.as_ref();
+        self.entries
+            .iter_mut()
+            .find(|(addr, _)| addr == node)
+            .map(|(_, value)| value)
+    }
+
+    /// Store `value` for `node`; the value it replaces, if any.
+    pub(super) fn insert(&mut self, node: String, value: V) -> Option<V> {
+        match self.position(&node) {
+            Some(at) => Some(std::mem::replace(&mut self.entries[at].1, value)),
+            None => {
+                self.entries.push((node, value));
+                None
+            }
+        }
+    }
+
+    pub(super) fn remove<K: AsRef<str> + ?Sized>(&mut self, node: &K) -> Option<V> {
+        let at = self.position(node.as_ref())?;
+        Some(self.entries.swap_remove(at).1)
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.entries.iter().map(|(addr, _)| addr)
+    }
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+
+    pub(super) fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.entries.iter_mut().map(|(_, value)| value)
+    }
+
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut V)> {
+        self.entries.iter_mut().map(|(addr, value)| (&*addr, value))
+    }
+}
+
+/// `map[node]`, panicking when the node has no entry, as a `HashMap` does.
+impl<V, K: AsRef<str> + ?Sized> std::ops::Index<&K> for NodeMap<V> {
+    type Output = V;
+
+    fn index(&self, node: &K) -> &V {
+        self.get(node).expect("no entry for the node")
+    }
+}
+
+impl<V> FromIterator<(String, V)> for NodeMap<V> {
+    fn from_iter<I: IntoIterator<Item = (String, V)>>(iter: I) -> Self {
+        let mut map = Self::default();
+        for (node, value) in iter {
+            map.insert(node, value);
+        }
+        map
+    }
 }
 
 /// A cached per-session backend connection plus the set of *named* prepared

@@ -104,7 +104,7 @@ impl ReadRouting<'_> {
 pub(super) struct ForwardCtx<'a> {
     pub(super) client: &'a mut ClientStream,
     /// The session's per-node backend connections.
-    pub(super) conns: &'a mut HashMap<String, BackendConn>,
+    pub(super) conns: &'a mut ConnMap,
     /// The node the request stays on unless routing moves it: the session's
     /// current node, the node holding the unnamed statement a Parse-less batch
     /// binds, or the replacement node on a TR re-execution.
@@ -149,7 +149,7 @@ impl OpenCycle<'_> {
     /// is unknown.
     pub(super) fn lost(
         &self,
-        conns: &HashMap<String, BackendConn>,
+        conns: &ConnMap,
         fault: &mut Option<BackendFault>,
     ) -> Option<ProxyError> {
         if conns.contains_key(self.node) {
@@ -425,7 +425,7 @@ impl ProxyServer {
     /// session idles on its home. Before reusing it, drop it if the backend
     /// closed it or sent anything unsolicited (a FATAL before closing): it
     /// holds nothing the session cannot rebuild, and `ensure_conn` dials anew.
-    pub(super) fn drop_if_unusable(conns: &mut HashMap<String, BackendConn>, target: &str) {
+    pub(super) fn drop_if_unusable(conns: &mut ConnMap, target: &str) {
         let Some(bc) = conns.get_mut(target) else {
             return;
         };
@@ -442,11 +442,7 @@ impl ProxyServer {
 
     /// `target` once took the session's settings by mirroring (a standby the
     /// session read from) and is behind them, while reads are offloaded.
-    pub(super) fn mirror_stale(
-        conns: &HashMap<String, BackendConn>,
-        target: &str,
-        reads: &ReadRouting<'_>,
-    ) -> bool {
+    pub(super) fn mirror_stale(conns: &ConnMap, target: &str, reads: &ReadRouting<'_>) -> bool {
         reads.offload_on
             && conns
                 .get(target)
@@ -461,7 +457,7 @@ impl ProxyServer {
     /// home lost while idle, so transaction replay re-homes the session
     /// (restoring its settings, or refusing when they are unknown).
     pub(super) fn home_moved(
-        conns: &HashMap<String, BackendConn>,
+        conns: &ConnMap,
         home: Option<&str>,
         state: &ServerState,
         config: &ProxyConfig,
@@ -476,7 +472,7 @@ impl ProxyServer {
 
     /// A once-mirrored connection now serves as the session's home: from here
     /// on it runs the session's `SET`s itself.
-    pub(super) fn mirror_now_home(conns: &mut HashMap<String, BackendConn>, target: &str) {
+    pub(super) fn mirror_now_home(conns: &mut ConnMap, target: &str) {
         if let Some(bc) = conns.get_mut(target) {
             bc.gucs_synced = None;
             bc.gucs_role = false;
@@ -494,7 +490,7 @@ impl ProxyServer {
     /// session's reads to its home, and the caller routes the read home.
     pub(super) async fn mirror_read_gucs(
         client: &mut ClientStream,
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         target: &str,
         reads: &ReadRouting<'_>,
         session: &ClientSession,
@@ -569,7 +565,7 @@ impl ProxyServer {
     /// client's pass-through credentials) only if absent. The cached
     /// connection is then reused across read/write route switches.
     pub(super) async fn ensure_conn(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         target: &str,
         session: &Arc<ClientSession>,
         config: &ProxyConfig,
@@ -732,7 +728,7 @@ impl ProxyServer {
     /// key, gets none. Callers record the fault first: a cancel this waits
     /// for never delays the node's demotion.
     pub(super) async fn abandon_conn(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         node: &str,
         session: &ClientSession,
         state: &ServerState,
@@ -749,7 +745,7 @@ impl ProxyServer {
     /// cancelled ([`Self::abandon_conn`]); otherwise the backend is idle (or
     /// waits for the rest of a frame) and the socket is just closed.
     pub(super) async fn drop_undelivered(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         node: &str,
         open_cycle: bool,
         session: &ClientSession,
@@ -1213,7 +1209,7 @@ impl ProxyServer {
     /// releases mid-transaction.
     #[cfg(feature = "pool-modes")]
     pub(super) async fn release_to_pool_if_idle(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         node: Option<&str>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
@@ -1229,7 +1225,7 @@ impl ProxyServer {
     /// parked, and a fresh one holds its startup state.
     #[cfg(feature = "pool-modes")]
     pub(super) async fn release_lease(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         node: Option<&str>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,

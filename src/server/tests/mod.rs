@@ -281,6 +281,8 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         rate_limit_key: std::sync::OnceLock::new(),
         #[cfg(feature = "rate-limiting")]
         rate_permit: parking_lot::Mutex::new(None),
+        #[cfg(feature = "rate-limiting")]
+        rate_permit_held: std::sync::atomic::AtomicBool::new(false),
         startup_slot: parking_lot::Mutex::new(None),
         reads_pinned: std::sync::atomic::AtomicBool::new(false),
         read_node: parking_lot::Mutex::new(None),
@@ -732,7 +734,7 @@ async fn refused_simple_reply(
 ) -> Vec<u8> {
     let (proxy_side, mut peer) = pair().await;
     let mut client = ClientStream::Plain(proxy_side);
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     let mut fault: Option<BackendFault> = None;
     let msg = crate::protocol::QueryMessage {
         query: sql.to_string(),
@@ -1840,7 +1842,7 @@ async fn read_next_client_message_times_out_while_watching_the_backend() {
     let baddr = blistener.local_addr().unwrap();
     let backend = TcpStream::connect(baddr).await.unwrap();
     let _backend_peer = blistener.accept().await.unwrap();
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     conns.insert("node-a".to_string(), BackendConn::new(backend));
 
     let server = ProxyServer::new(test_config()).unwrap();
@@ -1885,7 +1887,7 @@ async fn watch_relay_withholds_partial_backend_frames() {
     let baddr = blistener.local_addr().unwrap();
     let backend = TcpStream::connect(baddr).await.unwrap();
     let (mut backend_peer, _) = blistener.accept().await.unwrap();
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     conns.insert("node-a".to_string(), BackendConn::new(backend));
 
     let server = ProxyServer::new(test_config()).unwrap();
@@ -2589,7 +2591,7 @@ async fn idle_watch_keeps_a_backend_fatal_from_a_kept_session() {
         peer.write_all(&[status.clone(), fatal.clone()].concat())
             .await
             .unwrap();
-        let mut conns: HashMap<String, BackendConn> = HashMap::new();
+        let mut conns: ConnMap = ConnMap::default();
         conns.insert("node-a".to_string(), BackendConn::new(backend));
         let server = ProxyServer::new(test_config()).unwrap();
         let mut buffer = BytesMut::with_capacity(64);
@@ -2621,4 +2623,47 @@ async fn idle_watch_keeps_a_backend_fatal_from_a_kept_session() {
         }
         drop(peer);
     }
+}
+
+/// `NodeMap` (the type of a session's connection map) behaves as a map: one
+/// value per address, lookups by `&str` and `&String`, replace, remove.
+#[test]
+fn node_map_is_a_map_by_node_address() {
+    let mut map: session::NodeMap<u32> = session::NodeMap::default();
+    assert!(map.is_empty());
+    assert!(!map.contains_key("a:5432"));
+    assert_eq!(map.insert("a:5432".to_string(), 1), None);
+    assert_eq!(map.insert("b:5432".to_string(), 2), None);
+    assert_eq!(map.insert("a:5433".to_string(), 3), None);
+    assert_eq!(map.insert("a:5432".to_string(), 4), Some(1));
+    let owned = "b:5432".to_string();
+    assert!(map.contains_key(&owned) && map.contains_key("a:5433"));
+    assert!(!map.contains_key("a:543") && !map.contains_key(""));
+    assert_eq!(map.get("a:5432"), Some(&4));
+    *map.get_mut(&owned).unwrap() += 10;
+    assert_eq!(map.get(&owned), Some(&12));
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["a:5432", "a:5433", "b:5432"]);
+    assert_eq!(map.values().sum::<u32>(), 4 + 12 + 3);
+    for value in map.values_mut() {
+        *value += 1;
+    }
+    for (addr, value) in map.iter_mut() {
+        if addr == "a:5433" {
+            *value = 0;
+        }
+    }
+    assert_eq!(map.remove("a:5432"), Some(5));
+    assert_eq!(map.remove("a:5432"), None);
+    assert_eq!(map.get("b:5432"), Some(&13));
+    assert_eq!(map.get("a:5433"), Some(&0));
+    assert_eq!(map.remove("b:5432"), Some(13));
+    assert_eq!(map.remove("a:5433"), Some(0));
+    assert!(map.is_empty());
+    let built: session::NodeMap<u32> = [("x".to_string(), 1), ("x".to_string(), 2)]
+        .into_iter()
+        .collect();
+    assert_eq!(built.get("x"), Some(&2));
+    assert_eq!(built.keys().count(), 1);
 }

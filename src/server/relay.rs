@@ -3346,7 +3346,7 @@ impl ProxyServer {
     /// connection may still hold its own copy of a closed name, which becomes
     /// stale there. With `target` `None` every connection is "other".
     pub(super) fn note_statement_closes(
-        conns: &mut HashMap<String, BackendConn>,
+        conns: &mut ConnMap,
         target: Option<&str>,
         closes: &[String],
         left_closed: &[String],

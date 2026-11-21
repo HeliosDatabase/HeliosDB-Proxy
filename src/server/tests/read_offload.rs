@@ -416,7 +416,7 @@ async fn standby_connections_mirror_the_sessions_settings() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let fake = tokio::spawn(guc_backend(listener));
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     conns.insert(
         addr.clone(),
         BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
@@ -551,7 +551,7 @@ fn named_statements_are_classified_from_the_registry() {
 /// before the read (the idle watch covers only the home socket).
 #[tokio::test]
 async fn a_closed_standby_socket_is_dropped_before_reuse() {
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     let (live, _live_peer) = pair().await;
     conns.insert("live:5432".to_string(), BackendConn::new(live));
     ProxyServer::drop_if_unusable(&mut conns, "live:5432");
@@ -601,7 +601,7 @@ async fn home_tracking_and_stale_mirrors() {
         "a hinted request moves home"
     );
 
-    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut conns: ConnMap = ConnMap::default();
     let (s, _peer) = pair().await;
     let mut bc = BackendConn::new(s);
     bc.gucs_synced = Some(1);

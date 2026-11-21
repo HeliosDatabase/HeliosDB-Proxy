@@ -749,7 +749,7 @@ async fn copy_stall_deadline_arms_for_an_already_buffered_response() {
     backend
         .response_buf
         .extend_from_slice(&wire(b'G', &[0, 0, 0]));
-    let mut conns = HashMap::from([("buffered".into(), backend)]);
+    let mut conns = ConnMap::from_iter([("buffered".into(), backend)]);
     let (socket, _client_peer) = pair().await;
     let mut client = crate::client_tls::ClientStream::Plain(socket);
     let mut buffer = BytesMut::new();
@@ -792,7 +792,7 @@ async fn copy_stall_deadline_disarms_on_a_backend_error_before_ready() {
     backend
         .response_buf
         .extend_from_slice(&wire(b'E', b"SERROR\0C57014\0Mcancelled\0\0"));
-    let mut conns = HashMap::from([("buffered".into(), backend)]);
+    let mut conns = ConnMap::from_iter([("buffered".into(), backend)]);
     let (socket, _client_peer) = pair().await;
     let mut client = crate::client_tls::ClientStream::Plain(socket);
     let mut buffer = BytesMut::new();
@@ -7876,7 +7876,7 @@ mod simple_query_payload_regressions {
         config.add_node(&target, "primary").unwrap();
         let server = ProxyServer::new(config.clone()).unwrap();
         let session = make_test_session();
-        let mut conns = HashMap::from([(target.clone(), BackendConn::new(backend_socket))]);
+        let mut conns = ConnMap::from_iter([(target.clone(), BackendConn::new(backend_socket))]);
         let (client, mut client_peer) = pair().await;
         let mut client = ClientStream::Plain(client);
         let mut fault = None;
