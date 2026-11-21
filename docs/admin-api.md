@@ -48,7 +48,7 @@ All four are routed and token-exempt. The z-suffixed paths are Kubernetes-style 
 | `/health` | — | 200 `{"status":"ok"}` |
 | `/healthz` | `/health` | 200 `{"status":"ok"}` |
 | `/livez` | `/health/live` | 200 `{"alive":true}` |
-| `/readyz` | `/health/ready` | 200 if ≥1 healthy backend, else 503 |
+| `/readyz` | `/health/ready` | 200 if ≥1 healthy backend and the proxy is not draining, else 503 |
 
 The slash-form `/health/live` and `/health/ready` routes are **not** token-exempt, so when `admin_token` is set they require the bearer token like any other route — use the z-suffixed aliases (`/livez`, `/readyz`) for unauthenticated probes.
 
@@ -102,12 +102,14 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `GET` | `/pools` | Per-node connection pool stats | — | token |
 | `POST` | `/api/sql` | Execute SQL with transparent write routing | — | token |
 | `GET` | `/plugins` | Loaded WASM plugins (503 if manager not attached) | `wasm-plugins` | token |
+| `GET` | `/plugins/files` | Every file of the plugin directory and its state | `wasm-plugins` | token |
+| `POST` | `/plugins/reload` | Rescan the plugin directory now; report the changes | `wasm-plugins` | token |
 | `GET` | `/admin/kv/{plugin}/{key}` | Read a plugin KV value (`{"plugin","key","value"}`; 404 if absent) | `wasm-plugins` | token |
 | `GET` | `/admin/kv/{plugin}/` | List a plugin's KV keys (trailing slash) | `wasm-plugins` | token |
 | `PUT` | `/admin/kv/{plugin}/{key}` | Set a plugin KV value (UTF-8 body; 413 on cap breach) | `wasm-plugins` | token |
 | `DELETE` | `/admin/kv/{plugin}/{key}` | Delete a plugin KV value (idempotent 200) | `wasm-plugins` | token |
 | `GET` | `/anomalies` | Anomaly-detector recent events (`?limit=N`) | `anomaly-detection` | token |
-| `GET` | `/analytics`, `/api/analytics` | Top queries + slow-query log (`?limit=N`) | `query-analytics` | token |
+| `GET` | `/analytics`, `/api/analytics` | Top queries by calls + the slow-query count (`?limit=N`) | `query-analytics` | token |
 | `GET` | `/api/cache/heatmap` | Per-table query-cache heatmap + recommendations (`{"enabled":false}` while off) | `query-cache` | token |
 | `GET` | `/api/mcp/cache` | MCP tool-result cache counters, totals and per-owner (principal, tenant) usage (`{"enabled":false}` while off) | `query-cache` | token |
 | `POST` | `/api/mcp/cache/clear` | Clear the MCP tool-result cache: `{}` all, or the owners `{"principal","tenant"}` select (503 while off) | `query-cache` | token |
@@ -165,7 +167,7 @@ curl http://localhost:9090/livez
 
 ### GET /health/ready, GET /readyz
 
-Readiness. Returns 200 if at least one backend node is healthy, `503` otherwise. `/health/ready` **requires the bearer token** when `admin_token` is set; its `/readyz` alias is **token-exempt** — prefer `/readyz` for unauthenticated probes.
+Readiness. Returns 200 if at least one backend node is healthy, `503` otherwise, and `503` with `"message": "Proxy is draining"` once the proxy has closed its listener for a drain (SIGUSR2, SIGTERM, SIGINT). `/health/ready` **requires the bearer token** when `admin_token` is set; its `/readyz` alias is **token-exempt** — prefer `/readyz` for unauthenticated probes.
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/health/ready
@@ -294,7 +296,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 # → {"status":"enabled"}
 ```
 
-> Draining the **whole proxy** is a different operation: send `SIGUSR2` for a graceful drain (bounded by `shutdown_drain_timeout_secs`). There is no `/drain` route.
+> Draining the **whole proxy** is a different operation: send `SIGUSR2` for a binary-handoff drain, or `SIGTERM` / `SIGINT` to shut down (both bounded by `shutdown_drain_timeout_secs`; see [Signals](configuration.md#signals)). While either runs, `GET /health/ready` answers 503 `Proxy is draining`. There is no `/drain` route.
 
 ---
 
@@ -384,13 +386,22 @@ Server metrics in JSON.
   "bytes_sent": 189234567,
   "failovers": 1,
   "startup_waits_total": 0,
-  "startup_wait_timeouts_total": 0
+  "startup_wait_timeouts_total": 0,
+  "copy_input_timeouts": 0,
+  "query_cache_context_bypassed": 0,
+  "sessions_drained": 0,
+  "draining": false
 }
 ```
 
 `startup_waits_total` and `startup_wait_timeouts_total` count client startups that
 waited for an eligible healthy node (`[limits] startup_node_wait_ms`) and the waits that
-expired. The other fields are as in the Prometheus table below.
+expired. `copy_input_timeouts` counts COPY inputs ended by `[limits]
+copy_idle_timeout_secs`, `query_cache_context_bypassed` cacheable reads not looked up
+because their session may have changed its execution context, and `sessions_drained`
+sessions ended by a shutdown or handoff drain; `draining` is `true` once a SIGTERM,
+SIGINT or SIGUSR2 drain has started. With the MCP memory tools on, `mcp_memory` carries
+their counters. The other fields are as in the Prometheus table below.
 
 `connections_active` is computed as `accepted − closed`. `connections_rejected`
 counts connections refused because the `[limits] max_client_connections` cap was
@@ -464,6 +475,22 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_tenant_idle_permit_timeouts_total` | counter | `tenant` | Sessions terminated by `[multi_tenancy] idle_permit_timeout_ms`. |
 | `heliosdb_proxy_tenant_replay_bytes`, `_replay_byte_limit` | gauge | `tenant` | Transaction-replay bytes the tenant's sessions hold now, and its budget (`[multi_tenancy] max_replay_bytes_per_tenant` / `tenant_max_replay_bytes`). Only tenants with a replay-byte budget appear in this and the next row. |
 | `heliosdb_proxy_tenant_replay_budget_refusals_total` | counter | `tenant` | Transactions marked non-replayable by the tenant's replay-byte budget. |
+| `heliosdb_proxy_tenant_journal_bytes`, `_journal_byte_limit` | gauge | `tenant` | Recovery-journal bytes the tenant holds now, and its budget (`[multi_tenancy] max_journal_bytes_per_tenant` / `tenant_max_journal_bytes`). Only tenants with a journal budget appear in this and the next row. |
+| `heliosdb_proxy_tenant_journal_budget_refusals_total` | counter | `tenant` | Recovery-journal reservations refused by the tenant's byte budget (the transaction is then marked incomplete for recovery). |
+| `heliosdb_proxy_sessions_drained_total` | counter | — | Sessions ended with FATAL `57P01` by a SIGTERM / SIGINT shutdown drain or a SIGUSR2 handoff drain. |
+| `heliosdb_proxy_copy_input_timeouts_total` | counter | — | `COPY FROM STDIN` inputs ended by `[limits] copy_idle_timeout_secs` (FATAL `57014`). |
+| `heliosdb_proxy_query_cache_context_bypassed_total` | counter | — | Cacheable reads the query cache did not look up because their session ran a statement that may change its execution context (a write, `SET`, `SET ROLE`, a function call, ...). |
+| `heliosdb_proxy_cache_scope_proofs_total`, `_scope_proofs_reused_total` | counter | — | Backend settings proofs (`SHOW ALL`) taken for result-cache reads, and reads that reused their connection's proof within `[cache] proof_ttl_ms`. |
+| `heliosdb_proxy_cache_gateway_write_invalidations_total` | counter | `gateway` = `http`, `mcp`, `graphql` | Writes through a gateway that retired cached reads. |
+| `heliosdb_proxy_branch_moves_total` | counter | — | Sessions moved to another branch database by a `branch=` hint or a route plugin's `branch` answer (`[branch] route_enabled`). |
+| `heliosdb_proxy_mcp_results_truncated_total` | counter | — | MCP tool results cut at `[mcp] max_result_rows` / `max_result_bytes`. |
+| `heliosdb_proxy_mcp_cache_hits_total`, `_misses_total`, `_stores_total`, `_stale_rejected_total`, `_expired_total`, `_fills_raced_total` | counter | — | MCP tool-result cache activity (`[mcp] tool_cache_enabled`). No principal or tenant labels. |
+| `heliosdb_proxy_mcp_cache_skipped_total` | counter | `reason` | Cacheable MCP calls not cached, by reason. |
+| `heliosdb_proxy_mcp_cache_evictions_total` | counter | `scope` = `principal`, `global` | Entries evicted to stay within the per-owner or overall bounds. |
+| `heliosdb_proxy_mcp_cache_entries`, `_retained_bytes`, `_owners` | gauge | — | Entries, bytes and owners the MCP tool-result cache holds. |
+| `heliosdb_proxy_mcp_memory_ops_total` | counter | `op` | MCP memory tool calls completed, by tool (`[mcp] memory_enabled`). |
+| `heliosdb_proxy_mcp_memory_refused_total` | counter | `reason` | MCP memory tool calls refused, by reason. |
+| `heliosdb_proxy_mcp_memory_entries_quota_hits_total` | counter | — | `memory_put` calls refused by `[mcp] memory_max_entries_per_owner`. |
 | `heliosdb_proxy_tenant_query_wait_seconds` | histogram | — | How long requests waited for a tenant active-query permit (only requests that waited; every wait, whether it ended admitted, refused, cancelled or abandoned). One series for all tenants, not labelled by tenant: its `_count` is the sum of `heliosdb_proxy_tenant_query_waits_total` over all tenants. |
 
 Histogram buckets are `[limits] latency_buckets_ms`, exported in seconds as `_bucket{le="…"}`,
@@ -480,7 +507,7 @@ tier is off; `query_cache.refresh_hint` and `query_cache.refresh_ahead` (`claims
 the server counters carry `cache_excluded`, `cache_catalog_skipped`,
 `cache_time_travel_skipped` and `cache_ambiguous_skipped`.
 
-> This is not directly scrapable as raw Prometheus text — the payload is JSON with the exposition string in `text`, so a scraper must unwrap the `text` field. This endpoint is served unconditionally; there is no separate build flag that changes its format (the `observability` feature only pulls in the `prometheus`/`opentelemetry` crates and wires no exporter — see the feature-flags reference).
+> This is not directly scrapable as raw Prometheus text — the payload is JSON with the exposition string in `text`, so a scraper must unwrap the `text` field. This endpoint is served unconditionally; there is no separate build flag that changes its format (the `observability` feature is a reserved no-op that pulls no dependency — see the feature-flags reference).
 
 ### GET /sessions
 
@@ -495,7 +522,7 @@ Per-node connection pool statistics (active/idle/pending, lifetime created/close
 ### GET /version
 
 ```json
-{ "version": "1.5.0", "build_time": "1.5.0" }
+{ "version": "3.0.0", "build_time": "3.0.0" }
 ```
 
 > Both fields derive from the crate version (`CARGO_PKG_VERSION`); `build_time` is the version string, not a wall-clock timestamp.
@@ -555,7 +582,7 @@ Example (abridged; the example fixture has every field):
 ```json
 {
   "schema_version": 1,
-  "proxy_version": "2.2.0",
+  "proxy_version": "3.0.0",
   "generated_at": "2026-11-06T10:15:02.123Z",
   "uptime_secs": 86400,
   "nodes": {
@@ -653,7 +680,7 @@ Per node:
 | `max_total_idle` | integer | `[limits] max_total_idle_backend_conns`: idle connections kept across all identities. |
 | `idle_timeout_secs` | integer, seconds | `[pool_mode] idle_timeout_secs`. |
 | `acquire_timeout_secs` | integer, seconds | `[pool_mode] acquire_timeout_secs`. |
-| `idle_pool` | object, nullable | The data-path pool of parked, authenticated backend connections (transaction and statement mode); `null` in session mode. `idle` (parked now), `reuses_total` (checkouts that reused one), `parked_total` (check-ins), `over_capacity_total` (check-ins refused at an idle cap), `stale_evicted_total` (found dead at checkout), `reaped_total` (closed by the idle reaper), `resets_skipped_total` (parked without the reset query because provably clean), `capacity_evictions_total` (closed to make room on a backend at `max_connections`). |
+| `idle_pool` | object, nullable | The data-path pool of parked, authenticated backend connections (transaction and statement mode); `null` in session mode. `idle` (parked now), `reuses_total` (checkouts that reused one), `parked_total` (check-ins), `over_capacity_total` (check-ins refused at an idle cap), `stale_evicted_total` (found dead at checkout), `reaped_total` (closed by the idle reaper), `resets_skipped_total` (parked without the reset query because provably clean: `skip_clean_reset`, or a connection leased only to prove its settings for a cache hit), `capacity_evictions_total` (closed to make room on a backend at `max_connections`). |
 
 Version 1 has no per-(user, database) breakdown: the proxy keeps no counters by pool
 identity. Per-node connection counts are `nodes.items[].backend_connections`.
@@ -794,7 +821,33 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ### GET /plugins
 
-Loaded WASM plugins — name, version, description, hooks, state, invocation count. Returns `503 {"error":"plugin manager not attached"}` when the proxy runs without a plugin manager, and `503 {"error":"wasm-plugins feature not compiled in"}` in a build without `--features wasm-plugins`.
+Loaded WASM plugins in dispatch order (the order of their file names) — name, version, description, hooks, state, invocation and error counts, the file each was loaded from (`path`) and the SHA-256 of its module (`sha256`). Returns `503 {"error":"plugin manager not attached"}` when the proxy runs without a plugin manager, and `503 {"error":"wasm-plugins feature not compiled in"}` in a build without `--features wasm-plugins`.
+
+### GET /plugins/files
+
+Every `.wasm` / `.tar.gz` file of `[plugins] plugin_dir`, as of the latest rescan, with its state:
+
+| `state` | Fields | Meaning |
+|---|---|---|
+| `loaded` | `plugin` | Its current version is the loaded plugin. |
+| `stale` | `plugin`, `error` | It changed and the new version failed; the plugin keeps running the version loaded before. |
+| `shadowed` | `plugin`, `provided_by` | It declares a plugin another file provides (a `.tar.gz` before a bare `.wasm`, then file-name order). |
+| `failed` | `error` | No plugin is loaded from it (unreadable, bad signature, refused module, `max_plugins` reached). |
+| `pending` | | It changed within `hot_reload_debounce_ms`; not acted on yet. |
+
+```json
+[
+  {"path": "/etc/heliosproxy/plugins/10-guard.tar.gz", "state": "loaded", "plugin": "guard"},
+  {"path": "/etc/heliosproxy/plugins/20-router.wasm", "state": "failed",
+   "error": "Signature verification failed: ... requires a sidecar .sig file (trust root active)"}
+]
+```
+
+Same `503` answers as `GET /plugins`.
+
+### POST /plugins/reload
+
+Rescan the plugin directory now, as a SIGHUP does (changes count as settled at once), and report what changed: `200 {"loaded": [...], "updated": [...], "unloaded": [...], "failed": [{"path", "error"}]}`. A plugin whose new version failed keeps running its previous one. Same `503` answers as `GET /plugins`. See "Loading, reloading and the plugin directory" in `docs/configuration.md`.
 
 ### /admin/kv/{plugin}/{key} — plugin runtime KV
 
@@ -835,7 +888,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/anomalies?li
 
 ### GET /analytics (alias /api/analytics)
 
-Top queries by call count plus the slow-query log. Optional `?limit=N` (default 50). **`503` unless built with `--features query-analytics`.**
+Top queries by call count (`fingerprint`, `normalized`, `calls`, `avg_ms`, `p99_ms`, `rows`, `errors`), the number of slow queries (`slow_query_count`) and `analytics_dropped_total`. The slow-query entries themselves, N+1 and intent results are not exposed (planned for a later 3.x release). Optional `?limit=N` (default 50). **`503` unless built with `--features query-analytics`.**
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/api/analytics?limit=50"

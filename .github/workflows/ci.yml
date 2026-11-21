@@ -59,6 +59,8 @@ jobs:
           - "ha-tr"
           - "all-features"
           - "all-features,postgres-topology"
+          - "msrv-features"
+          - "wasm-plugins"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -71,6 +73,8 @@ jobs:
         run: |
           if [ -z "${{ matrix.features }}" ]; then
             cargo clippy --tests -- -D warnings
+          elif [ "${{ matrix.features }}" = "wasm-plugins" ]; then
+            cargo clippy --no-default-features --features wasm-plugins --tests -- -D warnings
           else
             cargo clippy --features "${{ matrix.features }}" --tests -- -D warnings
           fi
@@ -130,7 +134,36 @@ jobs:
       - name: Criterion and user-path gate comparator tests
         run: |
           python3 scripts/tests/bench_gate_compare_test.py
+          python3 scripts/tests/bench_gate_confirm_test.py
           python3 scripts/tests/compare_usertp_test.py
+
+  # ── First-party WASM plugins through the proxy's runtime ─────────────
+  plugin-e2e:
+    name: Plugin end-to-end (first-party plugins)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: HeliosDatabase/HeliosDB-Proxy-Plugins
+          path: plugins
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: plugin-e2e
+          workspaces: |
+            . -> target
+            plugins -> target
+      - name: Build the plugins
+        working-directory: plugins
+        run: cargo build --target wasm32-unknown-unknown --release
+      - name: Run the end-to-end tests (missing plugins fail)
+        env:
+          HELIOS_PLUGINS_DIR: ${{ github.workspace }}/plugins/target/wasm32-unknown-unknown/release
+          HELIOS_PLUGINS_REQUIRED: "1"
+        run: cargo test --features wasm-plugins --test wasm_plugin_e2e
 
   # ── Integration tests: PostgreSQL 18 primary + standby (REQUIRED) ────
   # Uses only the public postgres:18 image from Docker Hub, so it runs on every
@@ -231,7 +264,7 @@ jobs:
           --features "all-features,postgres-topology"
           -- --include-ignored
 
-  # ── Integration tests: HeliosDB Nano 4.41 primary + standby ─────────
+  # ── Integration tests: HeliosDB Nano 4.42 primary + standby ─────────
   # NON-BLOCKING (continue-on-error): Nano is a separately released engine, so a
   # Nano regression shows here without blocking Proxy merges.
   #
@@ -246,7 +279,7 @@ jobs:
   # port 5433 / standby 5435). Tests that hit a known Nano bug skip themselves
   # when HELIOS_TEST_BACKEND=nano and name the Nano issue.
   integrate-nano:
-    name: Integration — HeliosDB Nano 4.41 (primary + standby)
+    name: Integration — HeliosDB Nano 4.42 (primary + standby)
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test]
     continue-on-error: true
@@ -255,7 +288,7 @@ jobs:
 
     services:
       nano:
-        image: ghcr.io/heliosdatabase/heliosdb-nano:4.41.0
+        image: ghcr.io/heliosdatabase/heliosdb-nano:4.42.1
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
@@ -271,7 +304,7 @@ jobs:
           --health-start-period 5s
       # ── HA standby (modules 06/08/09/10) ───────────────────────────
       nano-standby:
-        image: ghcr.io/heliosdatabase/heliosdb-nano:4.41.0
+        image: ghcr.io/heliosdatabase/heliosdb-nano:4.42.1
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
@@ -301,7 +334,7 @@ jobs:
       - name: Build proxy binary
         run: cargo build --features "all-features,postgres-topology"
 
-      - name: Integration tests against HeliosDB Nano 4.41
+      - name: Integration tests against HeliosDB Nano 4.42
         continue-on-error: false
         env:
           HELIOS_TEST_BACKEND: nano
@@ -316,7 +349,7 @@ jobs:
           -- --include-ignored
 
       # ── HA tests: modules 06 / 08 / 09 / 10 with live standby ─────
-      - name: HA integration tests — Nano 4.41 primary + standby (modules 06/08/09/10)
+      - name: HA integration tests — Nano 4.42 primary + standby (modules 06/08/09/10)
         continue-on-error: false
         env:
           HELIOS_TEST_BACKEND: nano

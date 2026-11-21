@@ -286,6 +286,12 @@ pub struct L2Config {
     /// (10^5-10^6 entries) does not contend with concurrent readers for its
     /// whole duration at full rate.
     pub shed_pause: Duration,
+
+    /// When L2 must make room, an eviction pass frees this percentage of
+    /// `max_bytes` beyond what the store needs (`[cache]
+    /// l2_evict_headroom_pct`, 0..=50), so one pass over the map makes room
+    /// for many stores. Default 5.
+    pub evict_headroom_pct: u8,
 }
 
 impl Default for L2Config {
@@ -302,6 +308,7 @@ impl Default for L2Config {
             mmap_path: None,
             shed_batch: 1024,
             shed_pause: Duration::from_millis(2),
+            evict_headroom_pct: 5,
         }
     }
 }

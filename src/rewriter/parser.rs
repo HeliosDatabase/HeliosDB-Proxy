@@ -205,13 +205,6 @@ impl SqlParser {
 
         false
     }
-
-    /// Convert AST back to SQL
-    pub fn to_sql(&self, parsed: &ParsedQuery) -> String {
-        // For now, return the normalized version
-        // In production, use sqlparser-rs for full AST manipulation
-        parsed.original.clone()
-    }
 }
 
 impl Default for SqlParser {

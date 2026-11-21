@@ -157,8 +157,8 @@ impl TableGenerations {
 /// whose backend-ambiguous text holds a `;` that may end a statement for one
 /// backend where the capture reads none (the relay's unseen-write signal),
 /// and an `EXPLAIN` that may `ANALYZE` (it executes the statement it
-/// explains). A function called from a `SELECT` is a read here, as on the
-/// PG-wire relay.
+/// explains). Call-shaped reads are unknown scope, as on the PG-wire relay;
+/// a visible spelling cannot establish the resolved function's effects.
 pub(crate) fn gateway_statement_may_write(sql: &str) -> bool {
     use crate::journal_capture::{classify, StmtKind};
     // `EXPLAIN ANALYZE` runs the statement it explains: that one decides.
@@ -166,6 +166,10 @@ pub(crate) fn gateway_statement_may_write(sql: &str) -> bool {
         return true;
     };
     if classify(sql).0 != StmtKind::Read {
+        return true;
+    }
+    if matches!(crate::sql_lex::lead(sql), crate::sql_lex::Lead::Start(start) if crate::protocol::starts_with_ci(start, "WITH") && sql.contains('('))
+    {
         return true;
     }
     if sql.contains(';')
@@ -325,6 +329,8 @@ mod tests {
             "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
             "SELECT 1; UPDATE t SET v = 1",
             "EXECUTE upd(1)",
+            // Parenthesized SQL forms conservatively have unknown scope too.
+            "WITH x AS (SELECT 1) SELECT * FROM x",
             "COMMIT PREPARED 'g'",
             // A `;` in a backend-ambiguous rest may end a statement.
             "SELECT E'\\'' ; UPDATE b SET v = 1",
@@ -339,7 +345,6 @@ mod tests {
         for sql in [
             "SELECT value FROM widgets",
             "  select * from t where s = 'UPDATE'",
-            "WITH x AS (SELECT 1) SELECT * FROM x",
             "EXPLAIN SELECT * FROM t",
             "SHOW work_mem",
             "",

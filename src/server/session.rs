@@ -88,6 +88,33 @@ pub struct ClientSession {
     /// transaction the commit does again.
     #[cfg(feature = "query-cache")]
     pub(crate) cache_unseen_write: std::sync::atomic::AtomicBool,
+    /// Fail-closed result-cache eligibility. Any statement whose effects on
+    /// execution context are not provably neutral makes this sticky.
+    #[cfg(feature = "query-cache")]
+    pub(crate) cache_ineligible: std::sync::atomic::AtomicBool,
+    /// ParameterStatus messages relayed to this session so far: a reused
+    /// settings proof ([`CacheScopeMemo`]) is valid only while none arrived.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(crate) parameter_changes: std::sync::atomic::AtomicU64,
+    /// Complete startup identity, initialized once before the first lookup.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(crate) cache_startup_namespace: std::sync::OnceLock<[u8; 32]>,
+    /// Kinds of state ([`super::session_bound`]) the session holds on its
+    /// backend connection, refreshed before each request: a branch move
+    /// (which gives the session a connection to another database) is refused
+    /// while any is held.
+    pub(crate) branch_blockers: std::sync::atomic::AtomicU8,
+    /// The database the session started on, recorded at its first branch
+    /// move: `branch=` with no name moves it back there, and a Nano branch
+    /// is named after its base.
+    pub(crate) branch_home: std::sync::OnceLock<String>,
+    /// Last effective scope used by this client's raw-SQL L1 cache.
+    #[cfg(feature = "query-cache")]
+    pub(crate) cache_effective_namespace: std::sync::Mutex<Option<[u8; 32]>>,
+    /// Journal metadata already relayed by a Flush or COPY yield; never rows.
+    pub(crate) journal_response_prefix:
+        std::sync::Mutex<Option<(crate::journal_capture::ResponseOutcome, usize)>>,
+    pub(crate) journal_response_pending: std::sync::atomic::AtomicBool,
     /// TR-07 recovery-journal capture: the per-session state machine that
     /// turns registered statements + observed backend responses into
     /// committed transactions (`journal_capture`). Locked briefly on the
@@ -127,6 +154,11 @@ pub struct ClientSession {
     /// deferred to the default auth flow.
     #[cfg(feature = "wasm-plugins")]
     pub plugin_identity: RwLock<Option<Identity>>,
+    /// What every plugin hook call of this session carries in its
+    /// `hook_context` (identity, database, branch, attributes), built once
+    /// after authentication ([`ProxyServer::plugin_session_context`]).
+    #[cfg(feature = "wasm-plugins")]
+    pub plugin_context: std::sync::OnceLock<crate::plugins::HookContext>,
     /// Sticky edge-cache ineligibility: set once the session executes any
     /// statement that alters execution context (SET/SET ROLE/search_path,
     /// temp tables, ...). The shared edge cache keys on (fingerprint,
@@ -183,6 +215,9 @@ pub struct ClientSession {
     /// ends that at the session's end. It is also the startup backend
     /// connection's own (`BackendConn::backend_key`).
     pub(crate) cancel_key: std::sync::OnceLock<(u32, u32)>,
+    /// The waker of the task serving this session while it waits for its
+    /// client at a point where a shutdown drain may end it ([`DrainSignal`]).
+    pub(super) drain_waker: parking_lot::Mutex<Option<std::task::Waker>>,
 }
 
 impl ClientSession {
@@ -369,6 +404,29 @@ pub struct ExtendedBatchLog {
 /// names move from `prepared` to `stale` and are closed on that socket before
 /// a later batch uses or redefines them (F2).
 pub(super) struct BackendConn {
+    /// A cleanly drained backend that cannot provide the settings proof.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) cache_scope_unsupported: bool,
+    /// Reused only under the explicit immutable-backend-context contract
+    /// (for the physical connection's life, so it is parked with it).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) cache_scope_verified: Option<crate::pool::SettingsProof>,
+    /// The last settings proof of this connection, reused for later reads
+    /// within `[cache] proof_ttl_ms` while nothing but proven cacheable reads
+    /// ran on it ([`Self::forget_cache_scope`]).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) cache_scope_memo: Option<CacheScopeMemo>,
+    /// The connection still holds its reset settings: it was opened for
+    /// this session, or leased from the pool parked with them
+    /// (`ParkedSettings::baseline`), and nothing that may change settings
+    /// ran on it since. A proof taken while this holds describes the
+    /// settings `DISCARD ALL` restores, so it survives that reset when the
+    /// connection is parked (`ProxyServer::parked_settings`).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) settings_baseline: bool,
+    /// Explicit proof for synthetic protocol fixtures; absent from production.
+    #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
+    pub(super) cache_scope_test_override: Option<[u8; 32]>,
     pub(super) stream: TcpStream,
     /// Unpublished backend frame tail, owned by this socket across Flush,
     /// idle watch and Sync. Dropped with the socket, never moved to another node.
@@ -391,6 +449,13 @@ pub(super) struct BackendConn {
     /// (the backend's unnamed statement already holds that SQL) and synthesize
     /// the `ParseComplete` locally — the unnamed-Parse promotion (Batch H).
     pub(super) unnamed_sig: Option<bytes::Bytes>,
+    /// The socket may hold an unnamed statement of the client's that
+    /// `unnamed_sig` does not describe (the promotion is off, or its `Parse`
+    /// did not open its batch): the proxy could not re-establish it, so
+    /// nothing that destroys the unnamed statement (the result cache's
+    /// settings probe, a simple Query of the proxy's own) may run ahead of a
+    /// batch of the client's that does not replace it.
+    pub(super) unnamed_untracked: bool,
     /// The unnamed statement and portal this socket may still hold although
     /// the session's were destroyed without it (see [`UnnamedStale`]). Never
     /// set on a fresh or pooled connection.
@@ -440,6 +505,16 @@ pub(super) struct BackendConn {
 impl BackendConn {
     pub(super) fn new(stream: TcpStream) -> Self {
         Self {
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            cache_scope_unsupported: false,
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            cache_scope_verified: None,
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            cache_scope_memo: None,
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            settings_baseline: true,
+            #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
+            cache_scope_test_override: None,
             stream,
             response_buf: BytesMut::new(),
             prepared: HashSet::new(),
@@ -447,6 +522,7 @@ impl BackendConn {
             gucs_synced: None,
             gucs_role: false,
             unnamed_sig: None,
+            unnamed_untracked: false,
             unnamed_stale: UnnamedStale::default(),
             #[cfg(feature = "pool-modes")]
             dirty: false,
@@ -470,8 +546,53 @@ impl BackendConn {
     /// the backend destroyed its unnamed statement and portal.
     pub(super) fn unnamed_destroyed(&mut self) {
         self.unnamed_sig = None;
+        self.unnamed_untracked = false;
         self.unnamed_stale = UnnamedStale::default();
+        // A simple Query reached the socket: it may have changed settings.
+        self.forget_cache_scope();
     }
+
+    /// Something other than a proven cacheable read reached the socket (a
+    /// statement that may change its settings): the next cached read proves
+    /// them again.
+    pub(super) fn forget_cache_scope(&mut self) {
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        {
+            self.cache_scope_memo = None;
+            self.settings_baseline = false;
+        }
+    }
+
+    /// A statement that leaves the settings as they were (the settings proof
+    /// itself, a proven cacheable read) reached the socket through a path
+    /// that calls [`Self::unnamed_destroyed`]: keep what was known about the
+    /// settings before it.
+    pub(super) fn unnamed_destroyed_keeping_settings(&mut self) {
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        let kept = (self.cache_scope_memo.take(), self.settings_baseline);
+        self.unnamed_destroyed();
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        {
+            (self.cache_scope_memo, self.settings_baseline) = kept;
+        }
+    }
+}
+
+/// A settings proof kept for reuse ([`BackendConn::cache_scope_memo`]).
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CacheScopeMemo {
+    /// The proven namespace.
+    pub(super) namespace: [u8; 32],
+    /// The session startup digest it was computed with: a pooled
+    /// connection's proof carries over only to a borrower with the same one.
+    pub(super) startup: [u8; 32],
+    /// When it was proven.
+    pub(super) at: std::time::Instant,
+    /// The session's ParameterStatus count then
+    /// ([`ClientSession::parameter_changes`]): any ParameterStatus since
+    /// retires the memo.
+    pub(super) parameter_changes: u64,
 }
 
 /// Which unnamed objects a backend socket may still hold after the session's
@@ -553,6 +674,47 @@ impl Drop for SessionGuard {
         #[cfg(feature = "query-cache")]
         if let Some(ref qc) = self.state.query_cache {
             qc.remove_l1_cache(self.session_id.as_u64_pair().0);
+        }
+    }
+}
+
+/// Resolves once the server has begun its shutdown drain
+/// ([`ServerState::draining`], set by `ProxyServer::begin_drain` on SIGTERM
+/// or SIGINT). A session awaits it next to its client read only while it
+/// waits at a point where ending it loses nothing (no transaction, cycle,
+/// COPY or partly received request), so a drain closes idle sessions at once
+/// instead of waiting for their clients to leave.
+///
+/// The session's task waker is left in [`ClientSession::drain_waker`];
+/// `begin_drain` sets the flag first and wakes it afterwards, and the flag is
+/// read again here after the waker is stored, so a drain that begins between
+/// the two is never missed.
+pub(super) struct DrainSignal<'a> {
+    pub(super) state: &'a ServerState,
+    pub(super) session: &'a ClientSession,
+}
+
+impl std::future::Future for DrainSignal<'_> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        use std::sync::atomic::Ordering;
+        if self.state.draining.load(Ordering::Relaxed) {
+            return std::task::Poll::Ready(());
+        }
+        {
+            let mut slot = self.session.drain_waker.lock();
+            if !slot.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                *slot = Some(cx.waker().clone());
+            }
+        }
+        if self.state.draining.load(Ordering::SeqCst) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
         }
     }
 }

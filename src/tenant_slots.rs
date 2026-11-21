@@ -40,12 +40,119 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
-use crate::config::{ProxyConfig, TrMode};
+use crate::config::{MultiTenancyToml, ProxyConfig, TrMode};
 use crate::metrics_hist::LatencyHistogram;
 
+/// Shared accounting for a tenant's recovery-journal memory. Reservations are
+/// acquired atomically across sessions and returned when their RAII charges
+/// are dropped (rollback, eviction, or session teardown).
+#[derive(Debug)]
+pub struct TenantJournalBudget {
+    tenant: String,
+    /// Zero means unlimited, matching the other per-tenant byte budgets.
+    /// Changed only by a SIGHUP ([`TenantSlots::reload_caps`]).
+    limit: AtomicUsize,
+    used: AtomicUsize,
+    refusals: AtomicU64,
+}
+
+impl TenantJournalBudget {
+    pub fn new(tenant: impl Into<String>, limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            tenant: tenant.into(),
+            limit: AtomicUsize::new(limit),
+            used: AtomicUsize::new(0),
+            refusals: AtomicU64::new(0),
+        })
+    }
+
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    pub fn refusals(&self) -> u64 {
+        self.refusals.load(Ordering::Relaxed)
+    }
+
+    /// Reserve `bytes` across every session of this tenant. Overflow and
+    /// configured-limit violations fail closed without changing usage.
+    pub fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<TenantJournalCharge> {
+        if !self.reserve(bytes) {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(TenantJournalCharge {
+            budget: Arc::clone(self),
+            bytes: AtomicUsize::new(bytes),
+        })
+    }
+
+    fn reserve(&self, bytes: usize) -> bool {
+        update(&self.used, |used| {
+            let next = used.checked_add(bytes)?;
+            let limit = self.limit();
+            (limit == 0 || next <= limit).then_some(next)
+        })
+        .is_ok()
+    }
+}
+
+/// One reservation against a shared tenant recovery-journal budget.
+#[derive(Debug)]
+pub struct TenantJournalCharge {
+    budget: Arc<TenantJournalBudget>,
+    bytes: AtomicUsize,
+}
+
+impl TenantJournalCharge {
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    /// Set this transaction's reservation to its current deterministic
+    /// retained size. Growth is admitted atomically; shrinkage is returned
+    /// immediately after rollback or savepoint truncation.
+    pub fn settle(&self, retained: usize) -> bool {
+        let current = self.bytes();
+        if retained > current {
+            let additional = retained - current;
+            if !self.budget.reserve(additional) {
+                self.budget.refusals.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            self.bytes.fetch_add(additional, Ordering::AcqRel);
+        } else if current > retained {
+            let released = current - retained;
+            self.bytes.fetch_sub(released, Ordering::AcqRel);
+            self.budget.used.fetch_sub(released, Ordering::AcqRel);
+        }
+        true
+    }
+}
+
+impl Drop for TenantJournalCharge {
+    fn drop(&mut self) {
+        let bytes = self.bytes.load(Ordering::Acquire);
+        let previous = self.budget.used.fetch_sub(bytes, Ordering::AcqRel);
+        debug_assert!(previous >= bytes, "tenant journal charge underflow");
+    }
+}
+
 struct TenantSlot {
-    limit: usize,
+    /// The cap in force. Changed only by [`TenantSlot::resize`] (a SIGHUP).
+    limit: AtomicUsize,
     sem: Arc<Semaphore>,
+    /// Permits a lowered cap could not take back at once (see
+    /// [`TenantSlot::resize`]).
+    debt: Arc<SlotDebt>,
     waiting: AtomicUsize,
     waits: AtomicU64,
     refusals: AtomicU64,
@@ -81,20 +188,140 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// What a lowered cap still owes: permits that were held when the cap came
+/// down, so they could not be taken out of the semaphore then. Every permit
+/// of the semaphore is either within the cap or owed, so
+/// `held + available == limit + owed` at rest.
+#[derive(Default)]
+struct SlotDebt {
+    owed: AtomicUsize,
+    /// A collector task is running for this slot.
+    collecting: AtomicBool,
+}
+
+/// `AtomicUsize::fetch_update(AcqRel, Acquire, f)`, written out: that method
+/// is deprecated from Rust 1.99, and its replacement (`try_update`) does not
+/// exist on the 1.86 MSRV. `Ok` holds the value replaced, `Err` the value
+/// `f` refused.
+fn update(atomic: &AtomicUsize, mut f: impl FnMut(usize) -> Option<usize>) -> Result<usize, usize> {
+    let mut current = atomic.load(Ordering::Acquire);
+    while let Some(next) = f(current) {
+        match atomic.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+    Err(current)
+}
+
+impl SlotDebt {
+    /// Take up to `most` permits off the debt; returns how many.
+    fn cancel(&self, most: usize) -> usize {
+        let mut cancelled = 0;
+        let _ = update(&self.owed, |owed| {
+            cancelled = owed.min(most);
+            Some(owed - cancelled)
+        });
+        cancelled
+    }
+}
+
 impl TenantSlot {
     fn new(limit: usize) -> Self {
         Self {
-            limit,
+            limit: AtomicUsize::new(limit),
             sem: Arc::new(Semaphore::new(limit)),
+            debt: Arc::default(),
             waiting: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
             refusals: AtomicU64::new(0),
         }
     }
 
-    /// Permits taken right now.
+    /// The cap in force.
+    fn limit(&self) -> usize {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    /// Permits taken right now: by sessions, or for a moment by the
+    /// collector of a lowered cap.
     fn in_use(&self) -> usize {
-        self.limit - self.sem.available_permits().min(self.limit)
+        let total = self
+            .limit()
+            .saturating_add(self.debt.owed.load(Ordering::Relaxed));
+        total.saturating_sub(self.sem.available_permits())
+    }
+
+    /// Change the cap of a running slot; returns the cap it replaces. No
+    /// holder is ever revoked.
+    ///
+    /// Raising it first writes off what an earlier lowering still owes, then
+    /// adds the rest as permits, which wake waiters in FIFO order. Lowering
+    /// it removes free permits at once; the permits that are held become a
+    /// debt, collected by one task that queues on the semaphore like a
+    /// client (behind the waiters already there, ahead of later ones) and
+    /// retires each permit it is handed. Until the debt is paid the tenant
+    /// holds more than its new cap and admits nobody new.
+    ///
+    /// Callers serialize resizes of one slot and run on the tokio runtime
+    /// (the collector is spawned on it); `new_limit` is within
+    /// `Semaphore::MAX_PERMITS` and above 0.
+    fn resize(&self, new_limit: usize) -> usize {
+        let old = self.limit.swap(new_limit, Ordering::Relaxed);
+        if new_limit > old {
+            let raise = new_limit - old;
+            let added = raise - self.debt.cancel(raise);
+            if added > 0 {
+                self.sem.add_permits(added);
+            }
+        } else if old > new_limit {
+            let lower = old - new_limit;
+            let owed = lower - self.sem.forget_permits(lower);
+            if owed > 0 {
+                self.debt.owed.fetch_add(owed, Ordering::AcqRel);
+                self.collect_debt();
+            }
+        }
+        old
+    }
+
+    /// Start the collector unless one is running.
+    fn collect_debt(&self) {
+        if self.debt.collecting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.debt.collecting.store(false, Ordering::Release);
+            tracing::error!(
+                "tenant cap lowered outside the runtime: held permits above the new cap are not collected"
+            );
+            return;
+        };
+        let (sem, debt) = (Arc::clone(&self.sem), Arc::clone(&self.debt));
+        runtime.spawn(async move {
+            loop {
+                while debt.owed.load(Ordering::Acquire) > 0 {
+                    // Never closed; an error would leave nothing to collect.
+                    let Ok(permit) = sem.acquire().await else {
+                        return;
+                    };
+                    let owed = update(&debt.owed, |owed| owed.checked_sub(1));
+                    if owed.is_ok() {
+                        permit.forget();
+                    }
+                    // Else a raise wrote the debt off while this waited: the
+                    // permit goes back to the tenant.
+                }
+                debt.collecting.store(false, Ordering::Release);
+                // A lowering that found `collecting` set just before it was
+                // cleared left its debt to this task.
+                if debt.owed.load(Ordering::Acquire) == 0
+                    || debt.collecting.swap(true, Ordering::AcqRel)
+                {
+                    return;
+                }
+            }
+        });
     }
 
     /// Count a refusal; returns the running total.
@@ -178,10 +405,12 @@ pub struct TenantBudget {
     /// Waits ended by a CancelRequest or the client going away.
     query_wait_cancels: AtomicU64,
     idle_permit_timeouts: AtomicU64,
-    /// 0 = no replay budget.
-    replay_limit: usize,
+    /// 0 = no replay budget. Changed only by a SIGHUP, never to or from 0
+    /// ([`TenantSlots::reload_caps`]).
+    replay_limit: AtomicUsize,
     replay_in_use: AtomicUsize,
     replay_refusals: AtomicU64,
+    journal: Option<Arc<TenantJournalBudget>>,
 }
 
 /// A request refused at its tenant's active-query cap. `nth` is the tenant's
@@ -226,6 +455,12 @@ pub struct TenantBudgetStats {
     /// Replay bytes the tenant's sessions hold right now.
     pub replay_bytes: usize,
     pub replay_refusals: u64,
+    /// The recovery-journal byte budget; zero means not configured.
+    pub journal_byte_limit: usize,
+    /// Recovery-journal bytes reserved by this tenant now.
+    pub journal_bytes: usize,
+    /// Reservations refused by the recovery-journal byte budget.
+    pub journal_refusals: u64,
 }
 
 impl TenantBudget {
@@ -235,7 +470,10 @@ impl TenantBudget {
         query_wait: Option<Duration>,
         idle_permit_timeout: Option<Duration>,
         replay_limit: usize,
+        journal_limit: usize,
     ) -> Self {
+        let journal =
+            (journal_limit > 0).then(|| TenantJournalBudget::new(tenant.clone(), journal_limit));
         Self {
             tenant,
             queries: (query_limit > 0).then(|| TenantSlot::new(query_limit)),
@@ -245,9 +483,10 @@ impl TenantBudget {
             queries_idle: AtomicUsize::new(0),
             query_wait_cancels: AtomicU64::new(0),
             idle_permit_timeouts: AtomicU64::new(0),
-            replay_limit,
+            replay_limit: AtomicUsize::new(replay_limit),
             replay_in_use: AtomicUsize::new(0),
             replay_refusals: AtomicU64::new(0),
+            journal,
         }
     }
 
@@ -260,7 +499,19 @@ impl TenantBudget {
     }
 
     pub fn has_replay_budget(&self) -> bool {
-        self.replay_limit > 0
+        self.replay_limit() > 0
+    }
+
+    fn replay_limit(&self) -> usize {
+        self.replay_limit.load(Ordering::Relaxed)
+    }
+
+    pub fn has_journal_budget(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    pub fn journal_budget(&self) -> Option<&Arc<TenantJournalBudget>> {
+        self.journal.as_ref()
     }
 
     pub fn idle_permit_timeout(&self) -> Option<Duration> {
@@ -300,7 +551,7 @@ impl TenantBudget {
             .await
         {
             Ok((p, waited)) => Ok((p, Some(waited))),
-            Err(nth) => Err(self.refusal(slot.limit, nth)),
+            Err(nth) => Err(self.refusal(slot.limit(), nth)),
         }
     }
 
@@ -331,7 +582,7 @@ impl TenantBudget {
         let q = self.queries.as_ref();
         TenantBudgetStats {
             tenant: self.tenant.clone(),
-            query_limit: q.map_or(0, |s| s.limit),
+            query_limit: q.map_or(0, TenantSlot::limit),
             queries_active: q.map_or(0, TenantSlot::in_use),
             queries_idle: self.queries_idle.load(Ordering::Relaxed),
             queries_waiting: q.map_or(0, |s| s.waiting.load(Ordering::Relaxed)),
@@ -340,9 +591,12 @@ impl TenantBudget {
             query_refusals: q.map_or(0, |s| s.refusals.load(Ordering::Relaxed)),
             query_wait_cancels: self.query_wait_cancels.load(Ordering::Relaxed),
             idle_permit_timeouts: self.idle_permit_timeouts.load(Ordering::Relaxed),
-            replay_byte_limit: self.replay_limit,
+            replay_byte_limit: self.replay_limit(),
             replay_bytes: self.replay_in_use.load(Ordering::Relaxed),
             replay_refusals: self.replay_refusals.load(Ordering::Relaxed),
+            journal_byte_limit: self.journal.as_ref().map_or(0, |budget| budget.limit()),
+            journal_bytes: self.journal.as_ref().map_or(0, |budget| budget.used()),
+            journal_refusals: self.journal.as_ref().map_or(0, |budget| budget.refusals()),
         }
     }
 }
@@ -428,7 +682,7 @@ impl TenantCharge {
     /// budget (one CAS). A shrink always succeeds. Counts a refusal on
     /// failure. Without a replay budget: `true`, touching nothing.
     pub fn replay_reserve(&self, retained: usize) -> bool {
-        let limit = self.budget.replay_limit;
+        let limit = self.budget.replay_limit();
         if limit == 0 {
             return true;
         }
@@ -465,7 +719,7 @@ impl TenantCharge {
     /// on `false` says so with [`Self::note_replay_refusal`]. Without a
     /// replay budget: `true`, touching nothing.
     pub fn replay_room(&self, retained: usize) -> bool {
-        let limit = self.budget.replay_limit;
+        let limit = self.budget.replay_limit();
         if limit == 0 {
             return true;
         }
@@ -485,7 +739,7 @@ impl TenantCharge {
     /// Set this session's charge to `retained` bytes. Without a replay
     /// budget: a no-op.
     pub fn replay_settle(&self, retained: usize) {
-        if self.budget.replay_limit == 0 {
+        if self.budget.replay_limit() == 0 {
             return;
         }
         let prev = self.replay_charged.swap(retained, Ordering::Relaxed);
@@ -562,6 +816,59 @@ pub struct TenantSlots {
     /// A cancel can tell which session sent it only when exactly one live
     /// session holds the key, so only then does it end that session's wait.
     cancel_keys: dashmap::DashMap<(u32, u32), KeyHolders>,
+    /// Serializes [`Self::reload_caps`].
+    resizing: parking_lot::Mutex<()>,
+}
+
+/// Which per-tenant cap a reload changed ([`TenantSlots::reload_caps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantCap {
+    Clients,
+    ActiveQueries,
+    ReplayBytes,
+    JournalBytes,
+}
+
+impl TenantCap {
+    const ALL: [Self; 4] = [
+        Self::Clients,
+        Self::ActiveQueries,
+        Self::ReplayBytes,
+        Self::JournalBytes,
+    ];
+
+    /// The `[multi_tenancy]` keys that set it.
+    pub fn keys(self) -> &'static str {
+        match self {
+            Self::Clients => "max_clients_per_tenant / tenant_max_clients",
+            Self::ActiveQueries => "max_active_queries_per_tenant / tenant_max_active_queries",
+            Self::ReplayBytes => "max_replay_bytes_per_tenant / tenant_max_replay_bytes",
+            Self::JournalBytes => "max_journal_bytes_per_tenant / tenant_max_journal_bytes",
+        }
+    }
+
+    fn configured(self, config: &MultiTenancyToml, tenant: &str) -> usize {
+        match self {
+            Self::Clients => config.client_cap(tenant),
+            Self::ActiveQueries => config.active_query_cap(tenant),
+            Self::ReplayBytes => config.replay_byte_cap(tenant),
+            Self::JournalBytes => config.journal_byte_cap(tenant),
+        }
+    }
+
+    /// A semaphore of permits, as opposed to a byte counter.
+    fn counts_permits(self) -> bool {
+        matches!(self, Self::Clients | Self::ActiveQueries)
+    }
+}
+
+/// One cap a reload resized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantCapChange {
+    pub tenant: String,
+    pub cap: TenantCap,
+    pub from: usize,
+    pub to: usize,
 }
 
 impl TenantSlots {
@@ -586,8 +893,12 @@ impl TenantSlots {
             .tenants
             .iter()
             .filter_map(|t| {
-                let (queries, replay) = (mt.active_query_cap(t), mt.replay_byte_cap(t));
-                (queries > 0 || replay > 0).then(|| {
+                let (queries, replay, journal) = (
+                    mt.active_query_cap(t),
+                    mt.replay_byte_cap(t),
+                    mt.journal_byte_cap(t),
+                );
+                (queries > 0 || replay > 0 || journal > 0).then(|| {
                     (
                         t.clone(),
                         Arc::new(TenantBudget::new(
@@ -596,6 +907,7 @@ impl TenantSlots {
                             query_wait,
                             idle_permit_timeout,
                             replay,
+                            journal,
                         )),
                     )
                 })
@@ -614,7 +926,7 @@ impl TenantSlots {
         let track_cancel_keys = budgets.values().any(|b| b.has_query_cap());
         if track_cancel_keys && Self::vanished_clients_keep_permits(config) {
             tracing::warn!(
-                "[multi_tenancy] active-query caps with [limits] client_tcp_keepalive_secs = 0: a client that vanishes without closing its connection while its session holds a permit keeps that permit until the proxy restarts unless a timeout ends the session; idle_permit_timeout_ms ends only one idle in a transaction or holding advisory locks, [limits] client_idle_timeout_secs also one in the middle of an extended cycle, and nothing ends one in a stalled COPY or with a message partly received"
+                "[multi_tenancy] active-query caps with [limits] client_tcp_keepalive_secs = 0: a client that vanishes without closing its connection while its session holds a permit keeps that permit until the proxy restarts unless a timeout ends the session; idle_permit_timeout_ms ends only one idle in a transaction or holding advisory locks, [limits] client_idle_timeout_secs also one in the middle of an extended cycle, copy_idle_timeout_secs can bound a stalled COPY, but a partly received non-COPY message has no idle deadline"
             );
         }
         Self {
@@ -624,6 +936,114 @@ impl TenantSlots {
             budgets,
             track_cancel_keys,
             cancel_keys: dashmap::DashMap::new(),
+            resizing: parking_lot::Mutex::new(()),
+        }
+    }
+
+    /// Apply a reloaded `[multi_tenancy]` to the running caps (SIGHUP).
+    ///
+    /// A reload may resize a cap or byte budget that a tenant already has:
+    /// its client cap, its active-query cap, its replay-byte budget and its
+    /// recovery-journal budget. Everything else is built once at startup and
+    /// is refused here, naming the first reason: any other key of the
+    /// section, and a cap or budget that would be added to or removed from a
+    /// tenant (0 on one side), since sessions decide at their start which of
+    /// them they take part in. All or nothing: a refused reload changes no
+    /// cap. Returns what changed, by tenant.
+    ///
+    /// A raised cap admits waiters at once, in FIFO order. A lowered cap
+    /// never ends a session or a request: the tenant admits nobody new until
+    /// enough of its holders have finished (see [`TenantSlot::resize`]); a
+    /// lowered byte budget refuses growth until the tenant's use is back
+    /// under it. Must run on the tokio runtime.
+    pub fn reload_caps(
+        &self,
+        old: &MultiTenancyToml,
+        new: &MultiTenancyToml,
+    ) -> std::result::Result<Vec<TenantCapChange>, String> {
+        if old.without_caps() != new.without_caps() {
+            return Err("a key other than the per-tenant caps and byte budgets changed".into());
+        }
+        if !new.enabled {
+            // Nothing is enforced, so there is nothing to resize.
+            return Ok(Vec::new());
+        }
+        let _serialized = self.resizing.lock();
+        let mut changes = Vec::new();
+        for tenant in &new.tenants {
+            for cap in TenantCap::ALL {
+                let (from, to) = (cap.configured(old, tenant), cap.configured(new, tenant));
+                if from == to {
+                    continue;
+                }
+                if from == 0 || to == 0 {
+                    return Err(format!(
+                        "tenant \"{tenant}\": {} cannot be added or removed while running ({from} -> {to})",
+                        cap.keys()
+                    ));
+                }
+                if cap.counts_permits() && to > Semaphore::MAX_PERMITS {
+                    return Err(format!(
+                        "tenant \"{tenant}\": {} must be <= {}",
+                        cap.keys(),
+                        Semaphore::MAX_PERMITS
+                    ));
+                }
+                if !self.has_cap(tenant, cap) {
+                    return Err(format!(
+                        "tenant \"{tenant}\": {} is not enforced by this process",
+                        cap.keys()
+                    ));
+                }
+                changes.push(TenantCapChange {
+                    tenant: tenant.clone(),
+                    cap,
+                    from,
+                    to,
+                });
+            }
+        }
+        for change in &changes {
+            self.set_cap(&change.tenant, change.cap, change.to);
+        }
+        Ok(changes)
+    }
+
+    /// Whether `tenant` runs under `cap` (it was above 0 at startup).
+    fn has_cap(&self, tenant: &str, cap: TenantCap) -> bool {
+        let budget = self.budgets.get(tenant);
+        match cap {
+            TenantCap::Clients => self.tenants.contains_key(tenant),
+            TenantCap::ActiveQueries => budget.is_some_and(|b| b.has_query_cap()),
+            TenantCap::ReplayBytes => budget.is_some_and(|b| b.has_replay_budget()),
+            TenantCap::JournalBytes => budget.is_some_and(|b| b.has_journal_budget()),
+        }
+    }
+
+    /// Resize a cap [`Self::has_cap`] confirmed; `to` is above 0.
+    fn set_cap(&self, tenant: &str, cap: TenantCap, to: usize) {
+        let budget = self.budgets.get(tenant);
+        match cap {
+            TenantCap::Clients => {
+                if let Some(slot) = self.tenants.get(tenant) {
+                    slot.resize(to);
+                }
+            }
+            TenantCap::ActiveQueries => {
+                if let Some(slot) = budget.and_then(|b| b.queries.as_ref()) {
+                    slot.resize(to);
+                }
+            }
+            TenantCap::ReplayBytes => {
+                if let Some(budget) = budget {
+                    budget.replay_limit.store(to, Ordering::Relaxed);
+                }
+            }
+            TenantCap::JournalBytes => {
+                if let Some(journal) = budget.and_then(|b| b.journal.as_ref()) {
+                    journal.limit.store(to, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -671,6 +1091,14 @@ impl TenantSlots {
         self.tenants.contains_key(value).then_some(value)
     }
 
+    /// The configured tenant (`[multi_tenancy] tenants`) a startup packet
+    /// names, capped or not; `None` with multi-tenancy off. What plugin
+    /// hooks are told the session's tenant is.
+    pub fn configured_tenant_of<'p>(&self, params: &'p HashMap<String, String>) -> Option<&'p str> {
+        let value = self.key(params)?;
+        self.known.contains(value).then_some(value)
+    }
+
     /// Take a slot of `tenant` for a new client session. Uncapped or unknown
     /// tenant: `None` at once. Full: refuse at once without `wait`, else wait
     /// up to `wait` in FIFO order. Returns the wait in the second value when
@@ -693,7 +1121,7 @@ impl TenantSlots {
             Ok((p, waited)) => Ok((Some(p), Some(waited))),
             Err(_) => Err(TenantRefusal {
                 tenant: tenant.to_string(),
-                limit: slot.limit,
+                limit: slot.limit(),
             }),
         }
     }
@@ -706,7 +1134,7 @@ impl TenantSlots {
             .iter()
             .map(|(tenant, s)| TenantSlotStats {
                 tenant: tenant.clone(),
-                limit: s.limit,
+                limit: s.limit(),
                 in_use: s.in_use(),
                 waiting: s.waiting.load(Ordering::Relaxed),
                 waits: s.waits.load(Ordering::Relaxed),
@@ -841,6 +1269,108 @@ impl TenantSlots {
 mod tests {
     use super::*;
 
+    #[test]
+    fn update_behaves_as_fetch_update() {
+        let a = AtomicUsize::new(5);
+        assert_eq!(update(&a, |v| Some(v + 2)), Ok(5));
+        assert_eq!(a.load(Ordering::SeqCst), 7);
+        assert_eq!(update(&a, |v| v.checked_sub(8)), Err(7));
+        assert_eq!(a.load(Ordering::SeqCst), 7);
+        // Concurrent updaters lose nothing.
+        let a = std::sync::Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let a = std::sync::Arc::clone(&a);
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        update(&a, |v| Some(v + 1)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(a.load(Ordering::SeqCst), 40_000);
+    }
+
+    #[test]
+    fn journal_budget_reserves_exact_boundary_and_releases_with_charge() {
+        let budget = TenantJournalBudget::new("acme", 100);
+        let first = budget.try_reserve(60).unwrap();
+        let second = budget.try_reserve(40).unwrap();
+        assert_eq!(budget.used(), 100);
+        assert!(budget.try_reserve(1).is_none());
+        assert_eq!(budget.used(), 100);
+        assert_eq!(budget.refusals(), 1);
+        drop(first);
+        assert_eq!(budget.used(), 40);
+        drop(second);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn journal_budgets_are_isolated_and_concurrent_reservations_do_not_oversubscribe() {
+        let acme = TenantJournalBudget::new("acme", 100);
+        let other = TenantJournalBudget::new("other", 10);
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let budget = Arc::clone(&acme);
+                std::thread::spawn(move || budget.try_reserve(16))
+            })
+            .collect();
+        let charges: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(charges.len(), 6);
+        assert_eq!(acme.used(), 96);
+        assert_eq!(acme.refusals(), 10);
+        let independent = other.try_reserve(10).unwrap();
+        assert_eq!(other.used(), 10);
+        drop(charges);
+        assert_eq!(acme.used(), 0);
+        drop(independent);
+        assert_eq!(other.used(), 0);
+    }
+
+    #[test]
+    fn unlimited_journal_budget_still_rejects_arithmetic_overflow() {
+        let budget = TenantJournalBudget::new("uncapped", 0);
+        let charge = budget.try_reserve(usize::MAX).unwrap();
+        assert!(budget.try_reserve(1).is_none());
+        assert_eq!(budget.used(), usize::MAX);
+        drop(charge);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn journal_only_config_constructs_and_reports_a_tenant_budget() {
+        let mut config = ProxyConfig::default();
+        config.multi_tenancy.enabled = true;
+        config.multi_tenancy.tenants = vec!["acme".into(), "other".into()];
+        config.multi_tenancy.max_journal_bytes_per_tenant = 128;
+        let slots = TenantSlots::from_config(&config);
+        let budget = slots.budget("acme").unwrap();
+        assert!(!budget.has_query_cap());
+        assert!(!budget.has_replay_budget());
+        assert!(budget.has_journal_budget());
+        let charge = budget.journal_budget().unwrap().try_reserve(32).unwrap();
+        let stats = slots.budget_stats();
+        let row = stats.iter().find(|row| row.tenant == "acme").unwrap();
+        assert_eq!((row.journal_byte_limit, row.journal_bytes), (128, 32));
+        let other_budget = slots.budget("other").unwrap();
+        let other_charge = other_budget
+            .journal_budget()
+            .unwrap()
+            .try_reserve(128)
+            .unwrap();
+        assert_eq!(other_budget.journal_budget().unwrap().used(), 128);
+        drop(charge);
+        assert_eq!(slots.budget_stats()[0].journal_bytes, 0);
+        drop(other_charge);
+    }
+
     fn slots(per_tenant: usize, overrides: &[(&str, usize)]) -> TenantSlots {
         let mut config = ProxyConfig::default();
         config.multi_tenancy.enabled = true;
@@ -878,6 +1408,24 @@ mod tests {
         config.multi_tenancy.tenants = vec!["big".into()];
         config.multi_tenancy.max_clients_per_tenant = 1;
         assert!(TenantSlots::from_config(&config).is_empty());
+    }
+
+    /// An uncapped tenant takes no slot but is still the session's
+    /// configured tenant; with multi-tenancy off there is none.
+    #[test]
+    fn an_uncapped_tenant_is_still_a_configured_tenant() {
+        let mut config = ProxyConfig::default();
+        config.multi_tenancy.enabled = true;
+        config.multi_tenancy.identify_by = "user".into();
+        config.multi_tenancy.tenants = vec!["acme".into()];
+        let s = TenantSlots::from_config(&config);
+        let acme = params(&[("user", "acme")]);
+        assert_eq!(s.tenant_of(&acme), None);
+        assert_eq!(s.configured_tenant_of(&acme), Some("acme"));
+        assert_eq!(s.configured_tenant_of(&params(&[("user", "x")])), None);
+        config.multi_tenancy.enabled = false;
+        let off = TenantSlots::from_config(&config);
+        assert_eq!(off.configured_tenant_of(&acme), None);
     }
 
     #[test]
@@ -1392,5 +1940,310 @@ mod tests {
         );
         config.limits.client_tcp_keepalive_secs = 1;
         assert!(!TenantSlots::vanished_clients_keep_permits(&config));
+    }
+
+    /// Let a spawned debt collector run on the test's current-thread runtime.
+    async fn settled() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Lowering a cap below its holders revokes nobody: the holders keep
+    /// their permits, nobody new is admitted until they are back under the
+    /// new cap, and each permit they return while over it is retired.
+    #[tokio::test]
+    async fn a_lowered_cap_collects_held_permits_as_they_return() {
+        let slot = TenantSlot::new(3);
+        let mut held: Vec<_> = (0..3)
+            .map(|_| slot.sem.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(slot.resize(1), 3);
+        settled().await;
+        assert_eq!((slot.limit(), slot.in_use()), (1, 3));
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 2);
+
+        drop(held.pop());
+        settled().await;
+        assert_eq!(slot.in_use(), 2);
+        assert!(slot.sem.try_acquire().is_err(), "still over the new cap");
+        drop(held.pop());
+        settled().await;
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (1, 0));
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 0);
+        assert!(slot.sem.try_acquire().is_err(), "at the new cap");
+        assert!(!slot.debt.collecting.load(Ordering::Relaxed));
+
+        drop(held.pop());
+        settled().await;
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (0, 1));
+
+        // A second lowering starts a collector again; free permits go first.
+        assert_eq!(slot.resize(4), 1);
+        let held: Vec<_> = (0..3)
+            .map(|_| slot.sem.clone().try_acquire_owned().unwrap())
+            .collect();
+        slot.resize(2);
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 1);
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (3, 0));
+        drop(held);
+        settled().await;
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (0, 2));
+    }
+
+    /// Raising a cap writes off what a lowering still owes before it adds
+    /// permits, so the semaphore never holds more than the cap in force.
+    #[tokio::test]
+    async fn a_raised_cap_writes_off_the_debt_first() {
+        let slot = TenantSlot::new(4);
+        let held: Vec<_> = (0..4)
+            .map(|_| slot.sem.clone().try_acquire_owned().unwrap())
+            .collect();
+        slot.resize(1);
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 3);
+        // 1 -> 3 only forgives two of the three owed permits.
+        slot.resize(3);
+        settled().await;
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 1);
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (4, 0));
+        // 3 -> 6 forgives the last one and adds two.
+        slot.resize(6);
+        settled().await;
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 0);
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (4, 2));
+        assert!(!slot.debt.collecting.load(Ordering::Relaxed));
+        drop(held);
+        settled().await;
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (0, 6));
+    }
+
+    /// A raised cap admits the waiters in FIFO order; the collector of a
+    /// lowered cap queues behind the waiters that were already there.
+    #[tokio::test]
+    async fn resizing_keeps_the_fifo_order_of_waiters() {
+        let slot = Arc::new(TenantSlot::new(2));
+        let first = slot.sem.clone().try_acquire_owned().unwrap();
+        let second = slot.sem.clone().try_acquire_owned().unwrap();
+        let waiter = {
+            let slot = Arc::clone(&slot);
+            tokio::spawn(async move { slot.sem.clone().acquire_owned().await.unwrap() })
+        };
+        settled().await;
+        slot.resize(1);
+        settled().await;
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 1);
+
+        // The earlier waiter is served before the collector...
+        drop(first);
+        let admitted = waiter.await.unwrap();
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 1);
+        assert_eq!(slot.in_use(), 2);
+        // ...which retires the next permit that returns.
+        drop(second);
+        settled().await;
+        assert_eq!(slot.debt.owed.load(Ordering::Relaxed), 0);
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (1, 0));
+
+        let waiter = {
+            let slot = Arc::clone(&slot);
+            tokio::spawn(async move { slot.sem.clone().acquire_owned().await.unwrap() })
+        };
+        settled().await;
+        assert!(!waiter.is_finished());
+        slot.resize(2);
+        let raised = waiter.await.unwrap();
+        assert_eq!((slot.in_use(), slot.sem.available_permits()), (2, 0));
+        drop((admitted, raised));
+    }
+
+    fn tenancy(edit: impl FnOnce(&mut MultiTenancyToml)) -> ProxyConfig {
+        let mut config = ProxyConfig::default();
+        let mt = &mut config.multi_tenancy;
+        mt.enabled = true;
+        mt.tenants = vec!["acme".into(), "globex".into()];
+        mt.max_clients_per_tenant = 2;
+        mt.max_active_queries_per_tenant = 2;
+        mt.max_replay_bytes_per_tenant = 100;
+        mt.max_journal_bytes_per_tenant = 100;
+        mt.tenant_max_clients.insert("globex".into(), 0);
+        edit(mt);
+        config
+    }
+
+    /// A reload resizes the caps and byte budgets tenants already have, for
+    /// the tenants it names, and reports each change.
+    #[tokio::test]
+    async fn a_reload_resizes_existing_caps_and_budgets() {
+        let old = tenancy(|_| {});
+        let slots = TenantSlots::from_config(&old);
+        let new = tenancy(|mt| {
+            mt.tenant_max_clients.insert("acme".into(), 5);
+            mt.max_active_queries_per_tenant = 1;
+            mt.tenant_max_replay_bytes.insert("acme".into(), 40);
+            mt.tenant_max_journal_bytes.insert("globex".into(), 300);
+        });
+
+        // In use before the reload: both of acme's query permits, 60 of its
+        // replay bytes.
+        let acme = slots.budget("acme").unwrap().clone();
+        let queries = (
+            acme.try_acquire_query().unwrap(),
+            acme.try_acquire_query().unwrap(),
+        );
+        let charge = TenantCharge::new(acme.clone());
+        assert!(charge.replay_reserve(60));
+
+        let mut changes = slots
+            .reload_caps(&old.multi_tenancy, &new.multi_tenancy)
+            .unwrap();
+        changes.sort_by(|a, b| (&a.tenant, a.cap.keys()).cmp(&(&b.tenant, b.cap.keys())));
+        let change = |tenant: &str, cap, from, to| TenantCapChange {
+            tenant: tenant.into(),
+            cap,
+            from,
+            to,
+        };
+        assert_eq!(
+            changes,
+            vec![
+                change("acme", TenantCap::ActiveQueries, 2, 1),
+                change("acme", TenantCap::Clients, 2, 5),
+                change("acme", TenantCap::ReplayBytes, 100, 40),
+                change("globex", TenantCap::ActiveQueries, 2, 1),
+                change("globex", TenantCap::JournalBytes, 100, 300),
+            ]
+        );
+
+        assert_eq!(
+            slots
+                .stats()
+                .iter()
+                .map(|t| (t.tenant.as_str(), t.limit))
+                .collect::<Vec<_>>(),
+            vec![("acme", 5)]
+        );
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(slots.acquire("acme", None).await.unwrap().0.unwrap());
+        }
+        assert_eq!(slots.acquire("acme", None).await.unwrap_err().limit, 5);
+        drop(held);
+
+        // The lowered query cap: both holders stay, nobody new until one
+        // permit has been retired and the other returned.
+        let stats = |tenant: &str| {
+            slots
+                .budget_stats()
+                .into_iter()
+                .find(|row| row.tenant == tenant)
+                .unwrap()
+        };
+        assert_eq!(
+            (stats("acme").query_limit, stats("acme").queries_active),
+            (1, 2)
+        );
+        drop(queries.0);
+        settled().await;
+        assert!(acme.try_acquire_query().is_none());
+        assert_eq!(stats("acme").queries_active, 1);
+        drop(queries.1);
+        settled().await;
+        let again = acme.try_acquire_query().unwrap();
+        assert!(acme.try_acquire_query().is_none());
+        drop(again);
+
+        // The lowered replay budget: the 60 bytes in use stay charged, growth
+        // is refused until the tenant is back under 40.
+        assert_eq!(
+            (stats("acme").replay_byte_limit, stats("acme").replay_bytes),
+            (40, 60)
+        );
+        assert!(!charge.replay_reserve(61));
+        assert!(charge.replay_reserve(30));
+        assert!(charge.replay_reserve(40));
+        assert!(!charge.replay_reserve(41));
+
+        let globex = slots.budget("globex").unwrap().journal_budget().unwrap();
+        assert_eq!(globex.limit(), 300);
+        assert!(globex.try_reserve(300).is_some());
+        assert_eq!(stats("acme").journal_byte_limit, 100);
+    }
+
+    /// Anything a running process cannot follow refuses the whole reload and
+    /// changes nothing: another key of the section, and a cap that would be
+    /// added to or removed from a tenant.
+    #[tokio::test]
+    async fn a_reload_that_is_more_than_a_resize_changes_nothing() {
+        let old = tenancy(|_| {});
+        let slots = TenantSlots::from_config(&old);
+        let limits = || {
+            let rows = slots.budget_stats();
+            (
+                slots.stats().iter().map(|t| t.limit).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|r| (r.query_limit, r.replay_byte_limit, r.journal_byte_limit))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let before = limits();
+        let refused = |edit: fn(&mut MultiTenancyToml)| {
+            // Each refused reload also asks for a resize that would apply.
+            let new = tenancy(|mt| {
+                mt.max_active_queries_per_tenant = 7;
+                edit(mt);
+            });
+            let reason = slots
+                .reload_caps(&old.multi_tenancy, &new.multi_tenancy)
+                .unwrap_err();
+            assert_eq!(limits(), before, "{reason}");
+            reason
+        };
+
+        assert!(refused(|mt| mt.tenants.push("initech".into())).contains("other than"));
+        assert!(refused(|mt| mt.identify_by = "database".into()).contains("other than"));
+        assert!(refused(|mt| mt.active_query_wait_ms += 1).contains("other than"));
+        assert!(refused(|mt| mt.idle_permit_timeout_ms += 1).contains("other than"));
+        // globex has no client cap (override 0): one cannot be added...
+        let added = refused(|mt| {
+            mt.tenant_max_clients.insert("globex".into(), 3);
+        });
+        assert!(
+            added.contains("globex") && added.contains("0 -> 3"),
+            "{added}"
+        );
+        // ...and acme's replay budget cannot be removed.
+        let removed = refused(|mt| {
+            mt.tenant_max_replay_bytes.insert("acme".into(), 0);
+        });
+        assert!(
+            removed.contains("acme") && removed.contains("100 -> 0"),
+            "{removed}"
+        );
+        let over = refused(|mt| {
+            mt.tenant_max_clients
+                .insert("acme".into(), Semaphore::MAX_PERMITS + 1);
+        });
+        assert!(over.contains("must be <="), "{over}");
+
+        // A process that enforces nothing (the section is off) accepts any
+        // cap values and resizes nothing.
+        let off = tenancy(|mt| mt.enabled = false);
+        let off_slots = TenantSlots::from_config(&off);
+        let off_new = tenancy(|mt| {
+            mt.enabled = false;
+            mt.max_clients_per_tenant = 9;
+        });
+        assert_eq!(
+            off_slots.reload_caps(&off.multi_tenancy, &off_new.multi_tenancy),
+            Ok(Vec::new())
+        );
+        // One that does not run the caps its config names refuses.
+        assert!(TenantSlots::default()
+            .reload_caps(
+                &old.multi_tenancy,
+                &tenancy(|mt| mt.max_clients_per_tenant = 3).multi_tenancy
+            )
+            .unwrap_err()
+            .contains("not enforced"));
     }
 }

@@ -49,10 +49,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
+      # Same feature set as the Docker image (docker/Dockerfile) and the CI
+      # matrix: `all-features` carries no topology provider, and without
+      # `postgres-topology` a `[topology] provider = "postgres"` / "patroni"
+      # config is refused, leaving the binary on static roles only.
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} --features all-features
+        run: cargo build --release --target ${{ matrix.target }} --features "all-features,postgres-topology"
 
       - name: Package artifact
         shell: bash
@@ -85,9 +89,19 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # The release body is docs/releases/<version>.md when the tag has one
+      # (v3.0.0 -> docs/releases/3.0.0.md), followed by GitHub's generated list
+      # of merged pull requests; without one, the generated list alone.
+      - name: Release notes
+        id: notes
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME#v}.md"
+          if [ -f "$notes" ]; then echo "body_path=$notes" >> "$GITHUB_OUTPUT"; fi
+
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
+          body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: true
           files: artifacts/*
         env:

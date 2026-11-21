@@ -30,6 +30,8 @@ pub struct GraphqlGateway {
     /// H-06: the PG-wire request policies (rate limit per request; rewrite
     /// and circuit breaker per generated statement, in the engine).
     policy: crate::gateway_policy::SharedGatewayPolicy,
+    /// The daemon's shutdown drain (stop accepting, count in-flight requests).
+    drain: crate::gateway_drain::GatewayDrain,
 }
 
 impl GraphqlGateway {
@@ -80,7 +82,15 @@ impl GraphqlGateway {
             engine: Arc::new(engine),
             admission,
             policy: Arc::new(crate::gateway_policy::GatewayPolicy::default()),
+            drain: crate::gateway_drain::GatewayDrain::new(),
         }
+    }
+
+    /// Take part in the daemon's shutdown drain: stop accepting when it
+    /// closes, and count each accepted request until it is answered.
+    pub fn with_drain(mut self, drain: crate::gateway_drain::GatewayDrain) -> Self {
+        self.drain = drain;
+        self
     }
 
     /// Apply the PG-wire request policies to this gateway (H-06).
@@ -106,19 +116,30 @@ impl GraphqlGateway {
         let engine = self.engine.clone();
         let admission = self.admission.clone();
         let policy = self.policy.clone();
+        let drain = self.drain.clone();
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                () = drain.closed() => {
+                    tracing::info!(addr = %config.listen_address, "GraphQL gateway draining: listener closed");
+                    return Ok(());
+                }
+                accepted = listener.accept() => accepted,
+            };
+            let (stream, peer) = match accepted {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!("GraphQL gateway accept error: {}", e);
                     continue;
                 }
             };
+            let in_flight = drain.track();
             let config = config.clone();
             let engine = engine.clone();
             let admission = admission.clone();
             let policy = policy.clone();
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 if let Err(e) =
                     Self::handle_with(stream, Some(peer.ip()), config, engine, admission, policy)
                         .await

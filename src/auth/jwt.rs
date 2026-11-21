@@ -43,6 +43,11 @@ pub enum JwtError {
 
     #[error("JWKS fetch failed: {0}")]
     JwksFetchFailed(String),
+
+    /// The requested operation is not implemented in this release. It fails
+    /// closed instead of installing fabricated keys.
+    #[error("Not supported: {0}")]
+    NotSupported(String),
 }
 
 /// JWT validator
@@ -251,36 +256,28 @@ impl JwtValidator {
         }
     }
 
-    /// Refresh JWKS from remote endpoint
+    /// Refresh JWKS from the configured remote endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`JwtError::NotSupported`] in this release: fetching a
+    /// JWKS over HTTP is not implemented. The installed key set and the last
+    /// refresh time are left unchanged. Use [`JwtValidator::set_hs256_secret`]
+    /// to verify tokens against a configured shared secret.
     pub async fn refresh_jwks(&self) -> Result<(), JwtError> {
-        // In a real implementation, this would fetch JWKS from the configured URL
-        // using an HTTP client like reqwest.
-        //
-        // For demonstration, we create a dummy JWKS.
-
-        let jwks = Jwks {
-            keys: vec![Jwk {
-                kty: "RSA".to_string(),
-                kid: Some("default".to_string()),
-                alg: Some("RS256".to_string()),
-                use_: Some("sig".to_string()),
-                n: Some("dummy_modulus".to_string()),
-                e: Some("AQAB".to_string()),
-                x: None,
-                y: None,
-                crv: None,
-                k: None,
-            }],
-        };
-
-        *self.jwks.write() = jwks;
-        *self.last_refresh.write() = Some(Instant::now());
-
-        Ok(())
+        Err(JwtError::NotSupported(format!(
+            "fetching a JWKS over HTTP ({}) is not supported in this release",
+            self.config.jwks_url
+        )))
     }
 
     /// Check if JWKS needs refresh
     pub fn needs_refresh(&self) -> bool {
+        // Without a JWKS URL the keys are static (e.g. an HS256 secret):
+        // there is nothing to fetch.
+        if self.config.jwks_url.is_empty() {
+            return false;
+        }
         match *self.last_refresh.read() {
             Some(last) => last.elapsed() > self.config.jwks_refresh_interval,
             None => true,
@@ -551,6 +548,38 @@ mod tests {
             validator.validate("only.two"),
             Err(JwtError::InvalidFormat)
         ));
+    }
+
+    #[tokio::test]
+    async fn refresh_jwks_fails_closed_and_keeps_keys() {
+        let validator = JwtValidator::new(test_config());
+        match validator.refresh_jwks().await {
+            Err(JwtError::NotSupported(msg)) => {
+                assert!(
+                    msg.contains("https://example.com/.well-known/jwks.json"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+        assert!(validator.jwks.read().is_empty());
+        assert!(validator.last_refresh_time().is_none());
+        assert!(validator.needs_refresh());
+
+        // A configured HS256 secret survives a failed refresh and still verifies.
+        let v = hs256_validator(b"top-secret");
+        assert!(v.refresh_jwks().await.is_err());
+        let token = hs256_token(b"top-secret", &future_claims());
+        assert_eq!(v.validate(&token).expect("HS256 still valid").sub, "alice");
+    }
+
+    #[test]
+    fn static_keys_need_no_jwks_refresh() {
+        let mut config = test_config();
+        config.jwks_url = String::new();
+        assert!(!JwtValidator::new(config).needs_refresh());
+        // With a JWKS URL and no refresh yet, a refresh is due.
+        assert!(JwtValidator::new(test_config()).needs_refresh());
     }
 
     // ---- HS256 signature verification (real crypto; closes the accept-all hole) ----

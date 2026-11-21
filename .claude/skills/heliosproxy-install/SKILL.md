@@ -27,34 +27,35 @@ minimal; opt in to feature flags explicitly.
 | `cargo install heliosdb-proxy` | Production / operator install — pulls from crates.io |
 | `cargo install --git github.com/HeliosDatabase/HeliosDB-Proxy` | Pre-release / unreleased commit |
 | `git clone … && cargo build --release` | Developer install with `--features` matrix |
-| `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1` | Container deploy (Docker/K8s) |
+| Prebuilt binary from a GitHub release | Linux / macOS x86_64 and aarch64, built with `all-features,postgres-topology` |
+| `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0` | Container deploy (Docker/K8s) |
 
 ## Recipes
 
 ### Recipe 1: Install latest from crates.io (default features)
 
 ```bash
-cargo install heliosdb-proxy
+cargo install heliosdb-proxy --locked
 heliosdb-proxy --version
-# heliosdb-proxy 0.4.1
+# heliosdb-proxy 3.0.0
 ```
 
-Default features: `pool-modes` only. For more, see Recipe 3.
+Default features: `pool-modes` (Transaction Replay is always built in). For more, see Recipe 3. `cargo install` also installs the `helios-plugin` CLI.
 
-Requires Rust 1.75+ (MSRV). Check with `rustc --version`. If older,
+Requires Rust 1.86+ (MSRV). Check with `rustc --version`. If older,
 install Rust via `rustup` first.
 
 ### Recipe 2: Install a specific version
 
 ```bash
-cargo install heliosdb-proxy --version 0.4.1
+cargo install heliosdb-proxy --version 3.0.0 --locked
 ```
 
 Or pin in `Cargo.toml` as a library dep:
 
 ```toml
 [dependencies]
-heliosdb-proxy = "0.4.1"
+heliosdb-proxy = "3.0.0"   # 3.0 changed the library API; see CHANGELOG
 ```
 
 ### Recipe 3: Install with all features
@@ -79,7 +80,7 @@ which feature unlocks which skill.
 
 ```bash
 git clone git@github.com:HeliosDatabase/HeliosDB-Proxy.git
-cd HDB-HeliosDB-Proxy
+cd HeliosDB-Proxy
 cargo build --release --features all-features
 ./target/release/heliosdb-proxy --version
 ```
@@ -94,8 +95,8 @@ cargo build --features wasm-plugins,ha-tr,anomaly-detection
 ### Recipe 5: Docker image
 
 ```bash
-docker pull ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1
-docker run --rm ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1 --version
+docker pull ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0
+docker run --rm ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0 --version
 ```
 
 The image is published by `.github/workflows/docker.yml` on every
@@ -109,16 +110,16 @@ docker build -t my-heliosproxy:dev -f docker/Dockerfile .
 
 ```bash
 heliosdb-proxy --help                  # subcommands + flags
-heliosdb-proxy --version               # 0.4.1
+heliosdb-proxy --version               # heliosdb-proxy 3.0.0
 which heliosdb-proxy                   # ~/.cargo/bin/heliosdb-proxy
 ls $(dirname $(which heliosdb-proxy))  # confirm it's on PATH
 ```
 
 ## Pitfalls
 
-- **`error: failed to compile heliosdb-proxy v0.4.1, intermediate
+- **`error: failed to compile heliosdb-proxy v3.0.0, intermediate
   artifacts can be found at …`** — usually MSRV. Confirm
-  `rustc --version` is ≥ 1.75. Install via `rustup default stable`.
+  `rustc --version` is ≥ 1.86. Install via `rustup default stable`.
 - **`linker 'cc' not found`** — install build-essential
   (`apt install build-essential` / `xcode-select --install`).
 - **`error: failed to download` / network errors during install** —

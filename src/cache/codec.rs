@@ -111,8 +111,17 @@ fn lz4_blob(data: &[u8]) -> Option<Vec<u8>> {
     let mut blob = vec![0u8; 1 + lz4_flex::block::get_maximum_output_size(data.len())];
     blob[0] = MARKER_LZ4;
     let written = lz4_flex::block::compress_into(data, &mut blob[1..]).ok()?;
-    blob.truncate(1 + written);
-    Some(blob)
+    Some(exact(blob, 1 + written))
+}
+
+/// `blob` cut to its `len` written bytes, giving back the rest of the
+/// worst-case buffer it was compressed into. A `Bytes` made from a `Vec`
+/// with spare capacity keeps all of it, so without this every compressed
+/// entry held at least its raw size while L2 charged it at its stored size.
+fn exact(mut blob: Vec<u8>, len: usize) -> Vec<u8> {
+    blob.truncate(len);
+    blob.shrink_to_fit();
+    blob
 }
 
 /// `data` as a zstd blob at `level`: the marker, then one zstd frame; `None`
@@ -121,8 +130,7 @@ fn zstd_blob(data: &[u8], level: i32) -> Option<Vec<u8>> {
     let mut blob = vec![0u8; 1 + zstd::zstd_safe::compress_bound(data.len())];
     blob[0] = MARKER_ZSTD;
     let written = zstd::bulk::compress_to_buffer(data, &mut blob[1..], level).ok()?;
-    blob.truncate(1 + written);
-    Some(blob)
+    Some(exact(blob, 1 + written))
 }
 
 thread_local! {
@@ -243,6 +251,17 @@ mod tests {
     }
 
     /// Only payloads of at least `min_bytes` are compressed.
+    /// A stored blob owns no more than its bytes: the worst-case buffer it
+    /// was compressed into is given back (L2 charges the stored size).
+    #[test]
+    fn a_compressed_blob_keeps_no_spare_capacity() {
+        let data = data_rows(64 * 1024);
+        for blob in [lz4_blob(&data).unwrap(), zstd_blob(&data, 3).unwrap()] {
+            assert!(blob.len() < data.len() / 2);
+            assert_eq!(blob.capacity(), blob.len());
+        }
+    }
+
     #[test]
     fn the_threshold_is_inclusive() {
         for compression in [CacheCompression::Lz4, CacheCompression::Zstd] {

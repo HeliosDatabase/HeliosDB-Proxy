@@ -3,6 +3,12 @@
 //! Subscribes to WAL stream for real-time cache coherency.
 //! Invalidates cached entries when underlying data changes.
 //!
+//! The invalidator fails closed: [`WalInvalidator::start`] returns an error
+//! when the endpoint cannot be reached or does not acknowledge the
+//! subscription, and a stream that breaks (I/O error, malformed or
+//! unrecognised frame) stops the invalidator — [`WalInvalidator::is_running`]
+//! turns `false` — instead of silently skipping changes it could not read.
+//!
 //! # Protocol
 //!
 //! The WAL streaming protocol uses TCP with the following message format:
@@ -103,19 +109,19 @@ impl WalStreamer {
                 streamer.last_heartbeat = Instant::now();
                 Ok(streamer)
             }
-            Err(e) => {
-                // Return a disconnected streamer - can be reconnected later
-                tracing::warn!("Failed to connect to WAL endpoint {}: {}", endpoint, e);
-                Ok(streamer)
-            }
+            Err(e) => Err(CacheError::ConnectionError(format!(
+                "failed to connect to WAL endpoint {}: {}",
+                endpoint, e
+            ))),
         }
     }
 
     /// Send subscription request and start receiving WAL entries
     async fn subscribe(&mut self, start_lsn: Option<u64>) -> CacheResult<WalSubscription> {
-        self.running.store(true, Ordering::SeqCst);
-
-        if let Some(ref mut stream) = self.connection {
+        let stream = self.connection.as_mut().ok_or_else(|| {
+            CacheError::ConnectionError("WAL streamer is not connected".to_string())
+        })?;
+        {
             // Build subscription request
             let lsn = start_lsn.unwrap_or(0);
             let mut request = vec![WalMessageType::Subscribe as u8];
@@ -131,24 +137,34 @@ impl WalStreamer {
                 )));
             }
 
-            // Wait for subscription ack
+            // Wait for the subscription ack; anything else is a failure.
             let mut header = [0u8; 5];
-            match stream.read_exact(&mut header) {
-                Ok(_) => {
-                    if header[0] == WalMessageType::SubscribeAck as u8 {
-                        tracing::info!("WAL subscription acknowledged");
-                    } else if header[0] == WalMessageType::Error as u8 {
-                        return Err(CacheError::ConnectionError(
-                            "Subscription rejected by server".to_string(),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("No subscription ack received: {}", e);
-                }
+            stream.read_exact(&mut header).map_err(|e| {
+                CacheError::ConnectionError(format!("no WAL subscription ack received: {}", e))
+            })?;
+            let payload_len =
+                u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            if header[0] == WalMessageType::Error as u8 {
+                return Err(CacheError::ConnectionError(
+                    "WAL subscription rejected by server".to_string(),
+                ));
             }
+            if header[0] != WalMessageType::SubscribeAck as u8 {
+                return Err(CacheError::ConnectionError(format!(
+                    "unexpected WAL message type 0x{:02x} instead of a subscription ack",
+                    header[0]
+                )));
+            }
+            if payload_len > 0 {
+                let mut payload = vec![0u8; payload_len.min(MAX_WAL_PAYLOAD)];
+                stream.read_exact(&mut payload).map_err(|e| {
+                    CacheError::ConnectionError(format!("truncated WAL subscription ack: {}", e))
+                })?;
+            }
+            tracing::info!("WAL subscription acknowledged");
         }
 
+        self.running.store(true, Ordering::SeqCst);
         Ok(WalSubscription {
             running: self.running.clone(),
             connection: self.connection.take(),
@@ -166,8 +182,30 @@ pub struct WalSubscription {
     buffer: Vec<u8>,
 }
 
+/// Largest WAL frame payload accepted (10 MiB).
+const MAX_WAL_PAYLOAD: usize = 10 * 1024 * 1024;
+
 impl WalSubscription {
-    /// Receive next WAL entry from the stream (non-recursive loop-based implementation)
+    /// Mark the stream unusable. Every later `next` returns `None` and
+    /// [`Self::is_active`] reports `false`.
+    fn fail(&mut self, reason: &str) -> Option<WalEntry> {
+        tracing::error!(
+            lsn = self.current_lsn,
+            "WAL stream broken, cache invalidation stopped: {}",
+            reason
+        );
+        self.running.store(false, Ordering::SeqCst);
+        self.connection = None;
+        None
+    }
+
+    /// Receive the next WAL entry.
+    ///
+    /// Returns `None` when no entry arrived within the read timeout (the
+    /// subscription stays active) or when the stream broke — I/O error,
+    /// oversized, malformed or unrecognised frame — in which case the
+    /// subscription becomes inactive: a frame that cannot be read may carry
+    /// a change, so it is never skipped silently.
     pub async fn next(&mut self) -> Option<WalEntry> {
         loop {
             if !self.running.load(Ordering::SeqCst) {
@@ -193,56 +231,46 @@ impl WalSubscription {
                     continue;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    // Timeout - this is normal, just continue
+                    // No frame within the read timeout; still subscribed.
                     return None;
                 }
-                Err(_) => {
-                    // Connection error
-                    self.running.store(false, Ordering::SeqCst);
-                    return None;
-                }
+                Err(e) => return self.fail(&format!("read error: {}", e)),
             }
 
             let msg_type = header[0];
             let payload_len =
                 u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
+            if payload_len > MAX_WAL_PAYLOAD {
+                return self.fail(&format!("frame payload of {} bytes", payload_len));
+            }
+
             // Handle heartbeat messages
             if msg_type == WalMessageType::Heartbeat as u8 {
                 // Heartbeat has no payload or small status payload
                 if payload_len > 0 {
-                    let mut _payload = vec![0u8; payload_len];
-                    let _ = stream.read_exact(&mut _payload);
+                    let mut payload = vec![0u8; payload_len];
+                    if let Err(e) = stream.read_exact(&mut payload) {
+                        return self.fail(&format!("truncated heartbeat: {}", e));
+                    }
                 }
                 continue; // Skip heartbeats
             }
 
-            // Only process WAL entries
+            // Only WAL entries may follow a subscription
             if msg_type != WalMessageType::Entry as u8 {
-                // Skip unknown message types
-                if payload_len > 0 && payload_len < 1024 * 1024 {
-                    let mut skip = vec![0u8; payload_len];
-                    let _ = stream.read_exact(&mut skip);
-                }
-                continue;
-            }
-
-            // Read WAL entry payload
-            if payload_len == 0 || payload_len > 10 * 1024 * 1024 {
-                // Invalid payload size
-                return None;
+                return self.fail(&format!("unexpected message type 0x{:02x}", msg_type));
             }
 
             self.buffer.resize(payload_len, 0);
-            if stream.read_exact(&mut self.buffer).is_err() {
-                self.running.store(false, Ordering::SeqCst);
-                return None;
+            if let Err(e) = stream.read_exact(&mut self.buffer) {
+                return self.fail(&format!("truncated WAL entry: {}", e));
             }
 
             // Parse WAL entry from payload
             // Format: [lsn: 8 bytes][timestamp: 8 bytes][op_type: 1 byte][data...]
             if self.buffer.len() < 17 {
-                continue; // Invalid entry, skip
+                return self.fail("WAL entry shorter than its 17-byte header");
             }
 
             let lsn = u64::from_be_bytes([
@@ -266,17 +294,18 @@ impl WalSubscription {
                 self.buffer[15],
             ]);
             let op_type = self.buffer[16];
-            let data = &self.buffer[17..];
+            let data = self.buffer[17..].to_vec();
+            let data = data.as_slice();
 
             let operation = match op_type {
                 0x01 => {
                     // Put operation: [key_len: 4][key][value]
                     if data.len() < 4 {
-                        continue;
+                        return self.fail("truncated WAL entry key length");
                     }
                     let key_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
                     if data.len() < 4 + key_len {
-                        continue;
+                        return self.fail("truncated WAL entry key");
                     }
                     let key = data[4..4 + key_len].to_vec();
                     let value = data[4 + key_len..].to_vec();
@@ -285,11 +314,11 @@ impl WalSubscription {
                 0x02 => {
                     // Delete operation: [key_len: 4][key]
                     if data.len() < 4 {
-                        continue;
+                        return self.fail("truncated WAL entry key length");
                     }
                     let key_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
                     if data.len() < 4 + key_len {
-                        continue;
+                        return self.fail("truncated WAL entry key");
                     }
                     let key = data[4..4 + key_len].to_vec();
                     WalOperation::Delete { key }
@@ -297,11 +326,11 @@ impl WalSubscription {
                 0x03 => {
                     // Counter update: [table_name_len: 2][table_name][counter: 8]
                     if data.len() < 10 {
-                        continue;
+                        return self.fail("truncated counter update");
                     }
                     let name_len = u16::from_be_bytes([data[0], data[1]]) as usize;
                     if data.len() < 2 + name_len + 8 {
-                        continue;
+                        return self.fail("truncated counter update");
                     }
                     let table_name = String::from_utf8_lossy(&data[2..2 + name_len]).to_string();
                     let counter_offset = 2 + name_len;
@@ -323,11 +352,11 @@ impl WalSubscription {
                 0x04 => {
                     // Schema change: [table_name_len: 2][table_name]
                     if data.len() < 2 {
-                        continue;
+                        return self.fail("truncated schema change");
                     }
                     let name_len = u16::from_be_bytes([data[0], data[1]]) as usize;
                     if data.len() < 2 + name_len {
-                        continue;
+                        return self.fail("truncated schema change");
                     }
                     let table_name = String::from_utf8_lossy(&data[2..2 + name_len]).to_string();
                     WalOperation::SchemaChange { table_name }
@@ -335,16 +364,15 @@ impl WalSubscription {
                 0x05 => {
                     // Commit: [txn_id: 8]
                     if data.len() < 8 {
-                        continue;
+                        return self.fail("truncated commit");
                     }
                     let txn_id = u64::from_be_bytes([
                         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                     ]);
                     WalOperation::Commit { txn_id }
                 }
-                _ => {
-                    // Unknown operation type, skip
-                    continue;
+                other => {
+                    return self.fail(&format!("unknown WAL operation type 0x{:02x}", other));
                 }
             };
 
@@ -384,17 +412,14 @@ pub type InvalidationCallback = Arc<dyn Fn(&InvalidationTarget) + Send + Sync>;
 
 /// WAL-based cache invalidator
 pub struct WalInvalidator {
-    /// WAL stream
-    wal_stream: Option<WalStreamer>,
-
     /// Active WAL subscription
     subscription: tokio::sync::RwLock<Option<WalSubscription>>,
 
     /// Table to fingerprint index
     table_index: DashMap<String, HashSet<QueryFingerprint>>,
 
-    /// Invalidation callbacks
-    callbacks: Arc<tokio::sync::RwLock<Vec<InvalidationCallback>>>,
+    /// Invalidation callbacks (synchronous; never held across an await)
+    callbacks: Arc<parking_lot::RwLock<Vec<InvalidationCallback>>>,
 
     /// Running flag
     running: Arc<AtomicBool>,
@@ -419,85 +444,70 @@ impl WalInvalidator {
     /// Create a new invalidator
     pub fn new(_config: DistribCacheConfig) -> Self {
         Self {
-            wal_stream: None,
             subscription: tokio::sync::RwLock::new(None),
             table_index: DashMap::new(),
-            callbacks: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            callbacks: Arc::new(parking_lot::RwLock::new(Vec::new())),
             running: Arc::new(AtomicBool::new(false)),
             last_lsn: AtomicU64::new(0),
             stats: InvalidatorStats::default(),
         }
     }
 
-    /// Start the invalidator - connects to WAL endpoint and begins processing
+    /// Connect to the WAL endpoint and subscribe from the last processed
+    /// LSN.
+    ///
+    /// Fails — and leaves the invalidator stopped — when the endpoint cannot
+    /// be reached or does not acknowledge the subscription. Entries are
+    /// processed by [`Self::start_processing`] / [`Self::process_loop`].
     pub async fn start(&self, wal_endpoint: &str) -> CacheResult<()> {
         if self.running.load(Ordering::SeqCst) {
             return Ok(()); // Already running
         }
 
-        self.running.store(true, Ordering::SeqCst);
-
-        // Connect to WAL streaming endpoint
         let mut streamer = WalStreamer::connect(wal_endpoint).await?;
 
         // Start subscription from last known LSN (for recovery)
         let start_lsn = self.last_lsn.load(Ordering::Relaxed);
         let start_lsn = if start_lsn > 0 { Some(start_lsn) } else { None };
 
-        match streamer.subscribe(start_lsn).await {
-            Ok(sub) => {
-                *self.subscription.write().await = Some(sub);
-                tracing::info!("WAL invalidator started, connected to {}", wal_endpoint);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to subscribe to WAL stream: {}. Running in degraded mode.",
-                    e
-                );
-                // Still mark as running - can accept manual invalidations
-            }
-        }
-
+        let sub = streamer.subscribe(start_lsn).await?;
+        *self.subscription.write().await = Some(sub);
+        self.running.store(true, Ordering::SeqCst);
+        tracing::info!("WAL invalidator started, connected to {}", wal_endpoint);
         Ok(())
     }
 
-    /// Start the WAL processing loop in a background task
-    pub fn start_processing(&self) -> tokio::task::JoinHandle<()> {
-        let running = self.running.clone();
-        let _subscription = self.subscription.write();
-        let _callbacks = self.callbacks.clone();
-        let _stats = InvalidatorStats {
-            wal_entries_processed: AtomicU64::new(0),
-            tables_invalidated: AtomicU64::new(0),
-            entries_invalidated: AtomicU64::new(0),
-            invalidation_lag_ms: AtomicU64::new(0),
-        };
-        let _table_index = self.table_index.clone();
-        let _last_lsn = AtomicU64::new(self.last_lsn.load(Ordering::Relaxed));
-
-        tokio::spawn(async move {
+    /// Run [`Self::process_loop`] in the background until [`Self::stop`] or
+    /// until the stream breaks. The WAL socket is read with blocking I/O, so
+    /// the loop runs on a thread of the runtime's blocking pool rather than
+    /// occupying an async worker. Must be called within a Tokio runtime.
+    pub fn start_processing(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let this = Arc::clone(self);
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
             tracing::info!("WAL processing loop started");
-
-            // Note: This is a simplified version - in production you'd pass
-            // the subscription handle properly
-            while running.load(Ordering::SeqCst) {
-                // Sleep to avoid busy loop when no subscription
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-
+            handle.block_on(this.process_loop());
             tracing::info!("WAL processing loop stopped");
         })
     }
 
-    /// Process WAL entries in the current task (blocking)
+    /// Process WAL entries until [`Self::stop`] or until the stream breaks.
+    /// A broken (or missing) subscription stops the invalidator:
+    /// [`Self::is_running`] turns `false`.
     pub async fn process_loop(&self) {
         while self.running.load(Ordering::SeqCst) {
             let entry = {
                 let mut sub_guard = self.subscription.write().await;
-                if let Some(ref mut sub) = *sub_guard {
-                    sub.next().await
-                } else {
-                    None
+                match sub_guard.as_mut() {
+                    Some(sub) if sub.is_active() => sub.next().await,
+                    _ => {
+                        if self.running.swap(false, Ordering::SeqCst) {
+                            tracing::error!(
+                                "WAL subscription is not active; cache invalidation stopped"
+                            );
+                        }
+                        break;
+                    }
                 }
             };
 
@@ -527,10 +537,6 @@ impl WalInvalidator {
         let mut sub = self.subscription.write().await;
         *sub = None;
 
-        if let Some(_stream) = self.wal_stream.as_ref().map(|_| ()) {
-            // Stream cleanup handled by drop
-        }
-
         tracing::info!("WAL invalidator stopped");
     }
 
@@ -556,17 +562,12 @@ impl WalInvalidator {
 
     /// Add invalidation callback
     pub async fn add_callback(&self, callback: InvalidationCallback) {
-        self.callbacks.write().await.push(callback);
+        self.add_callback_sync(callback);
     }
 
-    /// Add callback (sync version for compatibility)
+    /// Add invalidation callback from synchronous code.
     pub fn add_callback_sync(&self, callback: InvalidationCallback) {
-        // Use blocking for sync context
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(async {
-                self.callbacks.write().await.push(callback);
-            });
-        }
+        self.callbacks.write().push(callback);
     }
 
     /// Process a WAL entry
@@ -610,7 +611,7 @@ impl WalInvalidator {
         };
 
         // Notify callbacks
-        let callbacks = self.callbacks.read().await;
+        let callbacks = self.callbacks.read().clone();
         for callback in callbacks.iter() {
             callback(&target);
         }
@@ -631,7 +632,7 @@ impl WalInvalidator {
             invalidate_all: false,
         };
 
-        let callbacks = self.callbacks.read().await;
+        let callbacks = self.callbacks.read().clone();
         for callback in callbacks.iter() {
             callback(&target);
         }
@@ -757,18 +758,111 @@ mod tests {
         assert_eq!(stats.wal_entries_processed, 1);
     }
 
+    /// Fail closed: an unreachable endpoint is a start error, and the
+    /// invalidator does not report itself running.
     #[tokio::test]
-    async fn test_start_stop() {
-        let config = DistribCacheConfig::default();
-        let invalidator = WalInvalidator::new(config);
+    async fn test_start_unreachable_endpoint_fails() {
+        let invalidator = WalInvalidator::new(DistribCacheConfig::default());
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = dead.local_addr().unwrap();
+        drop(dead);
 
-        // Start with invalid endpoint (will not connect but won't fail)
-        invalidator.start("127.0.0.1:59999").await.unwrap();
+        let err = invalidator.start(&addr.to_string()).await.unwrap_err();
+        assert!(matches!(err, CacheError::ConnectionError(_)), "got {err:?}");
+        assert!(!invalidator.is_running());
+    }
+
+    /// Fake WAL server: acks the subscription (or answers `first` instead),
+    /// then writes `frames` and keeps the socket open until the test ends.
+    fn spawn_wal_server(first: Vec<u8>, frames: Vec<Vec<u8>>) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 13];
+            sock.read_exact(&mut req).unwrap();
+            sock.write_all(&first).unwrap();
+            for frame in frames {
+                sock.write_all(&frame).unwrap();
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        addr
+    }
+
+    fn ack() -> Vec<u8> {
+        vec![WalMessageType::SubscribeAck as u8, 0, 0, 0, 0]
+    }
+
+    fn entry_frame(lsn: u64, op: u8, data: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&lsn.to_be_bytes());
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.push(op);
+        payload.extend_from_slice(data);
+        let mut frame = vec![WalMessageType::Entry as u8];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// A server that answers the subscription with anything but an ack is a
+    /// start error.
+    #[tokio::test]
+    async fn test_start_without_subscription_ack_fails() {
+        let addr = spawn_wal_server(vec![WalMessageType::Error as u8, 0, 0, 0, 0], vec![]);
+        let invalidator = WalInvalidator::new(DistribCacheConfig::default());
+        let err = invalidator.start(&addr.to_string()).await.unwrap_err();
+        assert!(matches!(err, CacheError::ConnectionError(_)), "got {err:?}");
+        assert!(!invalidator.is_running());
+    }
+
+    /// End to end: a WAL entry streamed after the ack reaches the
+    /// invalidation callbacks through the processing task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_processing_task_applies_streamed_entries() {
+        let mut key = Vec::new();
+        key.extend_from_slice(&(9u32).to_be_bytes());
+        key.extend_from_slice(b"users:123");
+        let addr = spawn_wal_server(ack(), vec![entry_frame(7, 0x02, &key)]);
+
+        let invalidator = Arc::new(WalInvalidator::new(DistribCacheConfig::default()));
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        invalidator.add_callback_sync(Arc::new(move |target| {
+            seen_cb.lock().push(target.table.clone());
+        }));
+        invalidator.start(&addr.to_string()).await.unwrap();
+        let task = invalidator.start_processing();
+
+        for _ in 0..200 {
+            if !seen.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(seen.lock().as_slice(), ["users".to_string()]);
+        assert_eq!(invalidator.stats().wal_entries_processed, 1);
+
+        invalidator.stop().await;
+        task.abort();
+    }
+
+    /// A malformed frame stops the invalidator instead of being skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_malformed_entry_stops_invalidator() {
+        let addr = spawn_wal_server(ack(), vec![entry_frame(1, 0x7e, &[])]);
+        let invalidator = Arc::new(WalInvalidator::new(DistribCacheConfig::default()));
+        invalidator.start(&addr.to_string()).await.unwrap();
         assert!(invalidator.is_running());
 
-        // Stop
-        invalidator.stop().await;
+        let task = invalidator.start_processing();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("processing loop must stop on a malformed frame")
+            .unwrap();
         assert!(!invalidator.is_running());
+        assert_eq!(invalidator.stats().wal_entries_processed, 0);
     }
 
     #[test]

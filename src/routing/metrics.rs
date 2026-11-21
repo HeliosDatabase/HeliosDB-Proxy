@@ -24,8 +24,9 @@ pub struct RoutingMetrics {
     no_nodes_count: AtomicU64,
     /// Total routing time (microseconds)
     total_routing_time_us: AtomicU64,
-    /// Per-target counts
-    target_counts: RwLock<HashMap<RouteTarget, u64>>,
+    /// Per-target counts (a synchronous lock: updated from the
+    /// synchronous `record_routing`)
+    target_counts: parking_lot::Mutex<HashMap<RouteTarget, u64>>,
     /// Per-hint usage counts
     hint_usage: RwLock<HashMap<String, u64>>,
     /// Recent routing decisions (for debugging)
@@ -45,7 +46,7 @@ impl RoutingMetrics {
             fallback_count: AtomicU64::new(0),
             no_nodes_count: AtomicU64::new(0),
             total_routing_time_us: AtomicU64::new(0),
-            target_counts: RwLock::new(HashMap::new()),
+            target_counts: parking_lot::Mutex::new(HashMap::new()),
             hint_usage: RwLock::new(HashMap::new()),
             recent_decisions: RwLock::new(Vec::new()),
             max_recent: 100,
@@ -65,13 +66,8 @@ impl RoutingMetrics {
         self.total_routing_time_us
             .fetch_add(elapsed.as_micros() as u64, Ordering::SeqCst);
 
-        // Track target usage (async - won't block)
         if let Some(t) = target {
-            let _target = t;
-            tokio::spawn(async move {
-                // In real implementation, would update the actual counter
-                // This is simplified for the skeleton
-            });
+            *self.target_counts.lock().entry(t).or_insert(0) += 1;
         }
     }
 
@@ -139,7 +135,7 @@ impl RoutingMetrics {
 
     /// Get target distribution
     pub async fn target_distribution(&self) -> HashMap<RouteTarget, u64> {
-        self.target_counts.read().await.clone()
+        self.target_counts.lock().clone()
     }
 
     /// Reset all metrics
@@ -151,7 +147,7 @@ impl RoutingMetrics {
         self.fallback_count.store(0, Ordering::SeqCst);
         self.no_nodes_count.store(0, Ordering::SeqCst);
         self.total_routing_time_us.store(0, Ordering::SeqCst);
-        self.target_counts.write().await.clear();
+        self.target_counts.lock().clear();
         self.hint_usage.write().await.clear();
         self.recent_decisions.write().await.clear();
     }
@@ -282,6 +278,35 @@ mod tests {
         assert_eq!(stats.total_routed, 3);
         assert_eq!(stats.with_hints, 2);
         assert_eq!(stats.without_hints, 1);
+    }
+
+    #[tokio::test]
+    async fn test_target_distribution_counts_each_target() {
+        let metrics = RoutingMetrics::new();
+
+        metrics.record_routing(Some(RouteTarget::Primary), true, Duration::from_micros(1));
+        metrics.record_routing(Some(RouteTarget::Primary), false, Duration::from_micros(1));
+        metrics.record_routing(Some(RouteTarget::Standby), false, Duration::from_micros(1));
+        metrics.record_routing(None, false, Duration::from_micros(1));
+
+        let dist = metrics.target_distribution().await;
+        assert_eq!(dist.get(&RouteTarget::Primary), Some(&2));
+        assert_eq!(dist.get(&RouteTarget::Standby), Some(&1));
+        assert_eq!(dist.len(), 2);
+
+        metrics.reset().await;
+        assert!(metrics.target_distribution().await.is_empty());
+    }
+
+    /// Recording needs no async runtime (it used to spawn a task per call).
+    #[test]
+    fn test_record_routing_outside_a_runtime() {
+        let metrics = RoutingMetrics::new();
+        metrics.record_routing(Some(RouteTarget::Async), true, Duration::from_micros(1));
+        assert_eq!(
+            metrics.target_counts.lock().get(&RouteTarget::Async),
+            Some(&1)
+        );
     }
 
     #[tokio::test]

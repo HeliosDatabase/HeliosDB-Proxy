@@ -57,14 +57,16 @@ fn standby_safe_reads_are_single_side_effect_free_reads() {
     for (sql, safe) in [
         ("SELECT * FROM t WHERE id = 1", true),
         ("select a, b from t order by a", true),
-        ("VALUES (1), (2)", true),
+        // The strict default policy does not vouch for call-shaped syntax or
+        // builtin spellings; healthy execution stays on the primary.
+        ("VALUES (1), (2)", false),
         ("TABLE t", true),
-        ("WITH x AS (SELECT 1 AS a) SELECT a FROM x", true),
+        ("WITH x AS (SELECT 1 AS a) SELECT a FROM x", false),
         ("SELECT * FROM t FOR UPDATE", false),
         ("SELECT * FROM t FOR NO KEY UPDATE", false),
         ("SELECT * FROM t FOR SHARE", false),
-        ("SELECT now(), version()", true),
-        ("SELECT inet_server_addr()", true),
+        ("SELECT now(), version()", false),
+        ("SELECT inet_server_addr()", false),
         ("SELECT pg_is_in_recovery()", false),
         ("SELECT inet_server_port(), PG_IS_IN_RECOVERY()", false),
         ("SELECT pg_current_wal_lsn()", false),
@@ -771,4 +773,32 @@ async fn a_sighup_reload_retries_refused_standby_logins() {
     server.reload_config().await;
     assert!(!server.state.offload_refusals.any());
     assert!(!server.state.offload_refusals.refused("pg-s1:5432", &app));
+}
+
+#[test]
+fn dual_read_call_standby_primary_binding() {
+    let policy = TrReadPolicy::from_config(&["pg_is_in_recovery".into()]);
+    for sql in [
+        r"SELECT CASE WHEN E'\'' IS NOT NULL THEN pg_is_in_recovery() ELSE false END -- '",
+        r"SELECT '\' AS value --' , pg_is_in_recovery() -- tail",
+    ] {
+        assert!(
+            ProxyServer::tr_read_eligible(sql, &policy),
+            "explicitly trusted: {sql}"
+        );
+        assert!(
+            !ProxyServer::standby_safe_read(sql, &policy),
+            "primary-bound: {sql}"
+        );
+    }
+}
+
+#[test]
+fn dual_read_call_pins_session_change() {
+    for sql in [
+        r"SELECT CASE WHEN E'\'' IS NOT NULL THEN set_config($k$work_mem$k$, $v$1MB$v$, false) ELSE NULL END -- '",
+        r"SELECT '\' AS value --' , set_config($k$work_mem$k$, $v$1MB$v$, false) -- tail",
+    ] {
+        assert!(ProxyServer::pins_reads(sql), "{sql}");
+    }
 }

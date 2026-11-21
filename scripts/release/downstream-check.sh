@@ -27,7 +27,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 HDB="${HDB:-$(dirname "$HERE")}"
 CONSUMERS="${CONSUMERS:-Lite:ha-proxy}"
-LOCK="${LOCK:-/home/gpc/HDB/sprint/coordination/build.lock}"
+LOCK="${LOCK:-${HELIOS_SPRINT:-$HOME/HDB/sprint}/coordination/build.lock}"
 MEM="${MEM:-24G}"
 MODE=check
 case "${1:-}" in

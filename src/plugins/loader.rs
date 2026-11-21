@@ -1,10 +1,15 @@
 //! Plugin Loader
 //!
-//! Loads WASM plugins from files and parses their manifests.
+//! Reads a plugin file — a bare `.wasm` module with optional sidecars, or a
+//! packed `.tar.gz` artefact ([`crate::plugin_artefact`]) — checks its
+//! signature against the trust root when one is configured, and parses and
+//! validates its manifest.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::plugin_artefact::{self, ArtefactError, ArtefactKind, SidecarManifest, TrustRoot};
 
 use super::sandbox::Permission;
 use super::HookType;
@@ -62,32 +67,22 @@ impl From<PluginLoadError> for super::runtime::PluginError {
     }
 }
 
-/// Artefact manifest as it appears inside a `helios-plugin pack`
-/// `.tar.gz`. Mirrors `cli/src/manifest.rs::Manifest` exactly — kept
-/// here as a private deserialisation type so the proxy doesn't take a
-/// dep on the CLI crate.
-#[derive(Debug, serde::Deserialize)]
-struct ArtefactManifest {
-    schema_version: String,
-    name: String,
-    version: String,
-    description: String,
-    license: String,
-    hooks: Vec<String>,
-    wasm_sha256: String,
-}
-
-fn sha256_hex_local(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut s = String::with_capacity(64);
-    for b in digest.iter() {
-        s.push_str(&format!("{:02x}", b));
+impl From<ArtefactError> for PluginLoadError {
+    fn from(err: ArtefactError) -> Self {
+        match err {
+            ArtefactError::Io(m) => PluginLoadError::IoError(m),
+            ArtefactError::Format(m) => PluginLoadError::InvalidFormat(m),
+            ArtefactError::Manifest(m) => PluginLoadError::ManifestError(m),
+            ArtefactError::Key(m) | ArtefactError::Signature(m) => {
+                PluginLoadError::SignatureInvalid(m)
+            }
+        }
     }
-    s
 }
 
-/// Plugin manifest (from plugin.yaml or embedded in WASM)
+/// Plugin manifest: from an artefact's `manifest.json`, a bare module's
+/// `.yaml` / `.json` sidecar, or the JSON in its `helios_manifest` custom
+/// section.
 #[derive(Debug, Clone)]
 pub struct PluginManifest {
     /// Plugin name
@@ -169,151 +164,119 @@ pub enum ConfigFieldType {
     Object,
 }
 
+/// Name of the WebAssembly custom section a bare module may carry its
+/// manifest in (JSON, same fields as a `.json` sidecar).
+pub const EMBEDDED_MANIFEST_SECTION: &str = "helios_manifest";
+
+/// Largest memory a manifest may ask for.
+const MAX_PLUGIN_MEMORY: usize = 256 * 1024 * 1024;
+
+/// What [`PluginLoader::load_verified`] read and checked.
+#[derive(Debug, Clone)]
+pub struct VerifiedPlugin {
+    /// The validated manifest.
+    pub manifest: PluginManifest,
+    /// The module bytes.
+    pub wasm: Vec<u8>,
+    /// The trusted key that signed the module, when a trust root is set.
+    pub signed_by: Option<String>,
+    /// The trusted key that signed an artefact's `manifest.json`, when it
+    /// carries a `manifest.sig`.
+    pub manifest_signed_by: Option<String>,
+    /// Manifest keys this format does not define (logged by the caller).
+    pub unknown_manifest_keys: Vec<String>,
+}
+
 /// Plugin loader
 pub struct PluginLoader {
     /// Search paths for plugins
     search_paths: Vec<PathBuf>,
 
-    /// Allowed extensions
-    allowed_extensions: Vec<String>,
-
-    /// Optional Ed25519 trust root. When `Some`, every loaded .wasm
-    /// must have a matching `.sig` sidecar verifiable against one of
-    /// these keys. When `None`, signatures are not checked (preserves
-    /// the dev-loop ergonomic of dropping unsigned `.wasm` files in
-    /// the plugin dir).
+    /// Optional Ed25519 trust root. When `Some`, every module must be
+    /// signed by one of its keys: a bare `.wasm` through its `.sig`
+    /// sidecar, an artefact through its `plugin.sig`. When `None`,
+    /// signatures are not checked (the dev-loop ergonomic of dropping
+    /// unsigned modules in the plugin dir).
     signature_verifier: Option<SignatureVerifier>,
+
+    /// Upper bound on a plugin file and on an artefact's decompressed
+    /// content.
+    max_bytes: u64,
+
+    /// With a trust root, refuse anything whose manifest is not signed:
+    /// artefacts without a valid `manifest.sig` and every bare `.wasm`.
+    require_signed_manifest: bool,
 }
 
-/// Ed25519 signature verifier for plugin .wasm files.
+/// Ed25519 signature verifier for plugin modules: a
+/// [`TrustRoot`](crate::plugin_artefact::TrustRoot) with this module's
+/// error type.
 ///
-/// Trust root format: a directory of `*.pub` files, each containing
-/// a base64-encoded 32-byte Ed25519 public key (one per trusted
-/// publisher). The .sig file format is base64 of the raw 64-byte
-/// Ed25519 signature over the .wasm bytes.
-///
-/// Wire shape is intentionally plain text + base64 — no PEM, no
-/// X.509, no JSON envelope — so operators can sign with `openssl
-/// pkeyutl -sign` or `signify` without bringing a CA story along.
+/// Trust-root format: a directory of `*.pub` files, one key each, a single
+/// key file, or 64 hex digits inline. A key is a SubjectPublicKeyInfo PEM
+/// (`openssl pkey -pubout`), base64 of the 32 raw bytes, or 64 hex digits.
+/// A signature is base64 of the raw 64-byte Ed25519 signature.
 #[derive(Debug, Default)]
 pub struct SignatureVerifier {
-    /// (label, public_key) pairs. Label is the .pub filename (no
-    /// extension) and shows up in error messages so operators can
-    /// trace which key matched.
-    keys: Vec<(String, ed25519_dalek::VerifyingKey)>,
+    trust: TrustRoot,
 }
 
 impl SignatureVerifier {
-    /// Build a verifier from a directory of `*.pub` files. Each file
-    /// must contain exactly one base64-encoded 32-byte Ed25519
-    /// public key. Whitespace at the start / end is tolerated.
+    /// Build a verifier from a trust root (see the type docs). A malformed
+    /// key, or a trust root without any key, is an error.
     pub fn from_trust_root(dir: &Path) -> Result<Self, PluginLoadError> {
-        use base64::Engine as _;
-
-        let mut keys = Vec::new();
-        let entries = fs::read_dir(dir).map_err(|e| {
-            PluginLoadError::IoError(format!("trust-root {}: {}", dir.display(), e))
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|e| PluginLoadError::IoError(e.to_string()))?;
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("pub") {
-                continue;
-            }
-            let raw = fs::read_to_string(&p)
-                .map_err(|e| PluginLoadError::IoError(format!("read {}: {}", p.display(), e)))?;
-            let raw = raw.trim();
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(raw)
-                .map_err(|e| {
-                    PluginLoadError::SignatureInvalid(format!(
-                        "{} not valid base64: {}",
-                        p.display(),
-                        e
-                    ))
-                })?;
-            if bytes.len() != 32 {
-                return Err(PluginLoadError::SignatureInvalid(format!(
-                    "{} should be 32 bytes (raw Ed25519 pubkey), got {}",
-                    p.display(),
-                    bytes.len()
-                )));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            let key = ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|e| {
-                PluginLoadError::SignatureInvalid(format!(
-                    "{} not a valid Ed25519 pubkey: {}",
-                    p.display(),
-                    e
-                ))
-            })?;
-            let label = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("(unknown)")
-                .to_string();
-            keys.push((label, key));
-        }
-        Ok(Self { keys })
+        Ok(Self {
+            trust: TrustRoot::load(&dir.to_string_lossy())?,
+        })
     }
 
     /// Verify a signature blob (base64-encoded Ed25519 signature)
-    /// against the .wasm bytes. Returns Ok with the matching label
-    /// on success.
+    /// against the module bytes. Returns the matching key's label.
     pub fn verify(&self, wasm: &[u8], sig_b64: &str) -> Result<&str, PluginLoadError> {
-        use base64::Engine as _;
-        use ed25519_dalek::Verifier;
-
-        let sig_bytes = base64::engine::general_purpose::STANDARD
-            .decode(sig_b64.trim())
-            .map_err(|e| PluginLoadError::SignatureInvalid(format!("base64 decode: {}", e)))?;
-        if sig_bytes.len() != 64 {
-            return Err(PluginLoadError::SignatureInvalid(format!(
-                "signature should be 64 bytes, got {}",
-                sig_bytes.len()
-            )));
-        }
-        let mut arr = [0u8; 64];
-        arr.copy_from_slice(&sig_bytes);
-        let sig = ed25519_dalek::Signature::from_bytes(&arr);
-
-        for (label, key) in &self.keys {
-            if key.verify(wasm, &sig).is_ok() {
-                return Ok(label.as_str());
-            }
-        }
-        Err(PluginLoadError::SignatureInvalid(
-            "signature did not match any trusted key".to_string(),
-        ))
+        Ok(self.trust.verify(wasm, sig_b64)?)
     }
 
-    /// Number of trusted keys. Useful for diagnostics — a verifier
-    /// with zero keys rejects every signature.
+    /// Number of trusted keys.
     pub fn key_count(&self) -> usize {
-        self.keys.len()
+        self.trust.key_count()
+    }
+
+    /// The underlying trust root.
+    pub fn trust_root(&self) -> &TrustRoot {
+        &self.trust
     }
 }
 
 impl PluginLoader {
-    /// Create a new plugin loader. Accepts both raw `.wasm` files
-    /// (the dev-loop format) and packed `.tar.gz` artefacts (the
-    /// distribution format produced by `helios-plugin pack`).
+    /// Create a new plugin loader. Accepts both bare `.wasm` modules (the
+    /// dev-loop format) and packed `.tar.gz` artefacts (the distribution
+    /// format `helios-plugin pack` produces).
     pub fn new() -> Self {
         Self {
             search_paths: Vec::new(),
-            allowed_extensions: vec![
-                "wasm".to_string(),
-                "gz".to_string(), // for `.tar.gz` artefacts
-            ],
             signature_verifier: None,
+            max_bytes: plugin_artefact::DEFAULT_MAX_ARTEFACT_BYTES,
+            require_signed_manifest: false,
         }
     }
 
-    /// Attach a trust-root verifier. Once set, every load() call
-    /// requires a matching .sig sidecar; loads without one fail.
+    /// Attach a trust-root verifier. Once set, every load requires a
+    /// signature made by one of its keys.
     pub fn with_signature_verifier(mut self, verifier: SignatureVerifier) -> Self {
         self.signature_verifier = Some(verifier);
+        self
+    }
+
+    /// Bound a plugin file's size, and an artefact's decompressed content.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// With a trust root, also require a signed manifest: only artefacts
+    /// with a valid `manifest.sig` load.
+    pub fn require_signed_manifest(mut self, required: bool) -> Self {
+        self.require_signed_manifest = required;
         self
     }
 
@@ -324,478 +287,185 @@ impl PluginLoader {
 
     /// Load a plugin from a file path. Two accepted shapes:
     ///
-    ///   1. Bare `.wasm` (the dev-loop format) — looks for a sidecar
-    ///      `.yaml` / `.json` manifest and, if a trust root is
-    ///      attached, a `.sig` sidecar.
-    ///   2. Packed `.tar.gz` artefact (the distribution format
-    ///      produced by `helios-plugin pack`) — manifest and signature
-    ///      are baked into the tarball; no sidecars needed.
+    ///   1. Bare `.wasm` — its manifest comes from a `.yaml` or `.json`
+    ///      sidecar, else from a `helios_manifest` custom section; with a
+    ///      trust root, a `.sig` sidecar must sign the module.
+    ///   2. Packed `.tar.gz` artefact — manifest and signatures are inside
+    ///      ([`crate::plugin_artefact`]).
     pub fn load(&self, path: &Path) -> Result<(PluginManifest, Vec<u8>), PluginLoadError> {
-        // Check file exists
+        self.load_verified(path).map(|p| (p.manifest, p.wasm))
+    }
+
+    /// [`load`](Self::load), also reporting who signed what and which
+    /// manifest keys were not understood.
+    pub fn load_verified(&self, path: &Path) -> Result<VerifiedPlugin, PluginLoadError> {
         if !path.exists() {
             return Err(PluginLoadError::FileNotFound(path.display().to_string()));
         }
-
-        // Tarball path — distinct because manifest + signature live
-        // inside the artefact rather than as sidecars.
-        if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-            return self.load_tar_gz(path);
+        match ArtefactKind::of(path) {
+            Some(ArtefactKind::TarGz) => self.load_tar_gz(path),
+            Some(ArtefactKind::Wasm) => self.load_wasm(path),
+            None => Err(PluginLoadError::InvalidFormat(format!(
+                "{} is not a plugin file (expected a name ending .wasm or .tar.gz)",
+                path.display()
+            ))),
         }
+    }
 
-        // Check extension
-        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !self.allowed_extensions.contains(&extension.to_string()) {
-            return Err(PluginLoadError::InvalidFormat(format!(
-                "Invalid extension: {}. Allowed: {:?}",
-                extension, self.allowed_extensions
+    fn load_wasm(&self, path: &Path) -> Result<VerifiedPlugin, PluginLoadError> {
+        let wasm_path = path;
+        if self.require_signed_manifest && self.signature_verifier.is_some() {
+            return Err(PluginLoadError::SignatureInvalid(format!(
+                "{} is a bare module, whose manifest cannot be signed; this proxy \
+                 requires signed manifests (pack it with `helios-plugin pack --sign-with`)",
+                path.display()
             )));
         }
-
-        // Read WASM bytes
-        let wasm_bytes = fs::read(path)?;
-
-        // Validate WASM magic number
-        if wasm_bytes.len() < 8 || &wasm_bytes[0..4] != b"\x00asm" {
+        let wasm = plugin_artefact::read_bounded(path, self.max_bytes)?;
+        if !plugin_artefact::is_wasm(&wasm) {
             return Err(PluginLoadError::InvalidFormat(
                 "Invalid WASM file (bad magic number)".to_string(),
             ));
         }
-
-        // Signature check (when a trust root is configured). The .sig
-        // sidecar is required — no signature, no load.
-        if let Some(ref verifier) = self.signature_verifier {
-            let sig_path = path.with_extension("sig");
-            if !sig_path.exists() {
-                return Err(PluginLoadError::SignatureInvalid(format!(
-                    "{} requires a sidecar .sig file (trust root active)",
-                    path.display()
-                )));
+        let signed_by = match &self.signature_verifier {
+            Some(verifier) => {
+                let sig_path = path.with_extension("sig");
+                if !sig_path.exists() {
+                    return Err(PluginLoadError::SignatureInvalid(format!(
+                        "{} requires a sidecar .sig file (trust root active)",
+                        path.display()
+                    )));
+                }
+                let sig_b64 = fs::read_to_string(&sig_path).map_err(|e| {
+                    PluginLoadError::IoError(format!("read {}: {}", sig_path.display(), e))
+                })?;
+                Some(verifier.verify(&wasm, &sig_b64)?.to_string())
             }
-            let sig_b64 = fs::read_to_string(&sig_path).map_err(|e| {
-                PluginLoadError::IoError(format!("read {}: {}", sig_path.display(), e))
-            })?;
-            let label = verifier.verify(&wasm_bytes, &sig_b64)?;
-            tracing::info!(
-                plugin = %path.display(),
-                signed_by = %label,
-                "plugin signature verified"
-            );
-        }
-
-        // Try to load manifest from sidecar file
-        let manifest = self.load_manifest(path, &wasm_bytes)?;
-
-        Ok((manifest, wasm_bytes))
-    }
-
-    /// Load a plugin packed as a `.tar.gz` artefact (the format
-    /// `helios-plugin pack` produces). Reads `manifest.json` +
-    /// `plugin.wasm` + optional `plugin.sig` from the tarball,
-    /// verifies the wasm SHA-256 against the manifest, verifies the
-    /// signature against the configured trust root if set.
-    fn load_tar_gz(&self, path: &Path) -> Result<(PluginManifest, Vec<u8>), PluginLoadError> {
-        use std::io::{Cursor, Read};
-
-        let raw = fs::read(path)?;
-        let gz = flate2::read::GzDecoder::new(Cursor::new(raw));
-        let mut archive = tar::Archive::new(gz);
-
-        let mut manifest_json: Option<Vec<u8>> = None;
-        let mut wasm_bytes: Option<Vec<u8>> = None;
-        let mut sig_bytes: Option<Vec<u8>> = None;
-
-        let entries = archive
-            .entries()
-            .map_err(|e| PluginLoadError::InvalidFormat(format!("tar entries: {}", e)))?;
-        for entry in entries {
-            let mut entry =
-                entry.map_err(|e| PluginLoadError::InvalidFormat(format!("tar entry: {}", e)))?;
-            let entry_path = entry
-                .path()
-                .map_err(|e| PluginLoadError::InvalidFormat(format!("tar path: {}", e)))?
-                .to_string_lossy()
-                .to_string();
-            let mut buf = Vec::new();
-            entry
-                .read_to_end(&mut buf)
-                .map_err(|e| PluginLoadError::IoError(format!("tar read entry: {}", e)))?;
-            match entry_path.as_str() {
-                "manifest.json" => manifest_json = Some(buf),
-                "plugin.wasm" => wasm_bytes = Some(buf),
-                "plugin.sig" => sig_bytes = Some(buf),
-                _ => {}
-            }
-        }
-
-        let manifest_json = manifest_json.ok_or_else(|| {
-            PluginLoadError::InvalidFormat("artefact missing manifest.json".to_string())
-        })?;
-        let wasm = wasm_bytes.ok_or_else(|| {
-            PluginLoadError::InvalidFormat("artefact missing plugin.wasm".to_string())
-        })?;
-
-        // Parse the artefact manifest. Field names mirror the helios-
-        // plugin CLI's Manifest type one-for-one.
-        let art: ArtefactManifest = serde_json::from_slice(&manifest_json)
-            .map_err(|e| PluginLoadError::ManifestError(format!("manifest.json: {}", e)))?;
-
-        // Major-version compatibility (today: only "1.x" understood).
-        let major_ok = art
-            .schema_version
-            .split('.')
-            .next()
-            .map(|m| m == "1")
-            .unwrap_or(false);
-        if !major_ok {
-            return Err(PluginLoadError::InvalidFormat(format!(
-                "unsupported artefact schema version: {}",
-                art.schema_version
-            )));
-        }
-
-        // Validate wasm SHA-256.
-        let actual_hash = sha256_hex_local(&wasm);
-        if actual_hash != art.wasm_sha256 {
-            return Err(PluginLoadError::InvalidFormat(format!(
-                "wasm sha256 mismatch: manifest claims {}, actual {}",
-                art.wasm_sha256, actual_hash
-            )));
-        }
-
-        // Validate WASM magic number too — the SHA check guarantees
-        // the bytes are intact, but a malicious manifest could
-        // advertise non-WASM bytes that hash correctly.
-        if wasm.len() < 8 || &wasm[0..4] != b"\x00asm" {
-            return Err(PluginLoadError::InvalidFormat(
-                "artefact plugin.wasm has bad magic number".to_string(),
-            ));
-        }
-
-        // Signature verification when trust root is attached.
-        if let Some(ref verifier) = self.signature_verifier {
-            let sig = sig_bytes.ok_or_else(|| {
-                PluginLoadError::SignatureInvalid(
-                    "artefact has no signature but trust root is active".into(),
-                )
-            })?;
-            let sig_str = std::str::from_utf8(&sig).map_err(|e| {
-                PluginLoadError::SignatureInvalid(format!("signature must be UTF-8 base64: {}", e))
-            })?;
-            let label = verifier.verify(&wasm, sig_str)?;
-            tracing::info!(
-                artefact = %path.display(),
-                signed_by = %label,
-                "plugin artefact signature verified"
-            );
-        }
-
-        // Build a PluginManifest from the artefact metadata. Hooks
-        // come over as strings; map them through HookType::from_str.
-        let mut hooks = Vec::with_capacity(art.hooks.len());
-        for h in &art.hooks {
-            if let Some(t) = super::HookType::from_str(h) {
-                hooks.push(t);
-            }
-        }
-        let manifest = PluginManifest {
-            name: art.name,
-            version: art.version,
-            description: art.description,
-            author: String::new(),
-            license: art.license,
-            hooks,
-            permissions: vec![],
-            min_memory: 1024 * 1024,
-            max_memory: 64 * 1024 * 1024,
-            config_schema: HashMap::new(),
-            path: path.to_path_buf(),
+            None => None,
         };
-
-        Ok((manifest, wasm))
+        let sidecar = match self.sidecar_manifest(wasm_path, &wasm)? {
+            Some(sidecar) => sidecar,
+            None => derived_manifest(wasm_path, &wasm)?,
+        };
+        let unknown = sidecar.unknown_keys.clone();
+        let manifest = manifest_from_sidecar(sidecar, path)?;
+        Ok(VerifiedPlugin {
+            manifest,
+            wasm,
+            signed_by,
+            manifest_signed_by: None,
+            unknown_manifest_keys: unknown,
+        })
     }
 
-    /// Load plugin manifest
-    fn load_manifest(
+    /// A bare module's manifest: the `.yaml` sidecar, else the `.json`
+    /// sidecar, else the module's `helios_manifest` custom section; `None`
+    /// when it has none of them.
+    fn sidecar_manifest(
         &self,
         wasm_path: &Path,
-        wasm_bytes: &[u8],
-    ) -> Result<PluginManifest, PluginLoadError> {
-        // Try sidecar YAML manifest
+        wasm: &[u8],
+    ) -> Result<Option<SidecarManifest>, PluginLoadError> {
         let yaml_path = wasm_path.with_extension("yaml");
         if yaml_path.exists() {
-            return self.parse_yaml_manifest(&yaml_path, wasm_path);
+            let text = fs::read_to_string(&yaml_path)?;
+            return plugin_artefact::parse_yaml_manifest(&text)
+                .map(Some)
+                .map_err(|e| {
+                    PluginLoadError::ManifestError(format!("{}: {e}", yaml_path.display()))
+                });
         }
-
-        // Try sidecar JSON manifest
         let json_path = wasm_path.with_extension("json");
         if json_path.exists() {
-            return self.parse_json_manifest(&json_path, wasm_path);
+            let text = fs::read_to_string(&json_path)?;
+            return plugin_artefact::parse_json_manifest(&text)
+                .map(Some)
+                .map_err(|e| {
+                    PluginLoadError::ManifestError(format!("{}: {e}", json_path.display()))
+                });
         }
-
-        // Try embedded manifest (custom section in WASM)
-        if let Some(manifest) = self.extract_embedded_manifest(wasm_bytes, wasm_path)? {
-            return Ok(manifest);
+        if let Some(section) = custom_section(wasm, EMBEDDED_MANIFEST_SECTION)? {
+            let text = std::str::from_utf8(section).map_err(|_| {
+                PluginLoadError::ManifestError(format!(
+                    "the {EMBEDDED_MANIFEST_SECTION} section is not UTF-8"
+                ))
+            })?;
+            return plugin_artefact::parse_json_manifest(text)
+                .map(Some)
+                .map_err(|e| {
+                    PluginLoadError::ManifestError(format!(
+                        "{EMBEDDED_MANIFEST_SECTION} section: {e}"
+                    ))
+                });
         }
-
-        // Generate minimal manifest from filename
-        Ok(self.generate_minimal_manifest(wasm_path))
-    }
-
-    /// Parse YAML manifest
-    fn parse_yaml_manifest(
-        &self,
-        yaml_path: &Path,
-        wasm_path: &Path,
-    ) -> Result<PluginManifest, PluginLoadError> {
-        let content = fs::read_to_string(yaml_path)?;
-
-        // Simple YAML parsing (in production, would use serde_yaml)
-        let mut manifest = PluginManifest {
-            path: wasm_path.to_path_buf(),
-            ..PluginManifest::default()
-        };
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            if let Some((key, value)) = line.split_once(':') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"').trim_matches('\'');
-
-                match key {
-                    "name" => manifest.name = value.to_string(),
-                    "version" => manifest.version = value.to_string(),
-                    "description" => manifest.description = value.to_string(),
-                    "author" => manifest.author = value.to_string(),
-                    "license" => manifest.license = value.to_string(),
-                    _ => {}
-                }
-            }
-        }
-
-        // Parse hooks section
-        if let Some(hooks_start) = content.find("hooks:") {
-            let hooks_section = &content[hooks_start..];
-            for line in hooks_section.lines().skip(1) {
-                let line = line.trim();
-                if line.is_empty() || !line.starts_with('-') {
-                    if !line.starts_with(' ') && !line.is_empty() {
-                        break;
-                    }
-                    continue;
-                }
-                let hook_name = line.trim_start_matches('-').trim();
-                if let Some(hook) = HookType::from_str(hook_name) {
-                    manifest.hooks.push(hook);
-                }
-            }
-        }
-
-        // Parse permissions section
-        if let Some(perms_start) = content.find("permissions:") {
-            let perms_section = &content[perms_start..];
-            for line in perms_section.lines().skip(1) {
-                let line = line.trim();
-                if line.is_empty() || !line.starts_with('-') {
-                    if !line.starts_with(' ') && !line.is_empty() {
-                        break;
-                    }
-                    continue;
-                }
-                let perm_name = line.trim_start_matches('-').trim();
-                if let Some(perm) = Permission::from_str(perm_name) {
-                    manifest.permissions.push(perm);
-                }
-            }
-        }
-
-        // Validate manifest
-        self.validate_manifest(&manifest)?;
-
-        Ok(manifest)
-    }
-
-    /// Parse JSON manifest
-    fn parse_json_manifest(
-        &self,
-        json_path: &Path,
-        wasm_path: &Path,
-    ) -> Result<PluginManifest, PluginLoadError> {
-        let content = fs::read_to_string(json_path)?;
-
-        // Parse JSON
-        let json: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| PluginLoadError::ManifestError(e.to_string()))?;
-
-        let mut manifest = PluginManifest {
-            path: wasm_path.to_path_buf(),
-            ..PluginManifest::default()
-        };
-
-        if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
-            manifest.name = name.to_string();
-        }
-        if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
-            manifest.version = version.to_string();
-        }
-        if let Some(description) = json.get("description").and_then(|v| v.as_str()) {
-            manifest.description = description.to_string();
-        }
-        if let Some(author) = json.get("author").and_then(|v| v.as_str()) {
-            manifest.author = author.to_string();
-        }
-        if let Some(license) = json.get("license").and_then(|v| v.as_str()) {
-            manifest.license = license.to_string();
-        }
-
-        // Parse hooks
-        if let Some(hooks) = json.get("hooks").and_then(|v| v.as_array()) {
-            for hook in hooks {
-                if let Some(hook_name) = hook.as_str() {
-                    if let Some(hook_type) = HookType::from_str(hook_name) {
-                        manifest.hooks.push(hook_type);
-                    }
-                }
-            }
-        }
-
-        // Parse permissions
-        if let Some(perms) = json.get("permissions").and_then(|v| v.as_array()) {
-            for perm in perms {
-                if let Some(perm_name) = perm.as_str() {
-                    if let Some(permission) = Permission::from_str(perm_name) {
-                        manifest.permissions.push(permission);
-                    }
-                }
-            }
-        }
-
-        // Parse memory requirements
-        if let Some(resources) = json.get("resources") {
-            if let Some(min_mem) = resources.get("min_memory").and_then(|v| v.as_str()) {
-                manifest.min_memory = parse_memory_size(min_mem);
-            }
-            if let Some(max_mem) = resources.get("max_memory").and_then(|v| v.as_str()) {
-                manifest.max_memory = parse_memory_size(max_mem);
-            }
-        }
-
-        self.validate_manifest(&manifest)?;
-        Ok(manifest)
-    }
-
-    /// Extract embedded manifest from WASM custom section
-    fn extract_embedded_manifest(
-        &self,
-        _wasm_bytes: &[u8],
-        wasm_path: &Path,
-    ) -> Result<Option<PluginManifest>, PluginLoadError> {
-        // In a real implementation, would parse WASM custom sections
-        // looking for a "helios_manifest" section containing JSON
-
-        // For now, return None (no embedded manifest found)
-        let _ = wasm_path;
         Ok(None)
     }
 
-    /// Generate minimal manifest from filename
-    fn generate_minimal_manifest(&self, wasm_path: &Path) -> PluginManifest {
-        let name = wasm_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        PluginManifest {
-            name,
-            version: "0.0.0".to_string(),
-            description: "Auto-generated manifest".to_string(),
-            author: "Unknown".to_string(),
-            license: "Unknown".to_string(),
-            hooks: Vec::new(), // No hooks without manifest
+    /// Load a packed `.tar.gz` artefact: unpack it strictly, check the
+    /// module's SHA-256 against the manifest and, with a trust root, its
+    /// signatures.
+    fn load_tar_gz(&self, path: &Path) -> Result<VerifiedPlugin, PluginLoadError> {
+        let artefact = plugin_artefact::read(path, self.max_bytes)?;
+        let (signed_by, manifest_signed_by) = match &self.signature_verifier {
+            Some(verifier) => {
+                let trust = plugin_artefact::verify_artefact(
+                    &artefact,
+                    verifier.trust_root(),
+                    self.require_signed_manifest,
+                )?;
+                (Some(trust.wasm_signed_by), trust.manifest_signed_by)
+            }
+            None => (None, None),
+        };
+        let hooks = parse_hooks(&artefact.manifest.hooks)?;
+        let manifest = PluginManifest {
+            name: artefact.manifest.name,
+            version: artefact.manifest.version,
+            description: artefact.manifest.description,
+            author: String::new(),
+            license: artefact.manifest.license,
+            hooks,
             permissions: Vec::new(),
-            min_memory: 1024 * 1024,
-            max_memory: 64 * 1024 * 1024,
             config_schema: HashMap::new(),
-            path: wasm_path.to_path_buf(),
-        }
+            path: path.to_path_buf(),
+            ..PluginManifest::default()
+        };
+        validate(&manifest)?;
+        Ok(VerifiedPlugin {
+            manifest,
+            wasm: artefact.wasm,
+            signed_by,
+            manifest_signed_by,
+            unknown_manifest_keys: Vec::new(),
+        })
     }
 
     /// Validate manifest
-    fn validate_manifest(&self, manifest: &PluginManifest) -> Result<(), PluginLoadError> {
-        if manifest.name.is_empty() {
-            return Err(PluginLoadError::ValidationError(
-                "Plugin name is required".to_string(),
-            ));
-        }
-
-        if manifest.name.len() > 128 {
-            return Err(PluginLoadError::ValidationError(
-                "Plugin name too long (max 128 chars)".to_string(),
-            ));
-        }
-
-        // Validate name format (alphanumeric + hyphens)
-        if !manifest
-            .name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(PluginLoadError::ValidationError(
-                "Plugin name must be alphanumeric (hyphens and underscores allowed)".to_string(),
-            ));
-        }
-
-        // Validate version format (semver-like)
-        if !manifest.version.chars().all(|c| c.is_numeric() || c == '.') {
-            return Err(PluginLoadError::ValidationError(
-                "Invalid version format (expected semver)".to_string(),
-            ));
-        }
-
-        // Validate memory requirements
-        if manifest.min_memory > manifest.max_memory {
-            return Err(PluginLoadError::ValidationError(
-                "min_memory cannot exceed max_memory".to_string(),
-            ));
-        }
-
-        if manifest.max_memory > 256 * 1024 * 1024 {
-            return Err(PluginLoadError::ValidationError(
-                "max_memory cannot exceed 256MB".to_string(),
-            ));
-        }
-
-        Ok(())
+    pub fn validate_manifest(&self, manifest: &PluginManifest) -> Result<(), PluginLoadError> {
+        validate(manifest)
     }
 
-    /// Discover plugins in search paths
+    /// The plugin files in the search paths (`.wasm` and `.tar.gz`; hidden
+    /// files and symlinks skipped), sorted.
     pub fn discover(&self) -> Result<Vec<PathBuf>, PluginLoadError> {
         let mut plugins = Vec::new();
-
         for search_path in &self.search_paths {
-            if !search_path.exists() || !search_path.is_dir() {
+            if !search_path.is_dir() {
                 continue;
             }
-
             for entry in fs::read_dir(search_path)? {
                 let entry = entry?;
-                let path = entry.path();
-
-                if !path.is_file() {
+                // Symlinks are not followed: a plugin is a real file here.
+                if !entry.file_type()?.is_file() {
                     continue;
                 }
-
-                let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if self.allowed_extensions.contains(&extension.to_string()) {
+                let path = entry.path();
+                if ArtefactKind::of(&path).is_some() {
                     plugins.push(path);
                 }
             }
         }
-
+        plugins.sort();
         Ok(plugins)
     }
 }
@@ -806,19 +476,128 @@ impl Default for PluginLoader {
     }
 }
 
-/// Parse memory size string (e.g., "64MB", "1024KB")
-fn parse_memory_size(s: &str) -> usize {
-    let s = s.trim().to_uppercase();
-
-    if let Some(mb) = s.strip_suffix("MB") {
-        mb.trim().parse::<usize>().unwrap_or(0) * 1024 * 1024
-    } else if let Some(kb) = s.strip_suffix("KB") {
-        kb.trim().parse::<usize>().unwrap_or(0) * 1024
-    } else if let Some(gb) = s.strip_suffix("GB") {
-        gb.trim().parse::<usize>().unwrap_or(0) * 1024 * 1024 * 1024
-    } else {
-        s.parse::<usize>().unwrap_or(0)
+/// Map manifest hook names to hook types; an unknown name is an error (a
+/// plugin whose hook is silently dropped would never run).
+fn parse_hooks(names: &[String]) -> Result<Vec<HookType>, PluginLoadError> {
+    let mut hooks = Vec::with_capacity(names.len());
+    for name in names {
+        let hook = HookType::from_str(name.trim())
+            .ok_or_else(|| PluginLoadError::ManifestError(format!("unknown hook {name:?}")))?;
+        if hooks.contains(&hook) {
+            return Err(PluginLoadError::ManifestError(format!(
+                "hook {name:?} listed twice"
+            )));
+        }
+        hooks.push(hook);
     }
+    Ok(hooks)
+}
+
+/// The manifest of a bare module that has none (a development
+/// convenience): its file name as the name, version `0.0.0-dev`, and as
+/// hooks the hook functions it exports (`pre_query`, `route`, `post_query`,
+/// `authenticate`; their signatures are checked when it is instantiated).
+fn derived_manifest(wasm_path: &Path, wasm: &[u8]) -> Result<SidecarManifest, PluginLoadError> {
+    let name = wasm_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let exports = exported_functions(wasm)?;
+    let hooks: Vec<String> = [
+        HookType::PreQuery,
+        HookType::Route,
+        HookType::PostQuery,
+        HookType::Authenticate,
+    ]
+    .iter()
+    .map(|h| h.export_name())
+    .filter(|name| exports.iter().any(|e| e == name))
+    .map(str::to_string)
+    .collect();
+    tracing::warn!(
+        path = %wasm_path.display(),
+        plugin = %name,
+        hooks = ?hooks,
+        "plugin module has no manifest; using its file name and the hooks it exports \
+         (development use: pack it with `helios-plugin pack` for production)"
+    );
+    Ok(SidecarManifest {
+        name,
+        version: "0.0.0-dev".to_string(),
+        description: "manifest derived from the module's exports".to_string(),
+        hooks,
+        ..SidecarManifest::default()
+    })
+}
+
+/// The names of the functions a WebAssembly module exports.
+pub fn exported_functions(wasm: &[u8]) -> Result<Vec<String>, PluginLoadError> {
+    Ok(plugin_artefact::wasm_exported_functions(wasm)?)
+}
+
+fn manifest_from_sidecar(
+    sidecar: SidecarManifest,
+    path: &Path,
+) -> Result<PluginManifest, PluginLoadError> {
+    let defaults = PluginManifest::default();
+    let memory = |value: Option<String>, default: usize| -> Result<usize, PluginLoadError> {
+        match value {
+            Some(v) => Ok(plugin_artefact::parse_memory_size(&v)?),
+            None => Ok(default),
+        }
+    };
+    let manifest = PluginManifest {
+        name: sidecar.name,
+        version: if sidecar.version.is_empty() {
+            defaults.version.clone()
+        } else {
+            sidecar.version
+        },
+        description: sidecar.description,
+        author: sidecar.author,
+        license: sidecar.license,
+        hooks: parse_hooks(&sidecar.hooks)?,
+        permissions: sidecar
+            .permissions
+            .iter()
+            .filter_map(|p| Permission::from_str(p))
+            .collect(),
+        min_memory: memory(sidecar.min_memory, defaults.min_memory)?,
+        max_memory: memory(sidecar.max_memory, defaults.max_memory)?,
+        config_schema: HashMap::new(),
+        path: path.to_path_buf(),
+    };
+    validate(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate(manifest: &PluginManifest) -> Result<(), PluginLoadError> {
+    let invalid = |e: ArtefactError| PluginLoadError::ValidationError(e.to_string());
+    if manifest.name.is_empty() {
+        return Err(PluginLoadError::ValidationError(
+            "Plugin name is required".to_string(),
+        ));
+    }
+    plugin_artefact::validate_name(&manifest.name).map_err(invalid)?;
+    plugin_artefact::validate_version(&manifest.version).map_err(invalid)?;
+    if manifest.min_memory > manifest.max_memory {
+        return Err(PluginLoadError::ValidationError(
+            "min_memory cannot exceed max_memory".to_string(),
+        ));
+    }
+    if manifest.max_memory > MAX_PLUGIN_MEMORY {
+        return Err(PluginLoadError::ValidationError(
+            "max_memory cannot exceed 256MB".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The payload of the custom section named `name` in a WebAssembly module,
+/// if it has one.
+pub fn custom_section<'a>(wasm: &'a [u8], name: &str) -> Result<Option<&'a [u8]>, PluginLoadError> {
+    Ok(plugin_artefact::wasm_custom_section(wasm, name)?)
 }
 
 #[cfg(test)]
@@ -843,18 +622,37 @@ mod tests {
     }
 
     #[test]
-    fn test_plugin_loader_new() {
-        let loader = PluginLoader::new();
-        assert!(loader.search_paths.is_empty());
-        assert!(loader.allowed_extensions.contains(&"wasm".to_string()));
+    fn discover_lists_plugin_files_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "b.wasm",
+            "a.tar.gz",
+            "a.sig",
+            "a.json",
+            ".hidden.wasm",
+            "c.gz",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let mut loader = PluginLoader::new();
+        assert!(loader.discover().unwrap().is_empty());
+        loader.add_search_path(dir.path().to_path_buf());
+        let found: Vec<_> = loader
+            .discover()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found, ["a.tar.gz", "b.wasm"]);
     }
 
     #[test]
     fn test_parse_memory_size() {
-        assert_eq!(parse_memory_size("64MB"), 64 * 1024 * 1024);
-        assert_eq!(parse_memory_size("1024KB"), 1024 * 1024);
-        assert_eq!(parse_memory_size("1GB"), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_size("1048576"), 1048576);
+        let size = crate::plugin_artefact::parse_memory_size;
+        assert_eq!(size("64MB").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(size("1024KB").unwrap(), 1024 * 1024);
+        assert_eq!(size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(size("1048576").unwrap(), 1048576);
     }
 
     #[test]
@@ -894,14 +692,154 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// A bare module with no manifest anywhere gets one derived from it:
+    /// its file name, version `0.0.0-dev`, and the hook functions it
+    /// exports.
     #[test]
-    fn test_generate_minimal_manifest() {
-        let loader = PluginLoader::new();
-        let path = PathBuf::from("/plugins/my-plugin.wasm");
-        let manifest = loader.generate_minimal_manifest(&path);
-
+    fn a_bare_module_without_a_manifest_takes_its_hooks_from_its_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("my-plugin.wasm");
+        let wasm = wat::parse_str(
+            r#"(module (memory (export "memory") 1)
+                 (func (export "alloc") (param i32) (result i32) (i32.const 0))
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "route") (param i32 i32) (result i64) (i64.const 0))
+                 (func (export "post_query") (param i32 i32)))"#,
+        )
+        .unwrap();
+        std::fs::write(&path, &wasm).unwrap();
+        let (manifest, _) = PluginLoader::new().load(&path).unwrap();
         assert_eq!(manifest.name, "my-plugin");
-        assert_eq!(manifest.version, "0.0.0");
+        assert_eq!(manifest.version, "0.0.0-dev");
+        assert_eq!(
+            manifest.hooks,
+            [
+                crate::plugins::HookType::Route,
+                crate::plugins::HookType::PostQuery
+            ]
+        );
+        assert_eq!(
+            exported_functions(&wasm).unwrap(),
+            ["alloc", "dealloc", "route", "post_query"]
+        );
+        // A file name that is not a valid plugin name is refused.
+        let odd = dir.path().join("my plugin.wasm");
+        std::fs::write(&odd, &wasm).unwrap();
+        assert!(PluginLoader::new().load(&odd).is_err());
+    }
+
+    /// The manifest may live in the module's `helios_manifest` custom
+    /// section; a sidecar takes precedence over it.
+    #[test]
+    fn an_embedded_manifest_section_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = br#"{"name": "embedded", "version": "2.1.0", "hooks": ["route"]}"#;
+        let name = EMBEDDED_MANIFEST_SECTION.as_bytes();
+        let mut body = vec![name.len() as u8];
+        body.extend_from_slice(name);
+        body.extend_from_slice(json);
+        let mut wasm = fake_wasm(b"");
+        wasm.push(0); // custom section id
+        wasm.push(body.len() as u8);
+        wasm.extend_from_slice(&body);
+        let path = dir.path().join("whatever.wasm");
+        std::fs::write(&path, &wasm).unwrap();
+        let (manifest, bytes) = PluginLoader::new().load(&path).unwrap();
+        assert_eq!(manifest.name, "embedded");
+        assert_eq!(manifest.version, "2.1.0");
+        assert_eq!(manifest.hooks, [crate::plugins::HookType::Route]);
+        assert_eq!(bytes, wasm);
+
+        std::fs::write(
+            dir.path().join("whatever.json"),
+            r#"{"name": "sidecar", "hooks": ["pre_query"]}"#,
+        )
+        .unwrap();
+        assert_eq!(PluginLoader::new().load(&path).unwrap().0.name, "sidecar");
+
+        // A section that runs past the module is malformed.
+        let mut truncated = fake_wasm(b"");
+        truncated.extend_from_slice(&[0, 0x40, 3]);
+        assert!(custom_section(&truncated, EMBEDDED_MANIFEST_SECTION).is_err());
+    }
+
+    /// Hook names are checked: an unknown one refuses the plugin rather
+    /// than being dropped.
+    #[test]
+    fn an_unknown_hook_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.wasm");
+        std::fs::write(&path, fake_wasm(b"")).unwrap();
+        std::fs::write(
+            dir.path().join("p.yaml"),
+            "name: p\nhooks:\n  - pre_query\n  - pre_qeury\n",
+        )
+        .unwrap();
+        let err = PluginLoader::new().load(&path).unwrap_err();
+        assert!(err.to_string().contains("unknown hook"), "{err}");
+        let tar = pack_tarball_hooks(dir.path(), "t", &fake_wasm(b"t"), None, &["route", "nope"]);
+        let err = PluginLoader::new().load(&tar).unwrap_err();
+        assert!(err.to_string().contains("unknown hook"), "{err}");
+    }
+
+    /// Only `.wasm` and `.tar.gz` names are plugin files.
+    #[test]
+    fn other_file_names_are_not_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.gz");
+        std::fs::write(&path, b"x").unwrap();
+        let err = PluginLoader::new().load(&path).unwrap_err();
+        assert!(matches!(err, PluginLoadError::InvalidFormat(_)), "{err:?}");
+    }
+
+    /// `require_signed_manifest` admits only artefacts whose manifest.sig
+    /// verifies: bare modules and schema-1.0 artefacts are refused.
+    #[test]
+    fn signed_manifests_can_be_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust_dir = tempfile::tempdir().unwrap();
+        let key = make_signing_key();
+        write_pub_key(trust_dir.path(), "official", &key);
+        let loader = || {
+            PluginLoader::new()
+                .with_signature_verifier(
+                    SignatureVerifier::from_trust_root(trust_dir.path()).unwrap(),
+                )
+                .require_signed_manifest(true)
+        };
+
+        let wasm = fake_wasm(b"signed");
+        let sig = base64::engine::general_purpose::STANDARD.encode(key.sign(&wasm).to_bytes());
+        let legacy = pack_tarball(dir.path(), "legacy", &wasm, Some(sig.as_bytes()));
+        let err = loader().load(&legacy).unwrap_err();
+        assert!(err.to_string().contains("manifest.sig"), "{err}");
+
+        let bare = dir.path().join("bare.wasm");
+        std::fs::write(&bare, &wasm).unwrap();
+        std::fs::write(dir.path().join("bare.sig"), &sig).unwrap();
+        std::fs::write(
+            dir.path().join("bare.json"),
+            r#"{"name": "bare", "hooks": ["route"]}"#,
+        )
+        .unwrap();
+        let err = loader().load(&bare).unwrap_err();
+        assert!(err.to_string().contains("bare module"), "{err}");
+
+        let input = crate::plugin_artefact::PackInput {
+            name: "signed".into(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            license: String::new(),
+            hooks: vec!["route".into()],
+            wasm,
+            wasm_signature: None,
+        };
+        let (_, bytes) = crate::plugin_artefact::pack(&input, Some(&key)).unwrap();
+        let packed = dir.path().join("signed.tar.gz");
+        std::fs::write(&packed, bytes).unwrap();
+        let verified = loader().load_verified(&packed).unwrap();
+        assert_eq!(verified.signed_by.as_deref(), Some("official"));
+        assert_eq!(verified.manifest_signed_by.as_deref(), Some("official"));
     }
 
     #[test]
@@ -1063,13 +1001,23 @@ mod tests {
     }
 
     fn pack_tarball(dir: &Path, name: &str, wasm: &[u8], sig: Option<&[u8]>) -> std::path::PathBuf {
+        pack_tarball_hooks(dir, name, wasm, sig, &["pre_query", "post_query"])
+    }
+
+    fn pack_tarball_hooks(
+        dir: &Path,
+        name: &str,
+        wasm: &[u8],
+        sig: Option<&[u8]>,
+        hooks: &[&str],
+    ) -> std::path::PathBuf {
         let manifest = serde_json::json!({
             "schema_version": "1.0",
             "name": name,
             "version": "0.1.0",
             "description": "test",
             "license": "Apache-2.0",
-            "hooks": ["pre_query", "post_query"],
+            "hooks": hooks,
             "wasm_sha256": sha256_hex(wasm),
             "signature_sha256": sig.map(sha256_hex),
             "signature_algorithm": sig.map(|_| "ed25519"),
@@ -1154,7 +1102,7 @@ mod tests {
         let err = loader.load(&out_path).unwrap_err();
         match err {
             PluginLoadError::InvalidFormat(msg) => {
-                assert!(msg.contains("sha256 mismatch"), "got {}", msg)
+                assert!(msg.contains("SHA-256"), "got {}", msg)
             }
             other => panic!("expected InvalidFormat, got {:?}", other),
         }
@@ -1195,10 +1143,10 @@ mod tests {
         let loader = PluginLoader::new();
         let err = loader.load(&out_path).unwrap_err();
         match err {
-            PluginLoadError::InvalidFormat(msg) => {
+            PluginLoadError::ManifestError(msg) => {
                 assert!(msg.contains("schema version"), "got {}", msg)
             }
-            other => panic!("expected InvalidFormat, got {:?}", other),
+            other => panic!("expected ManifestError, got {:?}", other),
         }
     }
 

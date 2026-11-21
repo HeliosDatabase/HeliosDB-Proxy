@@ -247,17 +247,13 @@ impl ProxyServer {
         }
 
         if let Some(forced) = forced_target {
-            // Resolve a node *name* to its address; an address is passed
-            // through unchanged. This lets `/*helios:node=pg-standby*/` (and a
-            // plugin `Node("name")`) target a node by its configured name
-            // rather than requiring the raw host:port.
-            let resolved = config
-                .nodes
-                .iter()
-                .find(|n| n.name.as_deref() == Some(forced.as_str()) || n.address() == forced)
-                .map(|n| n.address().to_string())
-                .unwrap_or(forced);
-            return Ok((resolved, false));
+            // A node *name* resolves to its address, so `/*helios:node=pg-standby*/`
+            // (and a plugin `Node("name")`) can name a node. The callers
+            // refuse anything that is not a configured node before this;
+            // here it is checked again rather than dialed.
+            return Self::resolve_forced_target(config, &forced)
+                .map(|address| (address, false))
+                .map_err(ProxyError::Routing);
         }
 
         let healthy = |addr: &str| {
@@ -590,14 +586,16 @@ impl ProxyServer {
         #[cfg(feature = "pool-modes")]
         if let Some(pool) = state.backend_pool.as_ref() {
             let key = Self::pool_key_for(target, session).await;
-            if let Some((stream, slot, backend_key)) = pool.checkout_keyed(&key) {
+            if let Some(parked) = pool.checkout_conn(&key) {
                 tracing::info!(
                     target: "helios::pool",
                     node = %target,
                     "reused pooled backend connection"
                 );
-                let mut bc = BackendConn::with_slot(stream, slot);
-                bc.backend_key = backend_key;
+                let mut bc = BackendConn::with_slot(parked.stream, parked.slot);
+                bc.backend_key = parked.backend_key;
+                #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+                Self::adopt_parked_settings(&mut bc, parked.settings, session).await;
                 conns.insert(target.to_string(), bc);
                 return Ok(());
             }
@@ -1022,13 +1020,113 @@ impl ProxyServer {
         }
     }
 
+    /// Take over what was known about a leased connection's settings when it
+    /// was parked ([`Self::parked_settings`]). A proof carries over only to a
+    /// session with the same startup parameters, which its namespace was
+    /// computed with; its age still counts against `[cache] proof_ttl_ms`.
+    #[cfg(all(
+        feature = "pool-modes",
+        any(feature = "query-cache", feature = "edge-proxy")
+    ))]
+    async fn adopt_parked_settings(
+        bc: &mut BackendConn,
+        settings: crate::pool::ParkedSettings,
+        session: &ClientSession,
+    ) {
+        bc.settings_baseline = settings.baseline;
+        if settings.proof.is_none() && settings.immutable_proof.is_none() {
+            return;
+        }
+        let startup = *Self::cache_startup_namespace(session).await;
+        if let Some(proof) = settings.proof.filter(|p| p.startup == startup) {
+            bc.cache_scope_memo = Some(super::session::CacheScopeMemo {
+                namespace: proof.namespace,
+                startup,
+                at: proof.proven_at,
+                parameter_changes: session.parameter_changes.load(Ordering::Relaxed),
+            });
+        }
+        bc.cache_scope_verified = settings.immutable_proof.filter(|p| p.startup == startup);
+    }
+
+    /// What is known about a connection's settings once it is parked.
+    /// `reset`: `None` when it is parked without a reset (provably clean),
+    /// else whether the reset that ran restores the settings it started
+    /// with (`DISCARD ALL`, no ParameterStatus in its reply).
+    ///
+    /// The settings proof is kept only if it still describes the connection
+    /// after that: with no reset, any valid proof; after a restoring reset,
+    /// one taken while the connection still had its reset settings
+    /// ([`BackendConn::settings_baseline`]). The immutable-context proof
+    /// holds for the physical connection and is always kept.
+    #[cfg(all(
+        feature = "pool-modes",
+        any(feature = "query-cache", feature = "edge-proxy")
+    ))]
+    fn parked_settings(
+        bc: &BackendConn,
+        reset: Option<bool>,
+        session: &ClientSession,
+    ) -> crate::pool::ParkedSettings {
+        let (baseline, keeps_proof) = match reset {
+            None => (bc.settings_baseline, true),
+            Some(restores) => (restores, restores && bc.settings_baseline),
+        };
+        let proof = bc
+            .cache_scope_memo
+            .filter(|memo| {
+                keeps_proof
+                    && memo.parameter_changes == session.parameter_changes.load(Ordering::Relaxed)
+            })
+            .map(|memo| crate::pool::SettingsProof {
+                namespace: memo.namespace,
+                startup: memo.startup,
+                proven_at: memo.at,
+            });
+        crate::pool::ParkedSettings {
+            baseline,
+            proof,
+            immutable_proof: bc.cache_scope_verified,
+        }
+    }
+
+    /// Without a result cache nothing is proven about a connection's settings.
+    #[cfg(all(
+        feature = "pool-modes",
+        not(any(feature = "query-cache", feature = "edge-proxy"))
+    ))]
+    fn parked_settings(
+        _bc: &BackendConn,
+        _reset: Option<bool>,
+        _session: &ClientSession,
+    ) -> crate::pool::ParkedSettings {
+        crate::pool::ParkedSettings::default()
+    }
+
+    /// The reset query restores every setting to the value the connection
+    /// started with. Only `DISCARD ALL` is recognised (`RESET ALL` leaves
+    /// the role and session authorization as they are); any other reset
+    /// query leaves the settings unknown, so the next cached read on the
+    /// connection proves them again.
+    #[cfg(feature = "pool-modes")]
+    pub(super) fn reset_restores_settings(reset_sql: &str) -> bool {
+        let words: Vec<&str> = reset_sql
+            .trim()
+            .trim_end_matches(|c: char| c == ';' || c.is_whitespace())
+            .split_whitespace()
+            .collect();
+        matches!(words.as_slice(), [a, b] if a.eq_ignore_ascii_case("discard") && b.eq_ignore_ascii_case("all"))
+    }
+
     /// Reset a backend connection to a clean session state before parking it
     /// for reuse: runs the configured reset query (default `DISCARD ALL`,
     /// which deallocates prepared statements, drops temp tables, resets GUCs
     /// and advisory locks) and drains its response to `ReadyForQuery`. Returns
     /// `Err` if the connection is unhealthy OR the reset itself did not cleanly
     /// succeed — the caller then drops (closes) it instead of parking a
-    /// poisoned connection.
+    /// poisoned connection. `Ok(true)`: the reply reported a parameter
+    /// (ParameterStatus), so the settings are not those the connection
+    /// started with as far as the proxy knows.
     ///
     /// "Cleanly succeeded" means: no `ErrorResponse` frame in the reply AND the
     /// terminating `ReadyForQuery` reported idle (`'I'`, not in/failed
@@ -1045,7 +1143,7 @@ impl ProxyServer {
         reset_sql: &str,
         backend_write_timeout: Duration,
         max_frame_bytes: usize,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let msg = crate::protocol::QueryMessage {
             query: reset_sql.to_string(),
         }
@@ -1057,6 +1155,7 @@ impl ProxyServer {
 
         let mut buf = BytesMut::with_capacity(1024);
         let mut had_error = false;
+        let mut reported = false;
         loop {
             // Walk complete frames by raw tag, tracking any ErrorResponse and
             // stopping at ReadyForQuery.
@@ -1075,6 +1174,7 @@ impl ProxyServer {
                 if mtype == b'E' {
                     had_error = true;
                 }
+                reported |= mtype == b'S';
                 consumed += frame_total;
                 if mtype == b'Z' {
                     ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
@@ -1090,7 +1190,7 @@ impl ProxyServer {
                         had_error, status as char
                     )));
                 }
-                return Ok(());
+                return Ok(reported);
             }
 
             buf.reserve(1024);
@@ -1118,6 +1218,23 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
+    ) {
+        Self::release_lease(conns, node, session, state, config, false).await;
+    }
+
+    /// [`Self::release_to_pool_if_idle`]. `untouched`: the request that
+    /// leased the connection sent it nothing but the result cache's settings
+    /// proof (a cache hit), so it is parked without the reset, as it was
+    /// parked before: a leased connection was reset or provably clean when
+    /// parked, and a fresh one holds its startup state.
+    #[cfg(feature = "pool-modes")]
+    pub(super) async fn release_lease(
+        conns: &mut HashMap<String, BackendConn>,
+        node: Option<&str>,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+        untouched: bool,
     ) {
         let Some(pool) = state.backend_pool.as_ref() else {
             return;
@@ -1157,31 +1274,50 @@ impl ProxyServer {
         // not record), so it is never clean-skipped (conservative by
         // construction). Nor is an unnamed statement or portal the session no
         // longer has (`unnamed_stale`).
-        let clean = !bc.dirty
-            && bc.prepared.is_empty()
+        let holds_nothing = bc.prepared.is_empty()
             && bc.stale.is_empty()
             && bc.unnamed_sig.is_none()
+            && !bc.unnamed_untracked
             && !bc.unnamed_stale.any();
-        if config.pool_mode.skip_clean_reset && clean {
+        if holds_nothing && (untouched || (config.pool_mode.skip_clean_reset && !bc.dirty)) {
             let key = Self::pool_key_for(node, session).await;
-            if pool.checkin_keyed(&key, bc.stream, bc._slot, bc.backend_key) {
+            let settings = Self::parked_settings(&bc, None, session);
+            if pool.checkin_conn(
+                &key,
+                crate::pool::PooledConn {
+                    stream: bc.stream,
+                    slot: bc._slot,
+                    backend_key: bc.backend_key,
+                    settings,
+                },
+            ) {
                 pool.note_reset_skipped();
                 tracing::debug!(target: "helios::pool", node = %node, "parked clean backend connection (reset skipped)");
             }
             return;
         }
 
-        if Self::reset_backend(
+        if let Ok(reported) = Self::reset_backend(
             &mut bc.stream,
             &config.pool_mode.reset_query,
             state.limits.backend_write_timeout,
             state.limits.max_backend_frame_bytes,
         )
         .await
-        .is_ok()
         {
             let key = Self::pool_key_for(node, session).await;
-            if pool.checkin_keyed(&key, bc.stream, bc._slot, bc.backend_key) {
+            let restores =
+                !reported && Self::reset_restores_settings(&config.pool_mode.reset_query);
+            let settings = Self::parked_settings(&bc, Some(restores), session);
+            if pool.checkin_conn(
+                &key,
+                crate::pool::PooledConn {
+                    stream: bc.stream,
+                    slot: bc._slot,
+                    backend_key: bc.backend_key,
+                    settings,
+                },
+            ) {
                 tracing::debug!(target: "helios::pool", node = %node, "parked backend connection for reuse");
             }
             return;

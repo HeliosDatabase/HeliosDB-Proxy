@@ -157,3 +157,97 @@ async fn write_path_capture_excludes_failed_and_rolled_back_work() {
     ProxyServer::journal_close(&session, &server.state).await;
     assert_eq!(server.state.transaction_journal.active_count().await, 0);
 }
+
+/// Metadata stays bounded, and discarding a refused cycle cannot contaminate
+/// the next request with completion tags that never belonged to it.
+#[test]
+fn journal_response_prefix_is_bounded_and_discarded() {
+    use super::make_test_session;
+    use crate::journal_capture::Completion;
+    use crate::server::ProxyServer;
+    use std::sync::atomic::Ordering;
+    let session = make_test_session();
+    ProxyServer::journal_stash_response(
+        &session,
+        vec![Completion::Tag("INSERT 0 1".into())],
+        None,
+        256,
+    )
+    .unwrap();
+    assert!(session.journal_response_pending.load(Ordering::Acquire));
+    assert!(ProxyServer::journal_stash_response(
+        &session,
+        vec![Completion::Tag("x".repeat(1024))],
+        None,
+        256
+    )
+    .is_err());
+    let held = session.journal_response_prefix.lock().unwrap();
+    assert_eq!(
+        held.as_ref().unwrap().0.completions.len(),
+        1,
+        "rejected metadata was retained"
+    );
+    drop(held);
+    ProxyServer::journal_discard(&session, b'I');
+    assert!(!session.journal_response_pending.load(Ordering::Acquire));
+    assert!(session.journal_response_prefix.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn journal_response_prefix_keeps_an_earlier_error() {
+    use super::{make_test_session, test_config};
+    use crate::journal_capture::{Completion, ResponseOutcome};
+    use crate::server::ProxyServer;
+    use std::sync::atomic::Ordering;
+    let server = ProxyServer::new(test_config()).unwrap();
+    let session = make_test_session();
+    for (sql, status, tag) in [
+        ("BEGIN", b'T', "BEGIN"),
+        ("INSERT INTO t VALUES (1)", b'E', ""),
+        ("COMMIT", b'I', "ROLLBACK"),
+    ] {
+        ProxyServer::journal_register_simple(&session, sql);
+        if sql.starts_with("INSERT") {
+            ProxyServer::journal_stash_response(
+                &session,
+                Vec::new(),
+                Some(("23505".into(), "duplicate".into())),
+                4096,
+            )
+            .unwrap();
+        }
+        ProxyServer::journal_observe(
+            &session,
+            &server.state,
+            ResponseOutcome {
+                status,
+                completions: if tag.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Completion::Tag(tag.into())]
+                },
+                error: None,
+            },
+        )
+        .await;
+    }
+    assert_eq!(
+        server
+            .state
+            .metrics
+            .journal_committed
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        server
+            .state
+            .metrics
+            .journal_statements
+            .load(Ordering::Relaxed),
+        0,
+        "a failed write was journaled as successful"
+    );
+    assert!(!session.journal_response_pending.load(Ordering::Acquire));
+}

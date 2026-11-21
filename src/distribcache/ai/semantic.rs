@@ -264,8 +264,10 @@ impl Ord for SimilarityResult {
     }
 }
 
-/// Simple HNSW-like index for semantic search
-/// (Simplified implementation - production would use a proper HNSW library)
+/// Exact nearest-neighbour index for semantic search: every search scans all
+/// stored vectors and ranks them by cosine similarity. Results are exact;
+/// search cost is linear in the number of vectors (no approximate graph
+/// index such as HNSW).
 pub struct SemanticIndex {
     /// All vectors with their IDs
     vectors: DashMap<VectorId, Embedding>,
@@ -274,30 +276,15 @@ pub struct SemanticIndex {
     next_id: AtomicU64,
 }
 
-/// Semantic index configuration
-#[derive(Debug, Clone)]
-pub struct SemanticIndexConfig {
-    /// Maximum connections per node (M parameter)
-    pub max_connections: usize,
-    /// Search expansion factor (ef parameter)
-    pub ef_search: usize,
-    /// Embedding dimension
-    pub dimension: usize,
-}
-
-impl Default for SemanticIndexConfig {
+impl Default for SemanticIndex {
     fn default() -> Self {
-        Self {
-            max_connections: 16,
-            ef_search: 100,
-            dimension: 384, // Common embedding size
-        }
+        Self::new()
     }
 }
 
 impl SemanticIndex {
-    /// Create a new semantic index
-    pub fn new(_config: SemanticIndexConfig) -> Self {
+    /// Create a new, empty semantic index
+    pub fn new() -> Self {
         Self {
             vectors: DashMap::new(),
             next_id: AtomicU64::new(1),
@@ -316,9 +303,9 @@ impl SemanticIndex {
         self.vectors.remove(&id);
     }
 
-    /// Search for k nearest neighbors
+    /// The `k` stored vectors most similar to `query` (exact linear scan),
+    /// most similar first.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(VectorId, f32)> {
-        // Brute force search (production would use HNSW)
         let mut heap: BinaryHeap<(std::cmp::Reverse<i64>, VectorId)> = BinaryHeap::new();
 
         for entry in self.vectors.iter() {
@@ -420,22 +407,7 @@ impl SemanticQueryCache {
     /// Create a new semantic query cache with specified capacity
     pub fn with_capacity(threshold: f32, max_entries: usize) -> Self {
         Self {
-            index: SemanticIndex::new(SemanticIndexConfig::default()),
-            entries: DashMap::new(),
-            threshold,
-            max_entries,
-            stats: SemanticCacheStats::default(),
-        }
-    }
-
-    /// Create with custom index config
-    pub fn with_config(
-        threshold: f32,
-        max_entries: usize,
-        index_config: SemanticIndexConfig,
-    ) -> Self {
-        Self {
-            index: SemanticIndex::new(index_config),
+            index: SemanticIndex::new(),
             entries: DashMap::new(),
             threshold,
             max_entries,
@@ -1027,7 +999,7 @@ mod tests {
 
     #[test]
     fn test_semantic_index() {
-        let index = SemanticIndex::new(SemanticIndexConfig::default());
+        let index = SemanticIndex::new();
 
         let id1 = index.insert(vec![1.0, 0.0, 0.0]);
         let id2 = index.insert(vec![0.9, 0.1, 0.0]);

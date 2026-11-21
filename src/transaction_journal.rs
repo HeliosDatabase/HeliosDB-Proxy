@@ -7,7 +7,7 @@ use super::{NodeId, ProxyError, Result};
 use crate::protocol::starts_with_ci;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -248,6 +248,21 @@ pub struct TransactionJournalEntry {
     /// transaction instead of applying it partially.
     #[serde(default)]
     pub incomplete_reason: Option<String>,
+    /// Runtime-only tenant charge follows the transaction from active capture
+    /// into committed retention and is released by rollback, eviction, or
+    /// the last read handle. It is deliberately absent from durable encoding.
+    #[serde(skip)]
+    pub(crate) tenant_journal_charge: Option<Arc<crate::tenant_slots::TenantJournalCharge>>,
+    /// [`Self::total_size`] of the first `sized_entries` entries, so the
+    /// size cap checked before every appended statement measures only what
+    /// was appended since the last check instead of walking the whole
+    /// journal again (a long transaction was quadratic). See
+    /// [`Self::tracked_size`]. Not encoded: a decoded journal starts at zero
+    /// and is measured on its first append.
+    #[serde(skip)]
+    sized_entries: usize,
+    #[serde(skip)]
+    sized_bytes: usize,
 }
 
 /// Savepoint information
@@ -262,6 +277,43 @@ pub struct Savepoint {
 }
 
 impl TransactionJournalEntry {
+    /// Conservative, deterministic estimate of memory retained by this
+    /// recovery record. Payload bytes are exact; metadata uses fixed overheads
+    /// so the result is stable across allocator implementations. This is a
+    /// budget accounting measure, not an RSS estimate.
+    pub fn retained_size_bytes(&self) -> usize {
+        const TX_OVERHEAD: usize = 512;
+        const SAVEPOINT_OVERHEAD: usize = 64;
+
+        let mut total = TX_OVERHEAD;
+        total = total.saturating_add(self.source.client_addr.len());
+        total = total.saturating_add(self.source.user.len());
+        total = total.saturating_add(self.source.database.len());
+        total = total.saturating_add(self.source.backend.len());
+        if let Some(tenant) = &self.source.tenant {
+            total = total.saturating_add(tenant.len());
+        }
+        total = total.saturating_add(self.commit_tag.as_ref().map_or(0, |tag| tag.len()));
+        total = total.saturating_add(
+            self.incomplete_reason
+                .as_ref()
+                .map_or(0, |reason| reason.len()),
+        );
+        total = total.saturating_add(self.entries.iter().fold(0usize, |sum, entry| {
+            sum.saturating_add(entry.retained_size_bytes())
+        }));
+        total.saturating_add(
+            self.savepoints
+                .len()
+                .saturating_mul(SAVEPOINT_OVERHEAD)
+                .saturating_add(
+                    self.savepoints
+                        .iter()
+                        .fold(0usize, |sum, sp| sum.saturating_add(sp.name.len())),
+                ),
+        )
+    }
+
     /// Create a new transaction journal entry
     pub fn new(tx_id: Uuid, session_id: Uuid, node_id: NodeId, start_lsn: u64) -> Self {
         Self {
@@ -280,6 +332,33 @@ impl TransactionJournalEntry {
             committed_at: None,
             commit_tag: None,
             incomplete_reason: None,
+            tenant_journal_charge: None,
+            sized_entries: 0,
+            sized_bytes: 0,
+        }
+    }
+
+    /// Resize the transaction's shared tenant reservation to match its
+    /// current retained size. A failed growth leaves the prior charge intact.
+    pub(crate) fn settle_tenant_journal_budget(
+        &mut self,
+        budget: &Arc<crate::tenant_slots::TenantJournalBudget>,
+    ) -> bool {
+        self.settle_tenant_journal_size(self.retained_size_bytes(), budget)
+    }
+
+    pub(crate) fn settle_tenant_journal_size(
+        &mut self,
+        retained: usize,
+        budget: &Arc<crate::tenant_slots::TenantJournalBudget>,
+    ) -> bool {
+        if let Some(charge) = &self.tenant_journal_charge {
+            charge.settle(retained)
+        } else if let Some(charge) = budget.try_reserve(retained) {
+            self.tenant_journal_charge = Some(Arc::new(charge));
+            true
+        } else {
+            false
         }
     }
 
@@ -302,7 +381,42 @@ impl TransactionJournalEntry {
             self.has_mutations = true;
         }
         self.current_sequence = entry.sequence;
+        if self.sized_entries > self.entries.len() {
+            // Entries the running size counted were removed from the public
+            // `entries` directly: this append must not stand in for them.
+            self.forget_size();
+        }
         self.entries.push(entry);
+    }
+
+    /// Drop every captured entry (the journal keeps its identity).
+    pub(crate) fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.forget_size();
+    }
+
+    fn forget_size(&mut self) {
+        self.sized_entries = 0;
+        self.sized_bytes = 0;
+    }
+
+    /// [`Self::total_size`] for the append path, which checks the size cap
+    /// before every statement: the running size plus the entries appended
+    /// since it was taken, so a transaction of `n` statements measures each
+    /// entry once instead of `n` times. Whatever removes entries
+    /// ([`Self::rollback_to_savepoint`], [`Self::clear_entries`], a shorter
+    /// `entries`) starts the count over. Code that rewrites counted entries
+    /// in place through the public `entries` is not seen; `total_size` always
+    /// walks and stays exact.
+    pub(crate) fn tracked_size(&mut self) -> usize {
+        if self.sized_entries > self.entries.len() {
+            self.forget_size();
+        }
+        for entry in &self.entries[self.sized_entries..] {
+            self.sized_bytes += entry.payload_size();
+        }
+        self.sized_entries = self.entries.len();
+        self.sized_bytes
     }
 
     /// Create a savepoint
@@ -322,6 +436,7 @@ impl TransactionJournalEntry {
 
             // Truncate entries after savepoint
             self.entries.retain(|e| e.sequence <= sequence);
+            self.forget_size();
 
             // Remove later savepoints
             self.savepoints.truncate(idx + 1);
@@ -346,28 +461,115 @@ impl TransactionJournalEntry {
     }
 
     /// Calculate total size of journal
+    ///
+    /// One flat walk on the path the capture produces (no array parameter):
+    /// nothing in it calls out, so it keeps its sum in registers wherever it
+    /// is inlined. An array parameter restarts the sum out of line in
+    /// [`Self::total_size_nested`].
+    #[inline]
     pub fn total_size(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|e| e.statement.len() + estimate_params_size(&e.parameters))
-            .sum()
+        let mut total = 0usize;
+        let mut nested = false;
+        for entry in &self.entries {
+            total += entry.statement.len();
+            for parameter in &entry.parameters {
+                total += match parameter {
+                    JournalValue::Null | JournalValue::Bool(_) => 1,
+                    JournalValue::Int64(_) | JournalValue::Float64(_) => 8,
+                    JournalValue::Text(text) => text.len(),
+                    JournalValue::Bytes(bytes)
+                    | JournalValue::TextRaw(bytes)
+                    | JournalValue::Binary(bytes) => bytes.len(),
+                    JournalValue::Array(_) => {
+                        nested = true;
+                        0
+                    }
+                };
+            }
+        }
+        if nested {
+            return self.total_size_nested();
+        }
+        total
+    }
+
+    /// [`Self::total_size`] of a journal holding array parameters.
+    #[cold]
+    #[inline(never)]
+    fn total_size_nested(&self) -> usize {
+        self.entries.iter().map(JournalEntry::payload_size).sum()
     }
 }
 
-fn estimate_params_size(params: &[JournalValue]) -> usize {
-    params
-        .iter()
-        .map(|p| match p {
-            JournalValue::Null => 1,
-            JournalValue::Bool(_) => 1,
-            JournalValue::Int64(_) => 8,
-            JournalValue::Float64(_) => 8,
-            JournalValue::Text(s) => s.len(),
-            JournalValue::Bytes(b) => b.len(),
-            JournalValue::Array(a) => estimate_params_size(a),
-            JournalValue::TextRaw(b) | JournalValue::Binary(b) => b.len(),
+impl JournalEntry {
+    /// What this entry adds to [`TransactionJournalEntry::total_size`].
+    #[inline]
+    fn payload_size(&self) -> usize {
+        self.statement.len() + estimate_params_size(&self.parameters)
+    }
+
+    /// Deterministic retained-size estimate for one journal entry.
+    pub(crate) fn retained_size_bytes(&self) -> usize {
+        const ENTRY_OVERHEAD: usize = 256;
+        let mut total = ENTRY_OVERHEAD.saturating_add(self.statement.len());
+        total = total.saturating_add(self.param_types.len().saturating_mul(4));
+        for parameter in &self.parameters {
+            total = total.saturating_add(parameter.retained_size_bytes());
+        }
+        total.saturating_add(match &self.outcome {
+            StatementOutcome::Unobserved => 0,
+            StatementOutcome::Succeeded { tag } => tag.len(),
+            StatementOutcome::Failed(failure) => {
+                failure.sqlstate.len().saturating_add(failure.message.len())
+            }
         })
-        .sum()
+    }
+}
+
+impl JournalValue {
+    /// Conservative deterministic size used by tenant recovery-journal
+    /// accounting. Every recursively retained value includes fixed metadata.
+    fn retained_size_bytes(&self) -> usize {
+        const VALUE_OVERHEAD: usize = 32;
+        VALUE_OVERHEAD.saturating_add(match self {
+            JournalValue::Null => 0,
+            JournalValue::Bool(_) => 1,
+            JournalValue::Int64(_) | JournalValue::Float64(_) => 8,
+            JournalValue::Text(text) => text.len(),
+            JournalValue::Bytes(bytes)
+            | JournalValue::TextRaw(bytes)
+            | JournalValue::Binary(bytes) => bytes.len(),
+            JournalValue::Array(values) => values.iter().fold(0usize, |sum, value| {
+                sum.saturating_add(value.retained_size_bytes())
+            }),
+        })
+    }
+}
+
+/// The size walk of [`TransactionJournalEntry::total_size`], run for every
+/// journaled statement. Scalar and byte parameters are sized in the caller's
+/// loop; only an array, which the capture path never produces, leaves it.
+/// Sharing one recursive body for both made the common walk depend on how
+/// that body happened to be inlined.
+#[inline]
+fn estimate_params_size(params: &[JournalValue]) -> usize {
+    params.iter().map(param_size).sum()
+}
+
+#[inline(always)]
+fn param_size(param: &JournalValue) -> usize {
+    match param {
+        JournalValue::Null | JournalValue::Bool(_) => 1,
+        JournalValue::Int64(_) | JournalValue::Float64(_) => 8,
+        JournalValue::Text(s) => s.len(),
+        JournalValue::Bytes(b) | JournalValue::TextRaw(b) | JournalValue::Binary(b) => b.len(),
+        JournalValue::Array(values) => array_size(values),
+    }
+}
+
+#[inline(never)]
+fn array_size(values: &[JournalValue]) -> usize {
+    values.iter().map(param_size).sum()
 }
 
 /// Everything `TransactionJournal::log_entry` needs to append one statement.
@@ -384,6 +586,23 @@ pub struct NewEntry {
 }
 
 impl NewEntry {
+    /// Deterministic size of the journal entry this value will materialize.
+    pub(crate) fn retained_size_bytes(&self) -> usize {
+        const ENTRY_OVERHEAD: usize = 256;
+        let mut total = ENTRY_OVERHEAD.saturating_add(self.statement.len());
+        total = total.saturating_add(self.param_types.len().saturating_mul(4));
+        for parameter in &self.parameters {
+            total = total.saturating_add(parameter.retained_size_bytes());
+        }
+        total.saturating_add(match &self.outcome {
+            StatementOutcome::Unobserved => 0,
+            StatementOutcome::Succeeded { tag } => tag.len(),
+            StatementOutcome::Failed(failure) => {
+                failure.sqlstate.len().saturating_add(failure.message.len())
+            }
+        })
+    }
+
     /// Materialize the entry with its sequence number and a timestamp of now.
     pub fn into_journal_entry(self, sequence: u64) -> JournalEntry {
         JournalEntry {
@@ -414,6 +633,10 @@ pub trait JournalSink: Send + Sync {
     fn append(&self, tx: &Arc<TransactionJournalEntry>) -> bool;
     /// Whether records this sink accepted survive a process restart.
     fn durable(&self) -> bool;
+    /// Block until every record accepted so far is written out under the
+    /// sink's sync policy. Called once at shutdown; a sink that keeps no
+    /// buffered state has nothing to do.
+    fn flush(&self) {}
 }
 
 /// Committed transactions in commit order, bounded by count and bytes.
@@ -516,17 +739,20 @@ impl JournalStore {
         tx_id: Uuid,
         journal: TransactionJournalEntry,
     ) -> &mut TransactionJournalEntry {
+        use std::collections::hash_map::Entry;
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        if let Some((old_seq, _)) = self.entries.insert(tx_id, (seq, journal)) {
-            self.order.remove(&old_seq);
-        }
         self.order.insert(seq, tx_id);
-        &mut self
-            .entries
-            .get_mut(&tx_id)
-            .expect("journal just inserted")
-            .1
+        // One hash of the key: the slot found for the insert is the handle.
+        match self.entries.entry(tx_id) {
+            Entry::Occupied(slot) => {
+                let slot = slot.into_mut();
+                self.order.remove(&slot.0);
+                *slot = (seq, journal);
+                &mut slot.1
+            }
+            Entry::Vacant(slot) => &mut slot.insert((seq, journal)).1,
+        }
     }
 
     fn take(&mut self, tx_id: &Uuid) -> Option<TransactionJournalEntry> {
@@ -645,6 +871,10 @@ pub struct TransactionJournal {
     rolled_back_total: AtomicU64,
     /// Committed transactions the sink could not accept.
     dropped_total: AtomicU64,
+    /// Sticky process-local loss-of-capture signal. If even a compact
+    /// incomplete marker cannot be retained, committed-history replay must
+    /// fail closed rather than treating a missing commit as a complete window.
+    capture_gap: AtomicBool,
 }
 
 impl TransactionJournal {
@@ -665,6 +895,7 @@ impl TransactionJournal {
             committed_total: AtomicU64::new(0),
             rolled_back_total: AtomicU64::new(0),
             dropped_total: AtomicU64::new(0),
+            capture_gap: AtomicBool::new(false),
         }
     }
 
@@ -686,6 +917,19 @@ impl TransactionJournal {
         self
     }
 
+    /// Write out what the sink holds (the shutdown path). Blocks: call it
+    /// from a blocking context.
+    pub fn flush_sink(&self) {
+        if let Some(sink) = &self.sink {
+            sink.flush();
+        }
+    }
+
+    /// Whether a sink is attached (a `[journal] dir` is configured).
+    pub fn has_sink(&self) -> bool {
+        self.sink.is_some()
+    }
+
     /// Whether committed transactions are handed to a durable sink.
     pub fn is_durable(&self) -> bool {
         self.sink.as_ref().map(|s| s.durable()).unwrap_or(false)
@@ -701,6 +945,18 @@ impl TransactionJournal {
         self.next_commit_seq
             .load(Ordering::SeqCst)
             .saturating_sub(1)
+    }
+
+    /// Mark that a committed transaction could not be represented in retained
+    /// history, even as an incomplete marker.
+    pub fn mark_capture_gap(&self) {
+        self.capture_gap.store(true, Ordering::Release);
+    }
+
+    /// Whether committed-history replay must fail closed due to an unrecorded
+    /// capture gap.
+    pub fn has_capture_gap(&self) -> bool {
+        self.capture_gap.load(Ordering::Acquire)
     }
 
     /// Reload committed transactions recovered from a durable sink, in the
@@ -880,7 +1136,7 @@ impl TransactionJournal {
         tx: TransactionJournalEntry,
         commit_tag: &str,
     ) -> Option<u64> {
-        if !self.enabled || tx.entries.is_empty() {
+        if !self.enabled || (tx.entries.is_empty() && tx.incomplete_reason.is_none()) {
             return None;
         }
         let stamp = CommitStamp::now(commit_tag);
@@ -1072,7 +1328,7 @@ impl TransactionJournal {
             ));
         }
 
-        if journal.total_size() >= max_size {
+        if journal.tracked_size() >= max_size {
             return Err(ProxyError::Internal(
                 "Transaction journal size limit exceeded".to_string(),
             ));
@@ -1328,6 +1584,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_size_accounts_for_payload_and_metadata_deterministically() {
+        let mut tx = TransactionJournalEntry::new(Uuid::nil(), Uuid::nil(), NodeId::new(), 0);
+        assert_eq!(tx.retained_size_bytes(), 512);
+        tx.source = SourceIdentity {
+            client_addr: "client".into(),
+            user: "user".into(),
+            database: "db".into(),
+            backend: "node".into(),
+            tenant: Some("tenant".into()),
+        };
+        tx.add_entry(JournalEntry {
+            sequence: 1,
+            statement: "INSERT".into(),
+            parameters: vec![
+                JournalValue::Text("abc".into()),
+                JournalValue::Array(vec![JournalValue::Binary(vec![1, 2])]),
+            ],
+            param_types: vec![23, 25],
+            result_checksum: None,
+            rows_affected: None,
+            timestamp: chrono::Utc::now(),
+            statement_type: StatementType::Insert,
+            duration_ms: 1,
+            outcome: StatementOutcome::Succeeded {
+                tag: "INSERT 0 1".into(),
+            },
+            protocol: WireProtocol::Extended,
+        });
+        tx.create_savepoint("s1".into());
+        let size = tx.retained_size_bytes();
+        assert!(size > 512 + "clientuserdbnodetenant".len());
+        assert_eq!(size, tx.retained_size_bytes());
+
+        let before = size;
+        tx.mark_incomplete("reason");
+        assert_eq!(tx.retained_size_bytes(), before + "reason".len());
+    }
+
+    /// The running size the append path trusts equals the full walk after
+    /// every way a journal changes: appends, a savepoint rollback, clearing,
+    /// a serde round trip (the running size is not encoded) and entries
+    /// removed from `entries` directly, including when a later append
+    /// restores the counted length.
+    #[test]
+    fn tracked_size_follows_every_journal_mutation() {
+        fn entry(sequence: u64, sql: &str) -> JournalEntry {
+            NewEntry {
+                statement: sql.to_string(),
+                parameters: vec![
+                    JournalValue::Text("abc".into()),
+                    JournalValue::Array(vec![JournalValue::Int64(7), JournalValue::Null]),
+                ],
+                param_types: Vec::new(),
+                result_checksum: None,
+                rows_affected: Some(1),
+                duration_ms: 0,
+                outcome: StatementOutcome::Unobserved,
+                protocol: WireProtocol::Simple,
+            }
+            .into_journal_entry(sequence)
+        }
+        fn check(tx: &mut TransactionJournalEntry) {
+            assert_eq!(tx.tracked_size(), tx.total_size());
+        }
+        let mut tx = TransactionJournalEntry::new(Uuid::nil(), Uuid::nil(), NodeId::new(), 0);
+        check(&mut tx);
+        for seq in 1..=4 {
+            tx.add_entry(entry(seq, "insert into t values ($1, $2)"));
+            check(&mut tx);
+        }
+        assert!(tx.total_size() > 0);
+        tx.create_savepoint("s".into());
+        tx.add_entry(entry(5, "update t set v = v + 1"));
+        tx.add_entry(entry(6, "delete from t"));
+        check(&mut tx);
+        assert_eq!(tx.rollback_to_savepoint("s"), Some(4));
+        assert_eq!(tx.entries.len(), 4);
+        check(&mut tx);
+
+        // Edited behind the running size, then brought back to the counted
+        // length by an append: the stale count must not be reused.
+        tx.entries.pop();
+        tx.add_entry(entry(7, "a much longer statement than the one it replaces"));
+        assert_eq!(tx.entries.len(), 4);
+        check(&mut tx);
+        tx.entries.push(entry(8, "pushed directly"));
+        check(&mut tx);
+
+        let mut decoded: TransactionJournalEntry =
+            serde_json::from_str(&serde_json::to_string(&tx).unwrap()).unwrap();
+        assert_eq!(decoded.entries.len(), tx.entries.len());
+        check(&mut decoded);
+        decoded.add_entry(entry(9, "after decoding"));
+        check(&mut decoded);
+
+        tx.clear_entries();
+        assert_eq!(tx.tracked_size(), 0);
+        tx.add_entry(entry(1, "select 1"));
+        check(&mut tx);
+    }
+
+    /// The per-statement size cap is enforced from the running size exactly
+    /// where the full walk enforced it.
+    #[test]
+    fn append_entry_enforces_the_size_cap_from_the_running_size() {
+        let journal = TransactionJournal::new().with_max_size(64);
+        let mut tx = TransactionJournalEntry::new(Uuid::new_v4(), Uuid::new_v4(), NodeId::new(), 0);
+        let new = |sql: &str| NewEntry {
+            statement: sql.to_string(),
+            parameters: Vec::new(),
+            param_types: Vec::new(),
+            result_checksum: None,
+            rows_affected: None,
+            duration_ms: 0,
+            outcome: StatementOutcome::Unobserved,
+            protocol: WireProtocol::Simple,
+        };
+        let sql = "x".repeat(40);
+        journal.append_entry(&mut tx, new(&sql)).unwrap();
+        // 40 < 64: the cap is checked before the append, as before.
+        journal.append_entry(&mut tx, new(&sql)).unwrap();
+        assert_eq!(tx.total_size(), 80);
+        assert!(journal.append_entry(&mut tx, new(&sql)).is_err());
+        assert_eq!(tx.entries.len(), 2);
+    }
+
+    #[test]
     fn test_statement_type_detection() {
         assert_eq!(
             StatementType::from_sql("SELECT * FROM users"),
@@ -1415,6 +1798,37 @@ mod tests {
         assert!(!StatementType::Select.is_mutation());
     }
 
+    /// Beginning a transaction id that is still active replaces its journal
+    /// and its place in the eviction order: one journal remains, the handle
+    /// `insert` returns is the new one, and the stale order slot is gone (an
+    /// eviction pass removes exactly the journals it counts).
+    #[test]
+    fn journal_store_insert_replaces_the_journal_and_its_eviction_slot() {
+        let journal =
+            |lsn| TransactionJournalEntry::new(Uuid::nil(), Uuid::nil(), NodeId::new(), lsn);
+        let mut store = JournalStore::default();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        assert_eq!(store.insert(first, journal(1)).start_lsn, 1);
+        assert_eq!(store.insert(second, journal(2)).start_lsn, 2);
+        let replaced = store.insert(first, journal(3));
+        assert_eq!(replaced.start_lsn, 3);
+        replaced.active = false;
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.order.len(), 2);
+        assert_eq!(
+            store.get(&first).map(|j| (j.start_lsn, j.active)),
+            Some((3, false))
+        );
+
+        // `first` was re-inserted after `second`, so `second` is now oldest.
+        store.evict_oldest(1);
+        assert!(store.get(&second).is_none());
+        assert_eq!(store.take(&first).map(|j| j.start_lsn), Some(3));
+        assert_eq!(store.len(), 0);
+        assert!(store.order.is_empty());
+    }
+
     #[tokio::test]
     async fn test_journal_lifecycle() {
         let journal = TransactionJournal::new();
@@ -1461,6 +1875,57 @@ mod tests {
         // Commit
         journal.commit_transaction(tx_id).await.unwrap();
         assert!(journal.get_journal(&tx_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tenant_charge_follows_committed_retention_and_last_read_handle() {
+        let budget = crate::tenant_slots::TenantJournalBudget::new("acme", 0);
+        let journal = TransactionJournal::new().with_max_committed(1);
+        let mut first =
+            TransactionJournalEntry::new(Uuid::new_v4(), Uuid::new_v4(), NodeId::new(), 0);
+        first.source.tenant = Some("acme".into());
+        first.add_entry(
+            NewEntry {
+                statement: "insert into t values (1)".into(),
+                parameters: Vec::new(),
+                param_types: Vec::new(),
+                result_checksum: None,
+                rows_affected: Some(1),
+                duration_ms: 1,
+                outcome: StatementOutcome::Unobserved,
+                protocol: WireProtocol::Simple,
+            }
+            .into_journal_entry(1),
+        );
+        assert!(first.settle_tenant_journal_budget(&budget));
+        let reserved = first.retained_size_bytes();
+        assert_eq!(budget.used(), reserved);
+        journal.record_committed_sync(first, "COMMIT");
+
+        let held = journal.committed_after(0).await;
+        let mut second =
+            TransactionJournalEntry::new(Uuid::new_v4(), Uuid::new_v4(), NodeId::new(), 0);
+        second.add_entry(
+            NewEntry {
+                statement: "insert into t values (2)".into(),
+                parameters: Vec::new(),
+                param_types: Vec::new(),
+                result_checksum: None,
+                rows_affected: Some(1),
+                duration_ms: 1,
+                outcome: StatementOutcome::Unobserved,
+                protocol: WireProtocol::Simple,
+            }
+            .into_journal_entry(1),
+        );
+        journal.record_committed_sync(second, "COMMIT");
+        assert_eq!(
+            budget.used(),
+            reserved,
+            "read handle owns the evicted record"
+        );
+        drop(held);
+        assert_eq!(budget.used(), 0, "last record handle releases the charge");
     }
 
     #[tokio::test]

@@ -10,6 +10,56 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+/// The longest word [`is_write_word`] knows (`DEALLOCATE`): a longer first
+/// word is not one of them.
+const LONGEST_WRITE_WORD: usize = 10;
+
+/// Whether `word`, upper-cased, starts a write or a transaction-control
+/// statement.
+fn is_write_word(word: &[u8]) -> bool {
+    matches!(
+        word,
+        b"INSERT"
+            | b"UPDATE"
+            | b"DELETE"
+            | b"CREATE"
+            | b"ALTER"
+            | b"DROP"
+            | b"TRUNCATE"
+            | b"GRANT"
+            | b"REVOKE"
+            | b"MERGE"
+            | b"UPSERT"
+            | b"BEGIN"
+            | b"START"
+            | b"COMMIT"
+            | b"ROLLBACK"
+            | b"SAVEPOINT"
+            | b"LOCK"
+            | b"PREPARE"
+            | b"EXECUTE"
+            | b"DEALLOCATE"
+    )
+}
+
+/// The first whitespace-delimited word of `b` (empty when there is none),
+/// when every byte up to its end is ASCII; `None` when a non-ASCII byte comes
+/// before that, where Unicode whitespace and case rules decide. Whitespace
+/// is `char::is_whitespace`'s ASCII part: tab to carriage return, and space.
+fn ascii_first_word(b: &[u8]) -> Option<&[u8]> {
+    let is_space = |c: u8| matches!(c, b'\t'..=b'\r' | b' ');
+    let start = b.iter().position(|&c| !is_space(c)).unwrap_or(b.len());
+    let rest = &b[start..];
+    let end = rest
+        .iter()
+        .position(|&c| is_space(c) || !c.is_ascii())
+        .unwrap_or(rest.len());
+    match rest.get(end) {
+        Some(c) if !c.is_ascii() => None,
+        _ => Some(&rest[..end]),
+    }
+}
+
 /// Query router - routes queries to appropriate nodes
 pub struct QueryRouter {
     /// Hint parser
@@ -133,38 +183,32 @@ impl QueryRouter {
             .map(|n| n.name.clone())
     }
 
-    /// Check if query is a write operation
+    /// Check if query is a write operation: its first word, in any case, is
+    /// one of the write and transaction-control words.
+    ///
+    /// The word is read without allocating when everything up to its end is
+    /// ASCII. Otherwise the whole text is upper-cased by Unicode rules and
+    /// split at Unicode whitespace, as it always was (`begın` upper-cases to
+    /// `BEGIN`; a no-break space ends a word).
     pub fn is_write_query(&self, query: &str) -> bool {
         if !self.config.default.auto_detect_writes {
             return false;
         }
-
-        let upper = query.trim().to_uppercase();
-        let first_word = upper.split_whitespace().next().unwrap_or("");
-
-        matches!(
-            first_word,
-            "INSERT"
-                | "UPDATE"
-                | "DELETE"
-                | "CREATE"
-                | "ALTER"
-                | "DROP"
-                | "TRUNCATE"
-                | "GRANT"
-                | "REVOKE"
-                | "MERGE"
-                | "UPSERT"
-                | "BEGIN"
-                | "START"
-                | "COMMIT"
-                | "ROLLBACK"
-                | "SAVEPOINT"
-                | "LOCK"
-                | "PREPARE"
-                | "EXECUTE"
-                | "DEALLOCATE"
-        )
+        match ascii_first_word(query.as_bytes()) {
+            Some(word) => {
+                let mut upper = [0u8; LONGEST_WRITE_WORD];
+                let Some(upper) = upper.get_mut(..word.len()) else {
+                    return false;
+                };
+                upper.copy_from_slice(word);
+                upper.make_ascii_uppercase();
+                is_write_word(upper)
+            }
+            None => {
+                let upper = query.trim().to_uppercase();
+                is_write_word(upper.split_whitespace().next().unwrap_or("").as_bytes())
+            }
+        }
     }
 
     /// Select a node from eligible nodes using load balancing
@@ -466,6 +510,120 @@ mod tests {
 
         assert!(!router.is_write_query("SELECT * FROM users"));
         assert!(!router.is_write_query("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+    }
+
+    /// `is_write_query` as it was before it stopped allocating: the whole
+    /// text upper-cased by Unicode rules, its first Unicode-whitespace word.
+    fn is_write_query_by_upper_casing(query: &str) -> bool {
+        let upper = query.trim().to_uppercase();
+        is_write_word(upper.split_whitespace().next().unwrap_or("").as_bytes())
+    }
+
+    /// Every write word in any case, behind every kind of leading whitespace
+    /// and before every kind of delimiter, plus look-alikes that Unicode
+    /// case and whitespace rules decide, classifies as upper-casing the text
+    /// did.
+    #[test]
+    fn is_write_query_matches_the_upper_casing_form() {
+        const WORDS: [&str; 20] = [
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "CREATE",
+            "ALTER",
+            "DROP",
+            "TRUNCATE",
+            "GRANT",
+            "REVOKE",
+            "MERGE",
+            "UPSERT",
+            "BEGIN",
+            "START",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "LOCK",
+            "PREPARE",
+            "EXECUTE",
+            "DEALLOCATE",
+        ];
+        const OTHERS: [&str; 12] = [
+            "SELECT",
+            "WITH",
+            "SHOW",
+            "INSERTS",
+            "DEALLOCATES",
+            "BEGI",
+            "BEGIN;",
+            "",
+            "b\u{131}g\u{131}n",
+            "beg\u{131}n",
+            "\u{130}NSERT",
+            "lo\u{17f}k",
+        ];
+        const LEADS: [&str; 8] = [
+            "",
+            " ",
+            "\t\n",
+            "\r \u{b}\u{c}",
+            "\u{a0}",
+            "\u{2003} ",
+            "\u{1f}",
+            "\u{85}",
+        ];
+        const TAILS: [&str; 8] = [
+            "",
+            " x",
+            "\tx",
+            "\nx",
+            "\u{b}x",
+            "\u{a0}x",
+            "\u{3000}x",
+            "\u{e9}",
+        ];
+        let router = QueryRouter::new(RoutingConfig::default());
+        let mixed = |word: &str| -> String {
+            word.chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        };
+        let (mut writes, mut reads) = (0, 0);
+        for word in WORDS.iter().chain(&OTHERS) {
+            for form in [word.to_string(), word.to_lowercase(), mixed(word)] {
+                for lead in LEADS {
+                    for tail in TAILS {
+                        let query = format!("{lead}{form}{tail}");
+                        let want = is_write_query_by_upper_casing(&query);
+                        assert_eq!(router.is_write_query(&query), want, "{query:?}");
+                        if want {
+                            writes += 1;
+                        } else {
+                            reads += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            writes > 1_000 && reads > 1_000,
+            "{writes} writes, {reads} reads"
+        );
+        for word in WORDS {
+            assert!(word.len() <= LONGEST_WRITE_WORD, "{word}");
+            assert!(router.is_write_query(word), "{word}");
+            assert!(router.is_write_query(&format!("  {} x", word.to_lowercase())));
+        }
+        // Unicode rules still decide where ASCII ones cannot.
+        assert!(router.is_write_query("beg\u{131}n"));
+        assert!(router.is_write_query("insert\u{a0}into t values (1)"));
+        assert!(!router.is_write_query("\u{1f}insert"));
     }
 
     #[tokio::test]

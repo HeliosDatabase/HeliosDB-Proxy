@@ -157,6 +157,11 @@ impl JournalSink for SegmentSink {
     fn durable(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
     }
+
+    fn flush(&self) {
+        // The inherent method: queue a flush marker and wait for the writer.
+        SegmentSink::flush(self);
+    }
 }
 
 /// The segmented store: recovery at open, then a writer thread.
@@ -637,6 +642,30 @@ mod tests {
             rec,
             "the legacy segment must be left intact"
         );
+    }
+
+    /// The shutdown path flushes through the journal's sink trait object
+    /// (`TransactionJournal::flush_sink`), not the inherent method: records
+    /// accepted before it are on disk once it returns, whatever the fsync
+    /// policy's interval.
+    #[test]
+    fn shutdown_flush_through_the_journal_writes_accepted_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slow = cfg(dir.path());
+        slow.fsync = JournalFsync::Interval;
+        slow.fsync_interval = Duration::from_secs(3600);
+        let (store, _) = SegmentStore::open(slow, 1000, usize::MAX).unwrap();
+        let sink: Arc<dyn JournalSink> = store.spawn_writer().unwrap();
+        let journal = TransactionJournal::new().with_sink(sink.clone());
+        assert!(journal.has_sink());
+        for i in 1..=3 {
+            assert!(sink.append(&Arc::new(tx(i, &format!("insert {i}")))));
+        }
+        journal.flush_sink();
+        let (_, rec) = SegmentStore::open(cfg(dir.path()), 1000, usize::MAX).unwrap();
+        assert_eq!(rec.records_read, 3, "flushed before the writer thread ends");
+        assert!(!TransactionJournal::new().has_sink());
+        TransactionJournal::new().flush_sink(); // no sink: nothing to do
     }
 
     #[test]

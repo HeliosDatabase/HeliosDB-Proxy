@@ -428,6 +428,25 @@ pub fn query_text(payload: &[u8]) -> Option<&str> {
     std::str::from_utf8(&payload[..end]).ok()
 }
 
+/// A simple Query contains exactly one NUL-terminated byte string. This
+/// structural check deliberately does not impose UTF-8 on client encodings.
+/// Parse payloads have a different layout and must not use this check.
+pub(crate) fn valid_simple_query_payload(payload: &[u8]) -> bool {
+    simple_query_payload_end(payload).is_some()
+}
+
+/// Return the byte offset of a simple Query's sole terminator.
+///
+/// Keeping the offset lets the relay validate framing and then borrow the SQL
+/// text without searching the payload for the same terminator a second time.
+pub(crate) fn simple_query_payload_end(payload: &[u8]) -> Option<usize> {
+    if payload.last() != Some(&0) {
+        return None;
+    }
+    let end = payload.len() - 1;
+    (!payload[..end].contains(&0)).then_some(end)
+}
+
 /// Skip leading whitespace and SQL comments (`-- …` and `/* … */`, which
 /// nest in PostgreSQL). Whitespace and line ends are PostgreSQL's: ASCII
 /// space, tab, `\n`, `\r`, form feed and vertical tab; a `--` comment ends
@@ -554,7 +573,13 @@ pub struct QueryMessage {
 impl QueryMessage {
     /// Parse from message payload
     pub fn parse(mut payload: BytesMut) -> Result<Self> {
-        let query = read_cstring(&mut payload)?;
+        let end = simple_query_payload_end(&payload)
+            .ok_or_else(|| ProxyError::Protocol("invalid simple Query payload".into()))?;
+        let bytes = payload.split_to(end);
+        payload.advance(1);
+        debug_assert!(payload.is_empty());
+        let query = String::from_utf8(bytes.into())
+            .map_err(|e| ProxyError::Protocol(format!("Invalid UTF-8 in cstring: {e}")))?;
         Ok(Self { query })
     }
 
@@ -1304,5 +1329,38 @@ mod tests {
         assert!(!leads_with_keyword("SET\u{e9}".as_bytes(), "SET"));
         assert!(!leads_with_keyword(b"SELECT 'SET'", "SET"));
         assert!(!leads_with_keyword(b"-- SET\rSELECT 1", "SET"));
+    }
+}
+
+#[cfg(test)]
+mod simple_query_payload_regressions {
+    use super::*;
+
+    #[test]
+    fn simple_query_payload_parser_rejects_trailing_bytes() {
+        for body in [b"SELECT 42\0junk".as_slice(), b"SELECT 42\0\0"] {
+            assert!(
+                QueryMessage::parse(BytesMut::from(body)).is_err(),
+                "simple Query payload must contain exactly one CString: {body:?}"
+            );
+            assert_eq!(simple_query_payload_end(body), None);
+        }
+    }
+
+    #[test]
+    fn simple_query_payload_valid_empty_and_generic_parse_tail_remain_supported() {
+        for (body, sql) in [(b"\0".as_slice(), ""), (b"SELECT 42\0", "SELECT 42")] {
+            assert_eq!(
+                QueryMessage::parse(BytesMut::from(body)).unwrap().query,
+                sql
+            );
+            assert_eq!(simple_query_payload_end(body), Some(body.len() - 1));
+        }
+        assert_eq!(simple_query_payload_end(b"\xff\0"), Some(1));
+        // query_text also inspects Parse SQL followed by type metadata.
+        assert_eq!(
+            query_text(b"SELECT $1\0\0\x01\0\0\0\x17"),
+            Some("SELECT $1")
+        );
     }
 }

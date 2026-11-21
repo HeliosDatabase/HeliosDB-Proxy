@@ -382,3 +382,63 @@ async fn startup_hba_rejection_remains_one_terminal_error() {
     assert!(state.sessions.is_empty());
     assert_single_error(&received, "28000");
 }
+
+/// Failed client authentications reach the credential-stuffing detector
+/// (`[anomaly] auth_*`): five pass-through refusals of the client's password
+/// (class 28) from one address make one `AuthBurst` Warning at the fifth; a
+/// refusal that is not about the credentials (3D000, after AuthenticationOk)
+/// does not count.
+#[cfg(feature = "anomaly-detection")]
+#[tokio::test]
+async fn password_refusals_feed_the_credential_stuffing_detector() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = config_for(address);
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let state = server.state.clone();
+    let codes = ["28P01", "28P01", "28P01", "28P01", "28P01", "3D000"];
+    let backend = tokio::spawn(async move {
+        for code in codes {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_startup(&mut stream).await;
+            stream.write_all(&auth_request(3, b"")).await.unwrap();
+            let _ = read_frame(&mut stream).await;
+            if code == "3D000" {
+                stream.write_all(&auth_request(0, b"")).await.unwrap();
+            }
+            stream.write_all(&fatal_frame(code)).await.unwrap();
+        }
+    });
+    for _ in codes {
+        let (proxy, mut client) = pair().await;
+        let peer = proxy.peer_addr().unwrap();
+        let task = tokio::spawn(ProxyServer::handle_client(
+            proxy,
+            peer,
+            state.clone(),
+            Arc::new(config.clone()),
+            server.shutdown_tx.clone(),
+        ));
+        client.write_all(&startup_bytes("bench")).await.unwrap();
+        assert_eq!(read_frame(&mut client).await, auth_request(3, b""));
+        client
+            .write_all(&wire_frame(b'p', b"wrong\0"))
+            .await
+            .unwrap();
+        let _ = through_eof(&mut client).await;
+        let _ = finish(task).await;
+    }
+    finish(backend).await;
+    let bursts: Vec<(String, u32)> = state
+        .anomaly_detector
+        .recent_events(16)
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::anomaly::AnomalyEvent::AuthBurst { user, failures, .. } => {
+                Some((user, failures))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bursts, [("bench".to_string(), 5)]);
+}

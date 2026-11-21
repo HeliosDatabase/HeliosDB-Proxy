@@ -168,7 +168,8 @@ through `/api/chaos` does not change its database role. With no eligible primary
 For PostgreSQL with an external manager that promotes and fences database nodes:
 
 1. Build the daemon with `--features all-features,postgres-topology`.
-   `all-features` alone does not include `postgres-topology`.
+   `all-features` alone does not include `postgres-topology`. The prebuilt release
+   binaries (since 3.0.0) and the Docker image are built with both and include it.
 2. Keep both nodes in `[[nodes]]`, then configure `[topology] provider = "postgres"`
    and the probe credentials, or `provider = "patroni"` and its REST endpoints.
 3. Confirm `GET /topology` reports the initial leader and a valid `authoritative`

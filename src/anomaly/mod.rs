@@ -124,6 +124,12 @@ pub struct AnomalyConfig {
     /// informational, so clearing on overflow is acceptable). Defaults
     /// to [`MAX_SEEN_FINGERPRINTS`].
     pub max_seen_fingerprints: usize,
+    /// Most `(user, client address)` failed-auth windows tracked at once.
+    /// Bounds memory when failures come from many sources (an attacker
+    /// rotating user names or addresses): at the cap, windows with no
+    /// failure left inside `auth_window_secs` are dropped first, then the
+    /// one whose last failure is oldest. Defaults to [`MAX_AUTH_WINDOWS`].
+    pub max_auth_windows: usize,
 }
 
 impl Default for AnomalyConfig {
@@ -137,6 +143,7 @@ impl Default for AnomalyConfig {
             event_buffer_size: 1024,
             emit_novel_queries: true,
             max_seen_fingerprints: MAX_SEEN_FINGERPRINTS,
+            max_auth_windows: MAX_AUTH_WINDOWS,
         }
     }
 }
@@ -162,6 +169,10 @@ pub struct AnomalyDetector {
 /// only the DEFAULT — the live cap is [`AnomalyConfig::max_seen_fingerprints`]
 /// (exposed via the `[anomaly]` config section) and read on the hot path.
 const MAX_SEEN_FINGERPRINTS: usize = 100_000;
+
+/// Default upper bound on tracked failed-auth windows
+/// ([`AnomalyConfig::max_auth_windows`], `[anomaly] max_auth_windows`).
+pub const MAX_AUTH_WINDOWS: usize = 10_000;
 
 impl AnomalyDetector {
     pub fn new(config: AnomalyConfig) -> Self {
@@ -285,10 +296,16 @@ impl AnomalyDetector {
                 .remove(&(user.to_string(), client_ip.to_string()));
             return None;
         }
+        let key = (user.to_string(), client_ip.to_string());
+        if self.auth_windows.len() >= self.config.max_auth_windows
+            && !self.auth_windows.contains_key(&key)
+        {
+            self.make_room_for_auth_window(timestamp);
+        }
         let count = {
             let mut window = self
                 .auth_windows
-                .entry((user.to_string(), client_ip.to_string()))
+                .entry(key)
                 .or_insert_with(|| AuthBurstWindow::new(self.config.auth_window_secs));
             window.record_failure(timestamp)
         };
@@ -309,6 +326,28 @@ impl AnomalyDetector {
         };
         self.push_event(ev.clone());
         Some(ev)
+    }
+
+    /// At the window cap: drop every window with no failure left inside its
+    /// window, then, if none was, the one whose last failure is oldest.
+    fn make_room_for_auth_window(&self, now: Instant) {
+        self.auth_windows.retain(|_, w| !w.expired(now));
+        if self.auth_windows.len() < self.config.max_auth_windows {
+            return;
+        }
+        let oldest = self
+            .auth_windows
+            .iter()
+            .min_by_key(|entry| entry.value().failures.back().copied())
+            .map(|entry| entry.key().clone());
+        if let Some(key) = oldest {
+            self.auth_windows.remove(&key);
+        }
+    }
+
+    /// Failed-auth windows tracked now.
+    pub fn auth_windows_tracked(&self) -> usize {
+        self.auth_windows.len()
     }
 
     /// Snapshot of the most recent events. Newest first.
@@ -378,6 +417,13 @@ impl AuthBurstWindow {
         }
     }
 
+    /// No failure of this window is inside it any more.
+    fn expired(&self, now: Instant) -> bool {
+        self.failures
+            .back()
+            .is_none_or(|&last| now.duration_since(last) > self.window)
+    }
+
     fn record_failure(&mut self, now: Instant) -> u32 {
         // Evict entries older than the window.
         while let Some(&front) = self.failures.front() {
@@ -444,6 +490,44 @@ mod tests {
         assert!(!evs
             .iter()
             .any(|e| matches!(e, AnomalyEvent::NovelQuery { .. })));
+    }
+
+    #[test]
+    fn auth_windows_are_bounded_and_drop_the_stalest_first() {
+        let det = AnomalyDetector::new(AnomalyConfig {
+            max_auth_windows: 3,
+            auth_window_secs: 60,
+            auth_warning_count: 2,
+            auth_critical_count: 3,
+            ..AnomalyConfig::default()
+        });
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        for (i, user) in ["a", "b", "c"].into_iter().enumerate() {
+            det.record_auth(user, "10.0.0.1", false, at(i as u64), "t");
+        }
+        assert_eq!(det.auth_windows_tracked(), 3);
+        // A fourth source at the cap: none expired yet, so the stalest
+        // ("a", last failure at 0 s) makes room.
+        det.record_auth("d", "10.0.0.1", false, at(10), "t");
+        assert_eq!(det.auth_windows_tracked(), 3);
+        assert!(!det
+            .auth_windows
+            .contains_key(&("a".to_string(), "10.0.0.1".to_string())));
+        // A tracked source keeps counting without eviction: its second
+        // failure inside the window is a Warning.
+        let ev = det.record_auth("b", "10.0.0.1", false, at(11), "t");
+        assert!(
+            matches!(ev, Some(AnomalyEvent::AuthBurst { failures: 2, .. })),
+            "{ev:?}"
+        );
+        assert_eq!(det.auth_windows_tracked(), 3);
+        // Much later every window has expired: the next new source clears them.
+        det.record_auth("e", "10.0.0.2", false, at(500), "t");
+        assert_eq!(det.auth_windows_tracked(), 1);
+        // A success forgets its source.
+        det.record_auth("e", "10.0.0.2", true, at(501), "t");
+        assert_eq!(det.auth_windows_tracked(), 0);
     }
 
     #[test]

@@ -20,7 +20,7 @@ If your verb isn't here, start with [`heliosproxy-overview`](../heliosproxy-over
 | Verb / phrase | Skill |
 |---|---|
 | connect, psql, asyncpg, jdbc, `SELECT 1` round-trip | `heliosproxy-connect` |
-| route hint, `/*+ route=primary */`, force primary | `heliosproxy-connect` |
+| route hint, `/*helios:route=primary*/`, force primary | `heliosproxy-connect` |
 | topology, current primary, `/topology`, `/nodes`, `/config` | `heliosproxy-topology` |
 | enable / disable a node | `heliosproxy-topology` |
 | health, `/health`, `/health/ready`, `/health/live`, `/version` | `heliosproxy-health` |

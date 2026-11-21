@@ -236,25 +236,24 @@ async fn test_module_06_failover_controller_config() {
         })
         .await;
 
-    // Trigger failover (promote_standby is a no-op without backend_template)
-    controller
+    // Trigger failover. Without a backend template the controller cannot
+    // reach the standby, so it fails closed: nothing is promoted, the
+    // primary is unchanged and the attempt is recorded as failed.
+    let err = controller
         .on_primary_failed(primary_id)
         .await
-        .expect("on_primary_failed");
+        .expect_err("a failover without a backend connection must fail");
+    assert!(err.to_string().contains("no backend connection"), "{err}");
 
-    assert_eq!(
-        controller.get_primary().await,
-        Some(standby_id),
-        "standby promoted to primary"
-    );
-    assert!(matches!(controller.state().await, FailoverState::Completed));
-    assert_eq!(controller.failover_count(), 1);
+    assert_eq!(controller.get_primary().await, Some(primary_id));
+    assert!(matches!(controller.state().await, FailoverState::Failed));
+    assert_eq!(controller.failover_count(), 0);
 
     let history = controller.history().await;
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].old_primary, primary_id);
     assert_eq!(history[0].new_primary, Some(standby_id));
-    assert!(history[0].success);
+    assert!(!history[0].success);
     assert!(history[0].ended_at.is_some());
 
     // Old-primary recovered path (split-brain guard)
@@ -318,10 +317,10 @@ async fn test_module_07_transaction_replay_config() {
 
 /// Module 08 — Session Migration.
 ///
-/// Registers a session with parameters and a prepared statement, verifies
-/// `generate_restore_statements()` output, then calls `migrate_session()`.
-/// Without `backend_template`, `execute_statement` is a no-op, so the
-/// migration succeeds with counts = 0 but `success = true`.
+/// Registers a session with parameters and a prepared statement and
+/// verifies `generate_restore_statements()` output. `migrate_session()`
+/// runs those statements on the caller's backend connection (unit-tested
+/// against a scripted backend in `session_migrate`).
 /// Appends a live SET/SHOW round-trip through an HA proxy when configured.
 #[tokio::test]
 async fn test_module_08_session_migration_config() {
@@ -334,7 +333,6 @@ async fn test_module_08_session_migration_config() {
 
     let session_id = uuid::Uuid::new_v4();
     let primary_id = NodeId::new();
-    let standby_id = NodeId::new();
 
     let mut state = SessionState::new(
         session_id,
@@ -359,7 +357,7 @@ async fn test_module_08_session_migration_config() {
     let s = migrate.get_session(&session_id).await.expect("get_session");
     assert_eq!(s.user, "helios");
     // SessionState stores the value verbatim; generate_restore_statements
-    // feeds it straight into SET search_path = <value>.
+    // passes it to set_config('search_path', <value>, false) as a literal.
     let sp = s.get_parameter("search_path").expect("search_path param");
     assert!(
         sp.contains("public") && sp.contains("ext"),
@@ -369,21 +367,15 @@ async fn test_module_08_session_migration_config() {
 
     let stmts = s.generate_restore_statements();
     assert!(
-        stmts.iter().any(|s| s.starts_with("SET ")),
-        "restore stmts must include SET commands: {stmts:?}"
+        stmts
+            .iter()
+            .any(|s| s == "SELECT pg_catalog.set_config('search_path', 'public, ext', false)"),
+        "restore stmts must set search_path: {stmts:?}"
     );
     assert!(
         stmts.iter().any(|s| s.starts_with("PREPARE ")),
         "restore stmts must include PREPARE commands: {stmts:?}"
     );
-
-    // migrate_session: execute_statement is a no-op (no backend_template)
-    let result = migrate
-        .migrate_session(session_id, standby_id)
-        .await
-        .expect("migrate_session");
-    assert!(result.success, "migration must succeed: {:?}", result.error);
-    assert_eq!(result.target_node, standby_id);
 
     let stats = migrate.stats().await;
     assert!(stats.enabled);
@@ -412,22 +404,85 @@ async fn test_module_08_session_migration_config() {
     }
 }
 
+/// Module 08 — Session Migration, live: `migrate_session()` restores the
+/// saved parameters and prepared statement on a real backend connection,
+/// and the same connection then reports them.
+#[tokio::test]
+async fn test_module_08_session_migration_live() {
+    use heliosdb_proxy::backend::{BackendClient, BackendConfig, TlsMode};
+    use heliosdb_proxy::session_migrate::{PreparedStatementInfo, SessionMigrate, SessionState};
+    use heliosdb_proxy::NodeId;
+
+    let Some(fx) = fixture::start_proxy().await else {
+        return;
+    };
+    if fx.backend.kind == fixture::BackendKind::Nano {
+        // The restore uses pg_catalog.set_config and SQL-level PREPARE/EXECUTE.
+        eprintln!("[module_08_live] skipped on Nano: PostgreSQL session restore only");
+        return;
+    }
+    let b = &fx.backend;
+    let mut client = BackendClient::connect(&BackendConfig {
+        host: b.host.clone(),
+        port: b.port,
+        user: b.user.clone(),
+        password: Some(b.password.clone()),
+        database: Some(b.dbname.clone()),
+        application_name: Some("module-08-migrate".into()),
+        tls_mode: TlsMode::Disable,
+        connect_timeout: std::time::Duration::from_secs(5),
+        query_timeout: std::time::Duration::from_secs(5),
+        tls_config: heliosdb_proxy::backend::tls::default_client_config(),
+    })
+    .await
+    .expect("connect to the backend");
+
+    let migrate = SessionMigrate::new();
+    let session_id = uuid::Uuid::new_v4();
+    let mut state = SessionState::new(session_id, b.user.clone(), b.dbname.clone(), NodeId::new());
+    state.set_parameter("timezone".into(), "America/New_York".into());
+    state.set_parameter("application_name".into(), "o'brien".into());
+    state.add_prepared_statement(PreparedStatementInfo {
+        name: "module08_q".into(),
+        query: "SELECT $1::int + 1".into(),
+        param_types: vec!["int".into()],
+        created_at: chrono::Utc::now(),
+    });
+    migrate.register_session(state).await.unwrap();
+
+    let target = NodeId::new();
+    let result = migrate
+        .migrate_session(session_id, target, &mut client)
+        .await
+        .expect("migrate_session");
+    assert!(result.success, "migration failed: {:?}", result.error);
+    assert_eq!(result.prepared_statements_restored, 1);
+
+    let tz = client.query_scalar("SHOW timezone").await.unwrap();
+    assert_eq!(tz.as_str(), Some("America/New_York"));
+    let app = client.query_scalar("SHOW application_name").await.unwrap();
+    assert_eq!(app.as_str(), Some("o'brien"));
+    let n = client.query_scalar("EXECUTE module08_q(41)").await.unwrap();
+    assert_eq!(n.as_str(), Some("42"));
+    client.close().await;
+}
+
 /// Module 09 — Cursor Restore.
 ///
-/// Saves a cursor, updates its fetch position, gets it back, then calls
-/// `restore_cursor()`. Without `backend_template`, `recreate_cursor` is
-/// a no-op that returns `success = true`.
+/// Saves a cursor, updates its fetch position, gets it back, and checks
+/// the statements `restore_cursor()` runs on the session's connection to
+/// recreate it there (`restore_statements`).
 #[tokio::test]
 async fn test_module_09_cursor_restore_config() {
-    use heliosdb_proxy::cursor_restore::{CursorDirection, CursorRestore, CursorState};
-    use heliosdb_proxy::NodeId;
+    use heliosdb_proxy::cursor_restore::{
+        restore_statements, CursorDirection, CursorRestore, CursorState,
+    };
 
     // ── In-process state test ───────────────────────────────────────
     let mut restore = CursorRestore::new().with_max_cursors(100);
     restore.set_enabled(true);
 
     let session_id = uuid::Uuid::new_v4();
-    let standby_id = NodeId::new();
 
     let cursor = CursorState {
         name: "cur_users".into(),
@@ -460,13 +515,16 @@ async fn test_module_09_cursor_restore_config() {
     let session_cursors = restore.get_session_cursors(&session_id).await;
     assert_eq!(session_cursors.len(), 1);
 
-    // restore_cursor: recreate_cursor is a no-op (no backend_template)
-    let result = restore
-        .restore_cursor("cur_users", standby_id)
-        .await
-        .expect("restore_cursor");
-    assert!(result.success, "restore must succeed: {:?}", result.error);
-    assert_eq!(result.name, "cur_users");
+    // What restore_cursor runs on the session's connection: a WITH HOLD
+    // cursor needs no transaction block, and it moves to the saved row.
+    let statements = restore_statements(&got, false).expect("restore_statements");
+    assert_eq!(
+        statements,
+        [
+            "DECLARE \"cur_users\" NO SCROLL CURSOR WITH HOLD FOR SELECT id, name FROM users ORDER BY id",
+            "MOVE FORWARD 50 IN \"cur_users\"",
+        ]
+    );
 
     let stats = restore.stats().await;
     assert!(stats.enabled);
@@ -687,12 +745,6 @@ async fn test_module_14_routing_hints_passthrough() {
     let Some(fx) = fixture::start_proxy().await else {
         return;
     };
-    if fx.backend.kind == fixture::BackendKind::Nano {
-        // Nano (through 4.41.0) answers any statement that starts with a block
-        // comment with no rows, directly as well (Sprinter nano 07a5ee1772ed).
-        eprintln!("[module_14] skipped on Nano: a leading comment returns no rows");
-        return;
-    }
     let conn_str = format!(
         "host=127.0.0.1 port={} user={} password={} dbname={}",
         fx.proxy_port, fx.backend.user, fx.backend.password, fx.backend.dbname
@@ -1333,7 +1385,12 @@ async fn tr07_admin_post(addr: &str, path: &str, body: &str) -> (u16, serde_json
 async fn test_c02_commit_aware_cache_invalidation_serves_no_stale_reads() {
     let Some(fx) = fixture::start_proxy_with(|c| {
         c.cache.enabled = true;
+        c.cache.extended_protocol = heliosdb_proxy::config::ExtendedProtocolCache::On;
         c.cache.ttl_secs = 300;
+        // This test deliberately writes directly to PostgreSQL and expects
+        // the subsequent read to hit the proxy cache. Enable the documented
+        // opt-in required for trusting reads that may have backend-side effects.
+        c.cache.trust_backend_read_effects = true;
     })
     .await
     else {
@@ -1435,15 +1492,34 @@ async fn test_c02_commit_aware_cache_invalidation_serves_no_stale_reads() {
         "DDL invalidates everything"
     );
 
-    // COPY (server-side program source; needs a superuser backend role).
+    // Exercise COPY through the client protocol, with an asserted outcome.
     assert_eq!(scalar(&reader, read_n).await, 1);
-    match writer
-        .batch_execute("COPY c02_t (id, v) FROM PROGRAM 'printf ''2\\t7\\n'''")
+    let mut copy =
+        heliosdb_proxy::backend::BackendClient::connect(&heliosdb_proxy::backend::BackendConfig {
+            host: "127.0.0.1".into(),
+            port: fx.proxy_port,
+            user: b.user.clone(),
+            password: Some(b.password.clone()),
+            database: Some(b.dbname.clone()),
+            application_name: Some("c02-copy-invalidation".into()),
+            tls_mode: heliosdb_proxy::backend::TlsMode::Disable,
+            connect_timeout: std::time::Duration::from_secs(5),
+            query_timeout: std::time::Duration::from_secs(5),
+            tls_config: heliosdb_proxy::backend::tls::default_client_config(),
+        })
         .await
-    {
-        Ok(()) => assert_eq!(scalar(&reader, read_n).await, 2, "COPY invalidates"),
-        Err(e) => eprintln!("COPY FROM PROGRAM not permitted here, COPY step skipped: {e}"),
-    }
+        .expect("connect COPY client through the proxy");
+    let copied = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        copy.copy_in("COPY c02_t (id, v) FROM STDIN", b"2\t7\n"),
+    )
+    .await
+    .expect("COPY completes within the fixture deadline")
+    .expect("COPY FROM STDIN succeeds");
+    assert_eq!(copied, 1);
+    assert_eq!(scalar(&reader, read_n).await, 2, "COPY invalidates");
+    assert_eq!(scalar(&reader, "SELECT v FROM c02_t WHERE id = 2").await, 7);
+    drop(copy);
 
     direct.batch_execute("DROP TABLE c02_t").await.unwrap();
 }
@@ -1529,7 +1605,7 @@ async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
         return;
     };
     if fx.backend.kind == fixture::BackendKind::Nano {
-        // Nano (through 4.41.0) describes the bigint[] parameter with an unknown
+        // Nano (through 4.42.1) describes the bigint[] parameter with an unknown
         // type, so the client cannot bind it (Sprinter nano ca8e186c9c49).
         eprintln!("[tr07] skipped on Nano: array parameters are not described");
         return;
@@ -1577,13 +1653,14 @@ async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
     )
     .await
     .expect("S1");
-    // A read in between: never journaled.
-    a.query("SELECT count(*) FROM tr07_ledger", &[])
-        .await
-        .expect("read");
     // S2 explicit transaction, committed.
     {
         let tx = a.transaction().await.expect("S2 begin");
+        // Read-only prepared statements are deliberately omitted from the
+        // recovery journal and must not contaminate the following writes.
+        tx.query("SELECT id FROM tr07_ledger LIMIT 1", &[])
+            .await
+            .expect("S2 read");
         tx.execute(
             "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
             &[&2i32, &20i64, &"two"],

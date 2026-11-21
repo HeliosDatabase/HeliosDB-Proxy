@@ -81,7 +81,7 @@ pub enum Resume {
     Warm {
         /// Number of history events replayed into the channel.
         replayed: usize,
-        /// Highest stream offset the edge is caught up through.
+        /// Highest offset queued for replay, not acknowledged application.
         upto: u64,
     },
     /// The cursor was absent, came from a different home boot, or is
@@ -103,7 +103,7 @@ struct InvalidationLog {
 impl InvalidationLog {
     fn new(cap: usize) -> Self {
         Self {
-            next_seq: 0,
+            next_seq: 1,
             history: VecDeque::new(),
             cap,
         }
@@ -132,7 +132,7 @@ impl InvalidationLog {
         tx: &mpsc::Sender<InvalidationEvent>,
     ) -> Resume {
         let upto = self.next_seq.saturating_sub(1);
-        if cursor_boot != home_boot || self.next_seq == 0 {
+        if cursor_boot != home_boot || self.next_seq == 1 {
             return Resume::Gap { upto }; // different boot, or nothing streamed yet
         }
         let last = self.next_seq - 1;
@@ -179,8 +179,8 @@ pub struct EdgeRegistry {
     inner: Arc<RwLock<HashMap<String, EdgeSubscription>>>,
     max_edges: usize,
     /// Per-boot identity mixed into resumption cursors: a cursor from a
-    /// previous home process (or a different home) can never be mistaken
-    /// for a position in this boot's stream.
+    /// previous home process (or a different home) is rejected with a
+    /// fresh random identity, independent of wall-clock granularity.
     boot_id: u64,
     /// Bounded replay history (C-03).
     log: Arc<Mutex<InvalidationLog>>,
@@ -191,10 +191,10 @@ pub struct EdgeRegistry {
 
 impl EdgeRegistry {
     pub fn new(max_edges: usize, liveness_window: Duration) -> Self {
-        let boot_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(1);
+        // Keep the public u64 cursor format while giving independent homes
+        // and restarts a clock-independent identity. The UUID version bits
+        // make this high half nonzero; no timestamp fallback is needed.
+        let boot_id = uuid::Uuid::new_v4().as_u64_pair().0;
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             max_edges,
@@ -259,7 +259,9 @@ impl EdgeRegistry {
         };
         let resume = match (self.boot_id, cursor.and_then(parse_cursor)) {
             (boot, Some((c_boot, c_seq))) => self.log.lock().resume(boot, c_boot, c_seq, &tx),
-            _ => Resume::Gap { upto: 0 },
+            _ => Resume::Gap {
+                upto: self.log.lock().next_seq.saturating_sub(1),
+            },
         };
         g.insert(edge_id.to_string(), sub);
         Ok((rx, resume))
@@ -644,7 +646,7 @@ mod tests {
             let e = rx.recv().await.unwrap();
             (e.seq, e)
         };
-        assert_eq!(seq1, 0);
+        assert_eq!(seq1, 1);
         assert_eq!(ev1.up_to_version, 1);
         drop(rx); // network drop
 
@@ -656,11 +658,11 @@ mod tests {
             resume,
             Resume::Warm {
                 replayed: 1,
-                upto: 1
+                upto: 2
             }
         );
         let replayed = rx2.recv().await.unwrap();
-        assert_eq!(replayed.seq, 1);
+        assert_eq!(replayed.seq, 2);
         assert_eq!(replayed.up_to_version, 2);
         assert!(rx2.try_recv().is_err(), "nothing else queued");
     }
@@ -676,21 +678,58 @@ mod tests {
         let (_rx2, resume) = r
             .register_at("e1", "us", "u", "ts", Some("999999:0"))
             .unwrap();
-        assert_eq!(resume, Resume::Gap { upto: 0 });
+        assert_eq!(resume, Resume::Gap { upto: 1 });
         // Malformed / absent cursor.
         let (_rx3, resume) = r.register_at("e1", "us", "u", "ts", Some("junk")).unwrap();
-        assert_eq!(resume, Resume::Gap { upto: 0 });
+        assert_eq!(resume, Resume::Gap { upto: 1 });
         let (_rx4, resume) = r.register_at("e1", "us", "u", "ts", None).unwrap();
-        assert_eq!(resume, Resume::Gap { upto: 0 });
+        assert_eq!(resume, Resume::Gap { upto: 1 });
         // Caught-up cursor resumes warm with no replay.
-        let cursor = format!("{}:{}", r.boot_id, 0);
+        let cursor = format!("{}:{}", r.boot_id, 1);
         let (_rx5, resume) = r.register_at("e1", "us", "u", "ts", Some(&cursor)).unwrap();
         assert_eq!(
             resume,
             Resume::Warm {
                 replayed: 0,
-                upto: 0
+                upto: 1
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod c03_checkpoint_regressions {
+    use super::*;
+    #[tokio::test]
+    async fn c03_checkpoint_empty_gap_zero_replays_missed_first_event() {
+        let registry = EdgeRegistry::new(4, Duration::from_secs(60));
+        let (receiver, gap) = registry
+            .register_at("edge", "fixture", "", "fixture", None)
+            .unwrap();
+        assert_eq!(gap, Resume::Gap { upto: 0 });
+        drop(receiver);
+        registry
+            .broadcast(InvalidationEvent {
+                seq: 0,
+                up_to_version: 1,
+                tables: vec!["ledger".into()],
+                committed_at: "fixture".into(),
+                epoch: 1,
+            })
+            .await;
+        let cursor = format!("{}:0", registry.boot_id());
+        let (mut receiver, resumed) = registry
+            .register_at("edge", "fixture", "", "fixture", Some(&cursor))
+            .unwrap();
+        assert_eq!(
+            resumed,
+            Resume::Warm {
+                replayed: 1,
+                upto: 1
+            },
+            "the first real event is not the empty-stream checkpoint"
+        );
+        let event = receiver.try_recv().expect("first event must replay");
+        assert_eq!((event.seq, event.up_to_version), (1, 1));
     }
 }

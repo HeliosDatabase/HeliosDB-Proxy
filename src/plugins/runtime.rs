@@ -24,10 +24,22 @@
 //!
 //! The runtime tries the result-returning signature first; if the
 //! exported function has the no-return shape it falls back.
+//!
+//! [`WasmPluginRuntime::instantiate`] checks these exports, and links the
+//! module's imports, when a plugin is loaded: a module that cannot be called
+//! is refused then rather than failing every hook call later.
+//!
+//! ## Limits
+//!
+//! Each call runs in a fresh `Store` bounded by the plugin's memory limit
+//! (`[plugins] memory_limit_mb`, or a lower `max_memory` from its manifest:
+//! growing past it fails, an initial memory above it fails instantiation),
+//! by `timeout_ms` (epoch interruption) and, when `fuel_metering` is on, by
+//! `fuel_limit`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -121,39 +133,39 @@ pub struct LoadedPlugin {
     pub path: PathBuf,
 
     /// Compiled wasmtime module — cheap to clone (internally Arc'd)
-    /// and shared across invocations. Replaces the prior Vec<u8> stub.
+    /// and shared across invocations.
     module: Module,
 
     /// Pre-resolved instantiation plan (module imports linked against the
-    /// runtime's shared `Linker`). Computed once on the first hook call and
-    /// reused for every subsequent call, so per-dispatch cost drops to
-    /// `Store::new` + `InstancePre::instantiate` — no per-call `Linker`
-    /// allocation, host-import re-registration, or import-name resolution.
+    /// runtime's shared `Linker`). Set when the plugin is instantiated, so
+    /// per-dispatch cost is `Store::new` + `InstancePre::instantiate` — no
+    /// per-call `Linker` allocation, host-import re-registration, or
+    /// import-name resolution. (Filled on first use for a plugin built
+    /// with [`LoadedPlugin::new`] directly.)
     instance_pre: OnceLock<InstancePre<StoreCtx>>,
+
+    /// Lower-case hex SHA-256 of the module bytes (empty for a plugin
+    /// built with [`LoadedPlugin::new`] directly).
+    wasm_sha256: String,
 
     /// Security sandbox
     sandbox: PluginSandbox,
 
-    /// Instance data (mock for non-wasmtime builds)
-    instance_data: RwLock<PluginInstanceData>,
+    /// Linear-memory size after the latest call, in bytes.
+    memory_used: AtomicUsize,
+
+    /// Fuel the latest call consumed (when metering is on).
+    fuel_consumed: AtomicU64,
 
     /// Creation timestamp
     loaded_at: Instant,
 
-    /// Last invocation timestamp
-    last_invoked: RwLock<Option<Instant>>,
+    /// Nanoseconds after `loaded_at` of the latest call, plus one; zero
+    /// before the first call. Atomic so concurrent calls never contend.
+    last_invoked_ns: AtomicU64,
 
     /// Invocation count
-    invocation_count: std::sync::atomic::AtomicU64,
-}
-
-/// Plugin instance data
-struct PluginInstanceData {
-    /// Plugin memory usage
-    memory_used: usize,
-
-    /// Fuel consumed (if metering enabled)
-    fuel_consumed: u64,
+    invocation_count: AtomicU64,
 }
 
 impl LoadedPlugin {
@@ -170,14 +182,13 @@ impl LoadedPlugin {
             path,
             module,
             instance_pre: OnceLock::new(),
+            wasm_sha256: String::new(),
             sandbox,
-            instance_data: RwLock::new(PluginInstanceData {
-                memory_used: 0,
-                fuel_consumed: 0,
-            }),
+            memory_used: AtomicUsize::new(0),
+            fuel_consumed: AtomicU64::new(0),
             loaded_at: Instant::now(),
-            last_invoked: RwLock::new(None),
-            invocation_count: std::sync::atomic::AtomicU64::new(0),
+            last_invoked_ns: AtomicU64::new(0),
+            invocation_count: AtomicU64::new(0),
         }
     }
 
@@ -186,15 +197,24 @@ impl LoadedPlugin {
         &self.sandbox
     }
 
-    /// Get memory usage
+    /// Lower-case hex SHA-256 of the module bytes.
+    pub fn wasm_sha256(&self) -> &str {
+        &self.wasm_sha256
+    }
+
+    /// Linear-memory size after the latest call, in bytes.
     pub fn memory_used(&self) -> usize {
-        self.instance_data.read().memory_used
+        self.memory_used.load(Ordering::Relaxed)
+    }
+
+    /// Fuel the latest call consumed (zero without fuel metering).
+    pub fn fuel_consumed(&self) -> u64 {
+        self.fuel_consumed.load(Ordering::Relaxed)
     }
 
     /// Get invocation count
     pub fn invocation_count(&self) -> u64 {
-        self.invocation_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.invocation_count.load(Ordering::Relaxed)
     }
 
     /// Get uptime
@@ -204,14 +224,18 @@ impl LoadedPlugin {
 
     /// Get last invoked time
     pub fn last_invoked(&self) -> Option<Instant> {
-        *self.last_invoked.read()
+        match self.last_invoked_ns.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(self.loaded_at + Duration::from_nanos(n - 1)),
+        }
     }
 
     /// Record an invocation
     pub fn record_invocation(&self) {
-        self.invocation_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        *self.last_invoked.write() = Some(Instant::now());
+        self.invocation_count.fetch_add(1, Ordering::Relaxed);
+        let since = u64::try_from(self.loaded_at.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+        self.last_invoked_ns
+            .store(since.saturating_add(1), Ordering::Relaxed);
     }
 }
 
@@ -237,9 +261,12 @@ pub struct WasmPluginRuntime {
     /// across calls so plugins can persist state between hooks.
     kv: KvBackend,
 
-    /// Module cache (path -> compiled module). Avoids re-compiling
-    /// the same `.wasm` on every load.
-    module_cache: RwLock<HashMap<PathBuf, Module>>,
+    /// Compiled modules by the SHA-256 of their bytes (when
+    /// `cache_modules` is on). A reload of unchanged bytes — a sidecar or
+    /// trust-root change, a rename — reuses the compiled module instead of
+    /// compiling it again. The plugin manager keeps it to the modules of
+    /// loaded plugins ([`WasmPluginRuntime::retain_modules`]).
+    module_cache: RwLock<HashMap<String, Module>>,
 
     /// Default security policy
     default_policy: SecurityPolicy,
@@ -251,10 +278,28 @@ pub struct WasmPluginRuntime {
 impl WasmPluginRuntime {
     /// Create a new WASM runtime
     pub fn new(config: &PluginRuntimeConfig) -> Result<Self, PluginError> {
+        if config.enable_threads {
+            return Err(PluginError::RuntimeError(
+                "enable_threads: this build's WebAssembly engine has no threads support \
+                 (shared memories); leave it off"
+                    .to_string(),
+            ));
+        }
+        if let Some(dir) = &config.cache_dir {
+            return Err(PluginError::RuntimeError(format!(
+                "cache_dir {}: compiled modules are not cached on disk (loading native code \
+                 from a directory would bypass the plugin signature check); leave it unset — \
+                 cache_modules keeps compiled modules in memory",
+                dir.display()
+            )));
+        }
         let mut engine_config = wasmtime::Config::new();
         if config.fuel_metering {
             engine_config.consume_fuel(true);
         }
+        // Relaxed SIMD builds on SIMD: both follow `enable_simd`.
+        engine_config.wasm_simd(config.enable_simd);
+        engine_config.wasm_relaxed_simd(config.enable_simd);
         // Epoch-based interrupts let us bound execution time without
         // polling fuel from inside the call.
         engine_config.epoch_interruption(true);
@@ -384,32 +429,59 @@ impl WasmPluginRuntime {
         );
 
         // Compile via wasmtime — this validates the module and produces
-        // an Arc-wrapped Module ready for repeated instantiation.
-        let module = Module::from_binary(&self.engine, wasm_bytes)
-            .map_err(|e| PluginError::InstantiationError(format!("wasmtime compile: {}", e)))?;
+        // an Arc-wrapped Module ready for repeated instantiation — unless
+        // the same bytes are already compiled.
+        let digest = crate::plugin_artefact::sha256_hex(wasm_bytes);
+        let cached = if self.config.cache_modules {
+            self.module_cache.read().get(&digest).cloned()
+        } else {
+            None
+        };
+        let module = match cached {
+            Some(module) => module,
+            None => {
+                let module = Module::from_binary(&self.engine, wasm_bytes).map_err(|e| {
+                    PluginError::InstantiationError(format!("wasmtime compile: {}", e))
+                })?;
+                if self.config.cache_modules {
+                    self.module_cache
+                        .write()
+                        .insert(digest.clone(), module.clone());
+                }
+                module
+            }
+        };
 
-        // Cache the compiled Module (cheap clone on hit).
-        {
-            let mut cache = self.module_cache.write();
-            cache.insert(manifest.path.clone(), module.clone());
-        }
+        // Refuse a module the hooks cannot call, and link its imports now:
+        // a plugin that would fail every call is refused at load.
+        check_exports(&module, &metadata.name, &metadata.hooks)?;
+        let instance_pre = self.linker.instantiate_pre(&module).map_err(|e| {
+            PluginError::InstantiationError(format!("link {}: {}", metadata.name, e))
+        })?;
 
-        Ok(LoadedPlugin::new(
-            metadata,
-            manifest.path.clone(),
-            module,
-            sandbox,
-        ))
+        let mut plugin = LoadedPlugin::new(metadata, manifest.path.clone(), module, sandbox);
+        plugin.wasm_sha256 = digest;
+        plugin.instance_pre = OnceLock::from(instance_pre);
+        Ok(plugin)
+    }
+
+    /// Drop compiled modules no loaded plugin uses: keep only the digests
+    /// in `live` (the plugin manager passes its plugins' `wasm_sha256`).
+    pub fn retain_modules<'a>(&self, live: impl IntoIterator<Item = &'a str>) {
+        let live: std::collections::HashSet<&str> = live.into_iter().collect();
+        self.module_cache
+            .write()
+            .retain(|digest, _| live.contains(digest.as_str()));
     }
 
     /// Call a hook on a plugin via wasmtime.
     ///
     /// 1. Build a fresh `Store` (wasmtime stores are not Sync, so each
-    ///    invocation is isolated).
-    /// 2. Apply fuel metering (per-call fuel cap) when configured.
-    /// 3. Instantiate the module against an empty Linker — host
-    ///    functions are TODO; plugins that import them will fail at
-    ///    instantiation with a clear error message.
+    ///    invocation is isolated), bounded by the plugin's memory limit.
+    /// 2. Apply fuel metering (per-call fuel cap) when configured, and the
+    ///    epoch deadline for `timeout`.
+    /// 3. Instantiate the module from its pre-linked plan (the runtime's
+    ///    host imports: KV and crypto).
     /// 4. Look up `memory`, `alloc`, `dealloc`, and the named hook
     ///    function exports.
     /// 5. Allocate a slot in plugin memory, write `args`, call the
@@ -448,8 +520,13 @@ impl WasmPluginRuntime {
         let store_ctx = StoreCtx {
             plugin_name: plugin.metadata.name.clone(),
             kv: self.kv.clone(),
+            limits: wasmtime::StoreLimitsBuilder::new()
+                .memory_size(plugin.metadata.max_memory)
+                .instances(1)
+                .build(),
         };
         let mut store: Store<StoreCtx> = Store::new(&self.engine, store_ctx);
+        store.limiter(|ctx| &mut ctx.limits);
         if self.config.fuel_metering {
             // wasmtime's set_fuel returns Result; cap is per-call.
             store
@@ -548,10 +625,12 @@ impl WasmPluginRuntime {
         if self.config.fuel_metering {
             if let Ok(remaining) = store.get_fuel() {
                 let consumed = self.config.fuel_limit.saturating_sub(remaining);
-                plugin.instance_data.write().fuel_consumed = consumed;
+                plugin.fuel_consumed.store(consumed, Ordering::Relaxed);
             }
         }
-        plugin.instance_data.write().memory_used = memory.data_size(&store);
+        plugin
+            .memory_used
+            .store(memory.data_size(&store), Ordering::Relaxed);
 
         Ok(result_bytes)
     }
@@ -644,8 +723,7 @@ impl Drop for WasmPluginRuntime {
     fn drop(&mut self) {
         // Signal the epoch ticker thread to exit; it polls the flag every
         // ~1ms and then releases its Engine clone.
-        self.epoch_stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.epoch_stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -686,6 +764,53 @@ impl serde::Serialize for QueryContext {
         state.serialize_field("hook_context", &self.hook_context)?;
         state.end()
     }
+}
+
+/// Check that `module` exports what the ABI calls: `memory`,
+/// `alloc(i32) -> i32`, `dealloc(i32, i32)`, and for every hook in `hooks` a
+/// function `(i32, i32) -> i64` (result-returning) or `(i32, i32)`
+/// (observer).
+fn check_exports(module: &Module, plugin: &str, hooks: &[HookType]) -> Result<(), PluginError> {
+    use wasmtime::{ExternType, ValType};
+    let refuse = |what: String| {
+        PluginError::InstantiationError(format!("plugin {plugin} cannot be called: {what}"))
+    };
+    let func = |name: &str| match module.get_export(name) {
+        Some(ExternType::Func(f)) => Ok(f),
+        Some(_) => Err(refuse(format!("export `{name}` is not a function"))),
+        None => Err(refuse(format!("it does not export `{name}`"))),
+    };
+    fn i32s(mut types: impl ExactSizeIterator<Item = ValType>, n: usize) -> bool {
+        types.len() == n && types.all(|t| t.is_i32())
+    }
+    match module.get_export("memory") {
+        Some(ExternType::Memory(_)) => {}
+        _ => return Err(refuse("it does not export `memory`".to_string())),
+    }
+    let alloc = func("alloc")?;
+    if !(i32s(alloc.params(), 1) && i32s(alloc.results(), 1)) {
+        return Err(refuse("`alloc` must be (i32) -> i32".to_string()));
+    }
+    let dealloc = func("dealloc")?;
+    if !(i32s(dealloc.params(), 2) && dealloc.results().len() == 0) {
+        return Err(refuse("`dealloc` must be (i32, i32) -> ()".to_string()));
+    }
+    for hook in hooks {
+        let name = hook.export_name();
+        let f = func(name)?;
+        let mut results = f.results();
+        let returns = match results.len() {
+            0 => true,
+            1 => results.next().is_some_and(|t| t.is_i64()),
+            _ => false,
+        };
+        if !(i32s(f.params(), 2) && returns) {
+            return Err(refuse(format!(
+                "hook `{name}` must be (i32, i32) -> i64 or (i32, i32) -> ()"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Look up a typed exported function on an instance, with a uniform
@@ -755,22 +880,59 @@ impl<'de> serde::Deserialize<'de> for PreQueryResult {
     where
         D: serde::Deserializer<'de>,
     {
+        // Two spellings are on the wire: this proxy's own (`action` with
+        // `value` / `data`) and the plugin ABI's (`helios-plugin-abi`:
+        // `kind` with `sql` / `reason` / `bytes`), which the first-party
+        // plugins write. Reading only the first made every first-party Block
+        // and Rewrite a decode error, and the query ran as if the plugin had
+        // said nothing. An answer that is neither, or a Rewrite or Cached
+        // answer without its payload, is an error (the hook failed), never a
+        // silent Continue.
         #[derive(serde::Deserialize)]
         struct Helper {
-            action: String,
+            #[serde(default)]
+            action: Option<String>,
+            #[serde(default)]
+            kind: Option<String>,
             #[serde(default)]
             value: Option<String>,
             #[serde(default)]
+            sql: Option<String>,
+            #[serde(default)]
+            reason: Option<String>,
+            #[serde(default)]
             data: Option<Vec<u8>>,
+            #[serde(default)]
+            bytes: Option<Vec<u8>>,
         }
+        use serde::de::Error as _;
 
         let helper = Helper::deserialize(deserializer)?;
-        match helper.action.as_str() {
+        let tag = helper
+            .action
+            .or(helper.kind)
+            .ok_or_else(|| D::Error::custom("pre-query result has neither `action` nor `kind`"))?;
+        match tag.as_str() {
             "continue" => Ok(PreQueryResult::Continue),
-            "rewrite" => Ok(PreQueryResult::Rewrite(helper.value.unwrap_or_default())),
-            "block" => Ok(PreQueryResult::Block(helper.value.unwrap_or_default())),
-            "cached" => Ok(PreQueryResult::Cached(helper.data.unwrap_or_default())),
-            _ => Ok(PreQueryResult::Continue),
+            "rewrite" => helper
+                .sql
+                .or(helper.value)
+                .map(PreQueryResult::Rewrite)
+                .ok_or_else(|| D::Error::custom("pre-query rewrite without its SQL")),
+            "block" => Ok(PreQueryResult::Block(
+                helper
+                    .reason
+                    .or(helper.value)
+                    .unwrap_or_else(|| "blocked by plugin".to_string()),
+            )),
+            "cached" => helper
+                .bytes
+                .or(helper.data)
+                .map(PreQueryResult::Cached)
+                .ok_or_else(|| D::Error::custom("pre-query cached answer without its bytes")),
+            other => Err(D::Error::custom(format!(
+                "unknown pre-query answer {other:?}"
+            ))),
         }
     }
 }
@@ -852,13 +1014,66 @@ impl<'de> serde::Deserialize<'de> for RouteResult {
                     .reason
                     .unwrap_or_else(|| "blocked by plugin".to_string()),
             )),
-            _ => Ok(RouteResult::Default),
+            // An answer the proxy does not know is the hook failing, not a
+            // silent default.
+            other => Err(serde::de::Error::custom(format!(
+                "unknown route answer {other:?}"
+            ))),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Both spellings of a pre-query answer decode: the proxy's own and the
+    /// plugin ABI's (`helios-plugin-abi`, what the first-party plugins write).
+    /// An unknown answer or one without its payload is an error, never a
+    /// silent Continue.
+    #[test]
+    fn pre_query_answers_decode_in_both_spellings() {
+        let decode = |json: &str| serde_json::from_str::<PreQueryResult>(json);
+        for (json, expected) in [
+            (r#"{"kind":"continue"}"#, "Continue"),
+            (r#"{"action":"continue"}"#, "Continue"),
+            (
+                r#"{"kind":"block","reason":"budget spent"}"#,
+                "Block(budget spent)",
+            ),
+            (
+                r#"{"action":"block","value":"budget spent"}"#,
+                "Block(budget spent)",
+            ),
+            (
+                r#"{"kind":"rewrite","sql":"select 'masked'"}"#,
+                "Rewrite(select 'masked')",
+            ),
+            (
+                r#"{"action":"rewrite","value":"select 'masked'"}"#,
+                "Rewrite(select 'masked')",
+            ),
+            (r#"{"kind":"cached","bytes":[1,2]}"#, "Cached([1, 2])"),
+            (r#"{"action":"cached","data":[1,2]}"#, "Cached([1, 2])"),
+        ] {
+            let got = match decode(json).unwrap_or_else(|e| panic!("{json}: {e}")) {
+                PreQueryResult::Continue => "Continue".to_string(),
+                PreQueryResult::Block(r) => format!("Block({r})"),
+                PreQueryResult::Rewrite(q) => format!("Rewrite({q})"),
+                PreQueryResult::Cached(b) => format!("Cached({b:?})"),
+            };
+            assert_eq!(got, expected, "{json}");
+        }
+        for json in [
+            r#"{"kind":"blok"}"#,
+            r#"{"kind":"rewrite"}"#,
+            r#"{"kind":"cached"}"#,
+            r#"{"reason":"no tag"}"#,
+        ] {
+            assert!(decode(json).is_err(), "{json} must not decode");
+        }
+        assert!(serde_json::from_str::<RouteResult>(r#"{"action":"teleport"}"#).is_err());
+    }
+
     use super::*;
 
     /// Build a tiny WAT module for runtime tests against a specific
@@ -1351,5 +1566,201 @@ mod tests {
             .expect("pre_query call");
         assert_eq!(out.len(), 64);
         assert_eq!(&out[..], SHA256_OF_ABC);
+    }
+
+    fn manifest(name: &str, hooks: Vec<HookType>) -> crate::plugins::loader::PluginManifest {
+        crate::plugins::loader::PluginManifest {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            hooks,
+            path: PathBuf::from(format!("/test/{name}.wasm")),
+            ..Default::default()
+        }
+    }
+
+    /// A hook module whose `pre_query` grows memory by `pages` and answers
+    /// the 4-byte result of `memory.grow` (the old size, or -1 when refused).
+    fn grow_module(initial_pages: u32, pages: u32) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(module
+              (memory (export "memory") {initial_pages})
+              (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+              (func (export "dealloc") (param i32) (param i32))
+              (func (export "pre_query") (param i32) (param i32) (result i64)
+                (i32.store (i32.const 0) (memory.grow (i32.const {pages})))
+                (i64.const 4)))"#
+        ))
+        .expect("wat parses")
+    }
+
+    /// A module that cannot serve a declared hook is refused when it is
+    /// loaded, not on every later call.
+    #[test]
+    fn instantiate_refuses_a_module_the_hooks_cannot_call() {
+        let runtime = WasmPluginRuntime::new(&PluginRuntimeConfig::default()).unwrap();
+        let bytes = grow_module(1, 0);
+        let err = runtime
+            .instantiate(&manifest("p", vec![HookType::Authenticate]), &bytes)
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string().contains("does not export `authenticate`"),
+            "{err}"
+        );
+
+        let no_alloc = wat::parse_str(
+            r#"(module (memory (export "memory") 1)
+                 (func (export "pre_query") (param i32 i32) (result i64) (i64.const 0)))"#,
+        )
+        .unwrap();
+        let err = runtime
+            .instantiate(&manifest("p", vec![HookType::PreQuery]), &no_alloc)
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("`alloc`"), "{err}");
+
+        let wrong_shape = wat::parse_str(
+            r#"(module (memory (export "memory") 1)
+                 (func (export "alloc") (param i32) (result i32) (i32.const 0))
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "pre_query") (param i32) (result i32) (i32.const 0)))"#,
+        )
+        .unwrap();
+        let err = runtime
+            .instantiate(&manifest("p", vec![HookType::PreQuery]), &wrong_shape)
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("must be (i32, i32)"), "{err}");
+
+        let unknown_import = wat::parse_str(
+            r#"(module (import "env" "no_such_import" (func))
+                 (memory (export "memory") 1)
+                 (func (export "alloc") (param i32) (result i32) (i32.const 0))
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "pre_query") (param i32 i32) (result i64) (i64.const 0)))"#,
+        )
+        .unwrap();
+        let err = runtime
+            .instantiate(&manifest("p", vec![HookType::PreQuery]), &unknown_import)
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("link p"), "{err}");
+    }
+
+    /// The same bytes compile once; `retain_modules` drops what no plugin
+    /// uses; with `cache_modules` off nothing is kept.
+    #[test]
+    fn compiled_modules_are_shared_by_content() {
+        let runtime = WasmPluginRuntime::new(&PluginRuntimeConfig {
+            fuel_metering: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let bytes = grow_module(1, 0);
+        let a = runtime
+            .instantiate(&manifest("a", vec![HookType::PreQuery]), &bytes)
+            .unwrap();
+        let b = runtime
+            .instantiate(&manifest("b", vec![HookType::PreQuery]), &bytes)
+            .unwrap();
+        assert_eq!(a.wasm_sha256(), b.wasm_sha256());
+        assert_eq!(a.wasm_sha256(), crate::plugin_artefact::sha256_hex(&bytes));
+        assert_eq!(runtime.stats().cached_modules, 1);
+        runtime.retain_modules([a.wasm_sha256()]);
+        assert_eq!(runtime.stats().cached_modules, 1);
+        runtime.retain_modules([]);
+        assert_eq!(runtime.stats().cached_modules, 0);
+        // Both still run: a plugin owns its compiled module.
+        assert!(runtime.call_hook(&b, HookType::PreQuery, b"{}").is_ok());
+
+        let uncached = WasmPluginRuntime::new(&PluginRuntimeConfig {
+            cache_modules: false,
+            ..Default::default()
+        })
+        .unwrap();
+        uncached
+            .instantiate(&manifest("a", vec![HookType::PreQuery]), &bytes)
+            .unwrap();
+        assert_eq!(uncached.stats().cached_modules, 0);
+    }
+
+    /// `memory_limit` bounds a call's linear memory: growing past it fails
+    /// (the module sees -1) and a module whose initial memory is above it
+    /// cannot be called.
+    #[test]
+    fn the_memory_limit_bounds_each_call() {
+        let runtime = WasmPluginRuntime::new(&PluginRuntimeConfig {
+            fuel_metering: false,
+            memory_limit: 1024 * 1024, // 16 pages
+            ..Default::default()
+        })
+        .unwrap();
+        let grow = |pages| {
+            let plugin = runtime
+                .instantiate(
+                    &manifest("g", vec![HookType::PreQuery]),
+                    &grow_module(1, pages),
+                )
+                .unwrap();
+            let out = runtime
+                .call_hook(&plugin, HookType::PreQuery, b"{}")
+                .unwrap();
+            (
+                i32::from_le_bytes(out[..4].try_into().unwrap()),
+                plugin.memory_used(),
+            )
+        };
+        assert_eq!(grow(4), (1, 5 * 65536), "within the limit: the old size");
+        assert_eq!(grow(32).0, -1, "past the limit: refused");
+
+        let big = runtime
+            .instantiate(
+                &manifest("big", vec![HookType::PreQuery]),
+                &grow_module(40, 0),
+            )
+            .unwrap();
+        let err = runtime
+            .call_hook(&big, HookType::PreQuery, b"{}")
+            .unwrap_err();
+        assert!(matches!(err, PluginError::InstantiationError(_)), "{err:?}");
+    }
+
+    /// `enable_simd = false` refuses SIMD modules; threads and an on-disk
+    /// module cache are refused outright.
+    #[test]
+    fn engine_options_are_applied_or_refused() {
+        let simd = wat::parse_str(
+            r#"(module (memory (export "memory") 1)
+                 (func (export "alloc") (param i32) (result i32) (i32.const 0))
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "pre_query") (param i32 i32) (result i64)
+                   (drop (v128.const i32x4 0 0 0 0)) (i64.const 0)))"#,
+        )
+        .unwrap();
+        let with = WasmPluginRuntime::new(&PluginRuntimeConfig::default()).unwrap();
+        assert!(with
+            .instantiate(&manifest("s", vec![HookType::PreQuery]), &simd)
+            .is_ok());
+        let without = WasmPluginRuntime::new(&PluginRuntimeConfig {
+            enable_simd: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let err = without
+            .instantiate(&manifest("s", vec![HookType::PreQuery]), &simd)
+            .err()
+            .expect("SIMD refused");
+        assert!(err.to_string().contains("compile"), "{err}");
+
+        assert!(WasmPluginRuntime::new(&PluginRuntimeConfig {
+            enable_threads: true,
+            ..Default::default()
+        })
+        .is_err());
+        assert!(WasmPluginRuntime::new(&PluginRuntimeConfig {
+            cache_dir: Some(PathBuf::from("/tmp/modules")),
+            ..Default::default()
+        })
+        .is_err());
     }
 }

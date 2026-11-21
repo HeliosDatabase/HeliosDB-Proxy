@@ -49,6 +49,7 @@ mod metrics;
 #[cfg(feature = "pool-modes")]
 pub use metrics::PoolModeStatsSnapshot;
 use metrics::ServerMetrics;
+pub(crate) use metrics::SessionPolicyCounters;
 #[cfg(test)]
 use metrics::TrMetrics;
 pub use metrics::{ServerMetricsSnapshot, TrMetricsSnapshot};
@@ -73,7 +74,7 @@ use frames::RelayLimits;
 use frames::{backend_frame_len, read_budget, validate_backend_frame_len};
 
 mod session;
-use session::{BackendConn, SessionGuard, UnnamedStale};
+use session::{BackendConn, DrainSignal, SessionGuard, UnnamedStale};
 pub use session::{ClientSession, ExtendedBatchLog, StatementLog, TransactionState};
 
 mod stmt_facts;
@@ -95,11 +96,29 @@ use backend_conn::{ForwardCtx, OffloadRefusals, OpenCycle, ReadRoute, ReadRoutin
 mod ext_set;
 use ext_set::{Bound, ExtSetBoundary, ExtSetCycle, ExtSetOutcome, SettingsOp, TxVerb};
 
+mod fastpath;
+use fastpath::FunctionCallClass;
+
+#[cfg(feature = "query-cache")]
+mod ext_cache;
+
 mod relay;
 
 mod sql_classify;
 
 mod policy;
+#[cfg(feature = "multi-tenancy")]
+use policy::TenantStatement;
+
+mod ext_hooks;
+// Session state a replacement backend cannot be given (a failover ends such
+// a session with 08006 instead of continuing without it).
+mod session_bound;
+use ext_hooks::{ExtHooks, StmtGate};
+
+// Branch routing: a `branch=` hint or a route plugin's answer moves the
+// session to a branch database.
+mod branch_route;
 
 mod journal_hooks;
 
@@ -119,6 +138,9 @@ mod node_control;
 
 mod cache_source;
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+mod cache_scope;
+
 mod gateway;
 
 /// Proxy server
@@ -134,6 +156,18 @@ pub struct ProxyServer {
     /// construction, loaded into the journal's committed store when `run`
     /// starts (the load takes the journal's async lock).
     journal_recovered: std::sync::Mutex<Vec<crate::transaction_journal::TransactionJournalEntry>>,
+}
+
+/// Why `ProxyServer::run` left its accept loop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// `ProxyServer::shutdown`: return at once.
+    Abrupt,
+    /// SIGUSR2: a sibling process serves new connections; drain this one as
+    /// for `Shutdown` (its clients reconnect to the sibling).
+    Handoff,
+    /// SIGTERM or SIGINT: end every session once it has nothing in flight.
+    Shutdown,
 }
 
 /// Stand-in "signal stream" on platforms without Unix signals: its `recv()`
@@ -311,6 +345,10 @@ struct ServerState {
     /// unwind, and removes a per-connection async write-lock from the accept and
     /// teardown paths.
     sessions: DashMap<Uuid, Arc<ClientSession>>,
+    /// The shutdown drain has begun (SIGTERM or SIGINT, `begin_drain`): the
+    /// listener is closed and every session ends at the next point where it
+    /// has nothing in flight (see [`DrainSignal`]). Never cleared.
+    draining: std::sync::atomic::AtomicBool,
     /// Node health status
     // Read-mostly: only the periodic health checker writes (a full-map
     // swap), every query reads. ArcSwap makes the per-query read a single
@@ -485,7 +523,7 @@ struct ServerState {
     /// this directly. Always present; journaling is skipped when
     /// `tr_enabled = false`.
     transaction_journal: Arc<crate::transaction_journal::TransactionJournal>,
-    /// TR-03 read re-execution eligibility (built-ins + `tr_read_functions`).
+    /// TR-03 explicit call trust (`tr_read_functions`); no implicit builtin-name trust.
     tr_read_policy: Arc<TrReadPolicy>,
     /// Anomaly detector (T3.1). Records every query and every
     /// auth outcome; surfaces detections via /api/anomalies.
@@ -598,10 +636,11 @@ enum PreQueryAction {
 }
 
 /// Routing override for a statement, from the Route plugin hook
-/// (`apply_route_hook`: simple `Query` only, `wasm-plugins`) or a SQL-comment
-/// hint (`hint_to_override`, `routing-hints`). `forward_simple_query` applies
+/// (`wasm-plugins`: `apply_route_hook` for a simple `Query`, `ExtHooks` for
+/// the first `Parse` of an extended cycle) or a SQL-comment hint
+/// (`hint_to_override`, `routing-hints`). `forward_simple_query` applies
 /// it (a hint wins over the plugin, see `resolve_simple_route`), and
-/// `extended_hint_route` applies a hint's override to an extended batch. A
+/// `extended_route` applies both, in the same order, to an extended batch. A
 /// migration cutover overrides `None`, `Primary`, `Standby` and `Node`
 /// (`choose_target_node`); a plugin `Block` is answered before any routing,
 /// so a cutover never overrides it. Without either feature `None` is the
@@ -632,6 +671,11 @@ enum RouteOverride {
     /// reason. Checked before hint resolution and any backend selection.
     #[cfg(feature = "wasm-plugins")]
     Block(String),
+    /// Move the session to this branch before the statement runs
+    /// (`ProxyServer::switch_branch`; `""`: back to the database it started
+    /// on), then route as `None`. A route plugin's `branch` answer.
+    #[cfg(feature = "wasm-plugins")]
+    Branch(String),
 }
 
 /// Outcome of waiting for the client's next protocol message.
@@ -646,6 +690,13 @@ enum ClientRead {
     /// entry is gone from `conns` and nothing of the client was read. The
     /// caller settles what died with it, then waits on the client again.
     BackendGone,
+    /// A backend response entered or left COPY while a COPY input timeout
+    /// is configured. Recompute deadlines without consuming client input.
+    CopyStateChanged,
+    /// The shutdown drain began while the session waited with nothing in
+    /// flight (`IdleWatch::drain`): nothing of the client was read, and the
+    /// caller ends the session.
+    Draining,
 }
 
 /// What the idle watch needs from the session while it relays backend
@@ -657,6 +708,12 @@ struct IdleWatch<'a> {
     /// The session's TR re-homes it: a backend's own FATAL/PANIC is
     /// dropped, not forwarded (see `forward_idle_backend_frames`).
     keep_session: bool,
+    /// Completion tally before COPY ended, when waiting for its delayed
+    /// answer to arm the final-Sync deadline.
+    copy_end_wait: Option<u32>,
+    /// The session waits with nothing in flight: a shutdown drain may end
+    /// the wait ([`ClientRead::Draining`]).
+    drain: bool,
 }
 
 /// SQLSTATE `too_many_connections`: the backend is at `max_connections`.
@@ -680,6 +737,13 @@ impl ProxyServer {
 
         let runtime_cfg = crate::plugins::PluginRuntimeConfig::from(toml_cfg);
         let plugin_dir = runtime_cfg.plugin_dir.clone();
+        if runtime_cfg.trust_root.is_none() {
+            tracing::warn!(
+                dir = %plugin_dir.display(),
+                "[plugins] trust_root is not set: plugin signatures are not checked, so any \
+                 module written to the plugin directory runs (set trust_root in production)"
+            );
+        }
 
         let pm = match crate::plugins::PluginManager::new(runtime_cfg) {
             Ok(pm) => Arc::new(pm),
@@ -689,42 +753,18 @@ impl ProxyServer {
             }
         };
 
-        match std::fs::read_dir(&plugin_dir) {
-            Ok(entries) => {
-                let mut loaded = 0usize;
-                let mut failed = 0usize;
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
-                        continue;
-                    }
-                    match pm.load_plugin(&path) {
-                        Ok(()) => loaded += 1,
-                        Err(e) => {
-                            failed += 1;
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %e,
-                                "Failed to load plugin"
-                            );
-                        }
-                    }
-                }
-                tracing::info!(
-                    dir = %plugin_dir.display(),
-                    loaded = loaded,
-                    failed = failed,
-                    "Plugin loading complete"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    dir = %plugin_dir.display(),
-                    error = %e,
-                    "Plugin directory not readable; no plugins loaded"
-                );
-            }
-        }
+        // The startup load is the first reconcile of the directory: every
+        // `.wasm` / `.tar.gz` in it, one file per plugin name. A missing
+        // directory holds no plugins (hot reload picks it up once it
+        // exists); a file that fails is retried when it changes.
+        let report = pm.rescan(true);
+        tracing::info!(
+            dir = %plugin_dir.display(),
+            loaded = report.loaded.len(),
+            failed = report.failed.len(),
+            hot_reload = pm.hot_reload_interval().is_some(),
+            "Plugin loading complete"
+        );
 
         Some(pm)
     }
@@ -912,6 +952,9 @@ impl ProxyServer {
                     crate::rate_limit::RateLimitConfig::default().default_concurrency
                 },
                 max_in_flight: rl.max_concurrent,
+                window_size: Duration::from_secs(rl.window_secs.max(1)),
+                window_max_requests: rl.window_max_requests,
+                cleanup_interval: Duration::from_secs(rl.cleanup_interval_secs.max(1)),
                 ..Default::default()
             };
             Some(Arc::new(crate::rate_limit::RateLimiter::new(rlc)))
@@ -986,6 +1029,7 @@ impl ProxyServer {
             tracing::info!(
                 ttl_secs = c.ttl_secs,
                 max_result_bytes = c.max_result_bytes,
+                max_dependency_tables = c.max_dependency_tables,
                 l2_max_bytes = c.l2_max_bytes,
                 l2_compression = c.l2_compression.as_str(),
                 semantic = c.semantic_enabled,
@@ -1037,10 +1081,13 @@ impl ProxyServer {
                     "cache heatmap on: GET /api/cache/heatmap"
                 );
             }
-            Some(Arc::new(crate::cache::QueryCache::with_generations(
-                c.to_cache_config(),
-                generations.clone(),
-            )))
+            Some(Arc::new(
+                crate::cache::QueryCache::with_generations(
+                    c.to_cache_config(),
+                    generations.clone(),
+                )
+                .with_max_dependency_tables(c.max_dependency_tables)?,
+            ))
         } else {
             None
         };
@@ -1252,6 +1299,7 @@ impl ProxyServer {
             limits: resolved_limits,
             client_slots,
             sessions: DashMap::new(),
+            draining: std::sync::atomic::AtomicBool::new(false),
             health: ArcSwap::from_pointee(health),
             health_write: parking_lot::Mutex::new(()),
             live_config: ArcSwap::from_pointee(config.clone()),
@@ -1394,20 +1442,73 @@ impl ProxyServer {
         HangupNever
     }
 
-    /// Wait for in-flight client connections to finish, up to `timeout`. Used by
-    /// the graceful drain after the listener is closed — the session map is the
-    /// live active-connection gauge (one entry per accepted connection).
-    async fn drain_connections(state: &Arc<ServerState>, timeout: Duration) {
+    /// A stream that yields once per `SIGTERM`, the stop signal of `docker
+    /// stop`, Kubernetes and systemd: the shutdown drain. Never yields on
+    /// non-Unix platforms.
+    #[cfg(unix)]
+    fn terminate_stream() -> tokio::signal::unix::Signal {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+    }
+    #[cfg(not(unix))]
+    fn terminate_stream() -> HangupNever {
+        HangupNever
+    }
+
+    /// A stream that yields once per `SIGINT` (ctrl-c): the same shutdown
+    /// drain as `SIGTERM`. Never yields on non-Unix platforms.
+    #[cfg(unix)]
+    fn interrupt_stream() -> tokio::signal::unix::Signal {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("failed to install SIGINT handler")
+    }
+    #[cfg(not(unix))]
+    fn interrupt_stream() -> HangupNever {
+        HangupNever
+    }
+
+    /// Begin the shutdown drain: from here on every session ends, with a
+    /// `57P01` FATAL, at the next point where it has nothing in flight: at
+    /// once when it is waiting for its client outside a transaction, else
+    /// when its transaction, extended cycle or COPY is over. The caller has
+    /// closed the listener and bounds the wait (`drain_connections`).
+    /// Idempotent.
+    fn begin_drain(state: &ServerState) {
+        // The flag first, then the wake-ups: see `DrainSignal`.
+        state
+            .draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for session in state.sessions.iter() {
+            if let Some(waker) = session.drain_waker.lock().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Wait for in-flight client connections and gateway requests to finish,
+    /// up to `timeout`. Used by the graceful drain after the listeners are
+    /// closed — the session map is the live active-connection gauge (one
+    /// entry per accepted connection), `gateways` counts accepted gateway
+    /// requests whose handler has not returned.
+    async fn drain_connections(
+        state: &Arc<ServerState>,
+        gateways: &crate::gateway_drain::GatewayDrain,
+        timeout: Duration,
+    ) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let active = state.sessions.len();
-            if active == 0 {
-                tracing::info!("drain complete — all in-flight connections finished");
+            let gateway_requests = gateways.in_flight();
+            if active == 0 && gateway_requests == 0 {
+                tracing::info!(
+                    "drain complete — all in-flight connections and gateway requests finished"
+                );
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!(
                     active,
+                    gateway_requests,
                     "drain timeout reached — exiting with connections still open"
                 );
                 return;
@@ -1417,7 +1518,7 @@ impl ProxyServer {
     }
 
     /// Graceful-drain timeout: how long to keep serving in-flight connections
-    /// after SIGUSR2 before exiting. Sourced from `shutdown_drain_timeout_secs`
+    /// after SIGUSR2, SIGTERM or SIGINT before exiting. Sourced from `shutdown_drain_timeout_secs`
     /// in the live config, with the `HELIOS_DRAIN_TIMEOUT_SECS` env var as a
     /// runtime override.
     fn drain_timeout(config_secs: u64) -> Duration {
@@ -1466,16 +1567,43 @@ impl ProxyServer {
             );
             new_config.edge = old.edge.clone();
         }
-        // [multi_tenancy] is built once at startup (tenant manager, client
-        // caps, request budgets): warn and keep the running section, like
-        // [edge].
-        if new_config.multi_tenancy != old.multi_tenancy {
+        if new_config.mcp.trust_backend_read_effects != old.mcp.trust_backend_read_effects {
             tracing::warn!(
-                old = ?old.multi_tenancy,
-                new = ?new_config.multi_tenancy,
-                "[multi_tenancy] changed on SIGHUP but is applied at startup only — keeping the running settings (restart, or a SIGUSR2 handoff, to apply)"
+                "[mcp] trust_backend_read_effects changed on SIGHUP but is startup-only; keeping the running contract (restart to apply)"
             );
-            new_config.multi_tenancy = old.multi_tenancy.clone();
+            new_config.mcp.trust_backend_read_effects = old.mcp.trust_backend_read_effects;
+        }
+        // [multi_tenancy] is built once at startup (tenant manager, client
+        // caps, request budgets). A reload resizes the caps and byte budgets
+        // the running tenants already have; any other change is refused
+        // whole: warn and keep the running section, like [edge].
+        if new_config.multi_tenancy != old.multi_tenancy {
+            match self
+                .state
+                .tenant_slots
+                .reload_caps(&old.multi_tenancy, &new_config.multi_tenancy)
+            {
+                Ok(changes) => {
+                    for change in &changes {
+                        tracing::info!(
+                            tenant = %change.tenant,
+                            cap = change.cap.keys(),
+                            from = change.from,
+                            to = change.to,
+                            "[multi_tenancy] cap resized on SIGHUP; a lowered cap admits nobody new until its holders are back under it"
+                        );
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        %reason,
+                        old = ?old.multi_tenancy,
+                        new = ?new_config.multi_tenancy,
+                        "[multi_tenancy] changed on SIGHUP beyond resizing existing per-tenant caps — keeping the running settings (restart, or a SIGUSR2 handoff, to apply)"
+                    );
+                    new_config.multi_tenancy = old.multi_tenancy.clone();
+                }
+            }
         }
         // tr_mode follows a reload for new sessions; the tenant replay-byte
         // budgets apply only to sessions that record their transactions.
@@ -1519,6 +1647,7 @@ impl ProxyServer {
         // rather than let an operator believe a SIGHUP armed them.
         if new_config.limits.max_client_connections != old.limits.max_client_connections
             || new_config.limits.client_idle_timeout_secs != old.limits.client_idle_timeout_secs
+            || new_config.limits.copy_idle_timeout_secs != old.limits.copy_idle_timeout_secs
             || new_config.limits.client_admission_wait_secs != old.limits.client_admission_wait_secs
             || new_config.limits.client_tcp_keepalive_secs != old.limits.client_tcp_keepalive_secs
         {
@@ -1531,15 +1660,41 @@ impl ProxyServer {
                 new_client_admission_wait_secs = new_config.limits.client_admission_wait_secs,
                 old_client_tcp_keepalive_secs = old.limits.client_tcp_keepalive_secs,
                 new_client_tcp_keepalive_secs = new_config.limits.client_tcp_keepalive_secs,
-                "[limits] max_client_connections / client_idle_timeout_secs / client_admission_wait_secs / client_tcp_keepalive_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
+                "[limits] max_client_connections / client_idle_timeout_secs / copy_idle_timeout_secs / client_admission_wait_secs / client_tcp_keepalive_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
             );
             // Keep the published config truthful: `/config` must not advertise
             // a cap/idle timeout that is not the one in effect (same treatment
             // as `[edge]` above).
             new_config.limits.max_client_connections = old.limits.max_client_connections;
             new_config.limits.client_idle_timeout_secs = old.limits.client_idle_timeout_secs;
+            new_config.limits.copy_idle_timeout_secs = old.limits.copy_idle_timeout_secs;
             new_config.limits.client_admission_wait_secs = old.limits.client_admission_wait_secs;
             new_config.limits.client_tcp_keepalive_secs = old.limits.client_tcp_keepalive_secs;
+        }
+        // `[plugins]` builds the plugin runtime (limits, trust root, the
+        // watched directory) once at startup: carry the running section
+        // forward. A SIGHUP does rescan the plugin directory, so files added,
+        // changed or removed since the last scan apply without hot reload.
+        if new_config.plugins != old.plugins {
+            tracing::warn!(
+                "[plugins] configuration changed on SIGHUP but is applied at startup only — \
+                 keeping the running plugin settings (restart to apply); the plugin directory \
+                 is rescanned"
+            );
+            new_config.plugins = old.plugins.clone();
+        }
+        #[cfg(feature = "wasm-plugins")]
+        if let Some(pm) = self.state.plugin_manager.clone() {
+            match tokio::task::spawn_blocking(move || pm.rescan(true)).await {
+                Ok(report) => tracing::info!(
+                    loaded = ?report.loaded,
+                    updated = ?report.updated,
+                    unloaded = ?report.unloaded,
+                    failed = report.failed.len(),
+                    "SIGHUP: plugin directory rescanned"
+                ),
+                Err(e) => tracing::error!(error = %e, "SIGHUP: plugin directory rescan panicked"),
+            }
         }
         if new_config.listen_address != old.listen_address {
             tracing::warn!(old = %old.listen_address, new = %new_config.listen_address,
@@ -1744,6 +1899,15 @@ impl ProxyServer {
             .as_ref()
             .and_then(|a| a.start_consumer());
 
+        // Rate limiter: drop the state of idle buckets (bounded memory with
+        // many distinct keys; lossless, see `RateLimiter::evict_idle`).
+        #[cfg(feature = "rate-limiting")]
+        let _rate_limit_maintenance_task = self.spawn_rate_limit_maintenance();
+
+        // Plugin hot reload (`[plugins] hot_reload`).
+        #[cfg(feature = "wasm-plugins")]
+        let _plugin_watcher_task = self.spawn_plugin_watcher();
+
         // Edge registry GC — prunes edges not seen within the liveness window.
         #[cfg(feature = "edge-proxy")]
         let _edge_maintenance_task = if self.config.edge.enabled {
@@ -1785,6 +1949,10 @@ impl ProxyServer {
         #[cfg(feature = "graphql-gateway")]
         let gql_pool = self.state.gateway_pools.graphql.clone();
 
+        // The gateways take part in the shutdown/handoff drain: closing this
+        // stops their accept loops; their in-flight requests are waited for.
+        let gateway_drain = crate::gateway_drain::GatewayDrain::new();
+
         // Start the MCP agent gateway when enabled.
         let mcp_task = if self.config.mcp.enabled {
             let mcp_cfg = self.config.mcp.clone();
@@ -1813,16 +1981,18 @@ impl ProxyServer {
                 );
             }
             #[cfg(not(feature = "query-cache"))]
-            if mcp_cfg.tool_cache_enabled {
+            if mcp_cfg.tool_cache_on() {
                 tracing::warn!(
                     "[mcp] tool_cache_enabled = true but this build lacks the `query-cache` \
                      feature: tool results are not cached"
                 );
             }
+            let drain = gateway_drain.clone();
             Some(tokio::spawn(async move {
                 let server = crate::mcp::McpServer::new(mcp_cfg, contract, pool)
                     .with_policy(policy)
-                    .with_strict_read_only_role(strict);
+                    .with_strict_read_only_role(strict)
+                    .with_drain(drain);
                 #[cfg(feature = "query-cache")]
                 let server = server.with_tool_cache(tool_cache);
                 if let Err(e) = server.run().await {
@@ -1838,12 +2008,36 @@ impl ProxyServer {
             let gw_cfg = self.config.http_gateway.clone();
             let pool = http_pool.clone();
             let policy = gateway_policy_for(&gw_cfg.tenant_header);
+            #[cfg(feature = "query-cache")]
+            let trust_backend_read_effects = self.config.cache.trust_backend_read_effects;
+            #[cfg(feature = "query-cache")]
+            let (volatile_scan, table_exclusions) = (
+                self.state.volatile_scan.clone(),
+                self.state.table_exclusions.clone(),
+            );
+            #[cfg(feature = "query-cache")]
+            let query_cache = if self.config.http_gateway_cache_sees_writes() {
+                self.state.query_cache.clone()
+            } else {
+                if self.state.query_cache.is_some() {
+                    tracing::warn!(
+                        backend = %format!("{}:{}", gw_cfg.backend_host, gw_cfg.backend_port),
+                        "HTTP SQL result caching is bypassed because writes to this backend are not visible to C-02 invalidation"
+                    );
+                }
+                None
+            };
+            let drain = gateway_drain.clone();
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::http_gateway::HttpGateway::new(gw_cfg, pool)
+                let gateway = crate::http_gateway::HttpGateway::new(gw_cfg, pool)
                     .with_policy(policy)
-                    .run()
-                    .await
-                {
+                    .with_drain(drain);
+                #[cfg(feature = "query-cache")]
+                let gateway = gateway
+                    .with_query_cache(query_cache)
+                    .with_trusted_read_effects(trust_backend_read_effects)
+                    .with_cache_rules(volatile_scan, table_exclusions);
+                if let Err(e) = gateway.run().await {
                     tracing::error!("HTTP gateway error: {}", e);
                 }
             }))
@@ -1857,9 +2051,11 @@ impl ProxyServer {
             let gw_cfg = self.config.graphql_gateway.clone();
             let pool = gql_pool.clone();
             let policy = gateway_policy_for(&gw_cfg.tenant_header);
+            let drain = gateway_drain.clone();
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::graphql_gateway::GraphqlGateway::new(gw_cfg, pool)
                     .with_policy(policy)
+                    .with_drain(drain)
                     .run()
                     .await
                 {
@@ -1891,11 +2087,13 @@ impl ProxyServer {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         // SIGHUP -> zero-downtime config reload; SIGUSR2 -> graceful drain for
-        // binary handoff (Batch H). On platforms without Unix signals these are
-        // simply never readable.
+        // binary handoff (Batch H); SIGTERM / SIGINT -> shutdown drain. On
+        // platforms without Unix signals these are simply never readable.
         let mut sighup = Self::hangup_stream();
         let mut sigusr2 = Self::usr2_stream();
-        let mut graceful = false;
+        let mut sigterm = Self::terminate_stream();
+        let mut sigint = Self::interrupt_stream();
+        let mut stop = Stop::Abrupt;
 
         loop {
             tokio::select! {
@@ -1907,7 +2105,23 @@ impl ProxyServer {
                         "SIGUSR2: graceful binary-handoff drain — closing the listener so new \
                          connections route to the sibling process; finishing in-flight connections"
                     );
-                    graceful = true;
+                    stop = Stop::Handoff;
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!(
+                        "SIGTERM: shutting down — closing the listener, ending idle sessions and \
+                         finishing in-flight transactions"
+                    );
+                    stop = Stop::Shutdown;
+                    break;
+                }
+                _ = sigint.recv() => {
+                    tracing::info!(
+                        "SIGINT: shutting down — closing the listener, ending idle sessions and \
+                         finishing in-flight transactions"
+                    );
+                    stop = Stop::Shutdown;
                     break;
                 }
                 accept_result = listener.accept() => {
@@ -1959,16 +2173,47 @@ impl ProxyServer {
         // sit unaccepted) — all new connections now go to the sibling listener.
         drop(listener);
 
-        // On a graceful handoff, keep serving in-flight connections until they
-        // finish (or the drain deadline), so nothing in flight is dropped.
-        if graceful {
+        // A shutdown and a binary handoff drain alike: nothing in flight is
+        // dropped, and nobody waits for clients to leave on their own. Each
+        // session ends as soon as it has nothing in flight (`begin_drain`),
+        // the gateways stop accepting and finish the requests they hold, all
+        // under one deadline; a second SIGTERM or SIGINT ends the wait at once.
+        // After a handoff the ended clients reconnect to the sibling process.
+        if stop != Stop::Abrupt {
+            // The listener is closed: `/health/ready` says so.
+            self.state
+                .metrics
+                .policy
+                .draining
+                .store(true, Ordering::Relaxed);
             let timeout =
                 Self::drain_timeout(self.state.live_config.load().shutdown_drain_timeout_secs);
             tracing::info!(
+                reason = if stop == Stop::Handoff {
+                    "handoff"
+                } else {
+                    "shutdown"
+                },
                 timeout_secs = timeout.as_secs(),
+                active = self.state.sessions.len(),
+                gateway_requests = gateway_drain.in_flight(),
                 "draining in-flight connections"
             );
-            Self::drain_connections(&self.state, timeout).await;
+            Self::begin_drain(&self.state);
+            gateway_drain.close();
+            tokio::select! {
+                _ = Self::drain_connections(&self.state, &gateway_drain, timeout) => {}
+                _ = sigterm.recv() => tracing::warn!(
+                    active = self.state.sessions.len(),
+                    gateway_requests = gateway_drain.in_flight(),
+                    "second SIGTERM — exiting with connections still open"
+                ),
+                _ = sigint.recv() => tracing::warn!(
+                    active = self.state.sessions.len(),
+                    gateway_requests = gateway_drain.in_flight(),
+                    "second SIGINT — exiting with connections still open"
+                ),
+            }
         }
 
         // Wait for background tasks
@@ -2012,6 +2257,23 @@ impl ProxyServer {
         }
         if let Some(t) = http_gw_task {
             t.abort();
+        }
+        // Write out the recovery journal's queued records before the process
+        // exits (its writer thread would otherwise die with them under the
+        // `interval` and `none` fsync policies), bounded like the analytics
+        // flush above. Not on an abrupt stop, which returns at once.
+        if stop != Stop::Abrupt && self.state.transaction_journal.has_sink() {
+            let journal = self.state.transaction_journal.clone();
+            let budget =
+                Self::drain_timeout(self.state.live_config.load().shutdown_drain_timeout_secs);
+            let flushed = tokio::time::timeout(
+                budget,
+                tokio::task::spawn_blocking(move || journal.flush_sink()),
+            )
+            .await;
+            if !matches!(flushed, Ok(Ok(()))) {
+                tracing::warn!("recovery journal did not finish writing before shutdown");
+            }
         }
 
         Ok(())
@@ -2067,6 +2329,9 @@ impl ProxyServer {
 
             // P-03: latency histograms and the query cache's counters.
             admin_state.with_latency(state.latency.clone()).await;
+            admin_state
+                .with_session_policy(state.metrics.policy.clone())
+                .await;
             admin_state.with_node_slots(state.node_slots.clone()).await;
             admin_state
                 .with_tenant_slots(state.tenant_slots.clone())
@@ -2296,6 +2561,15 @@ impl ProxyServer {
                                 .metrics
                                 .reads_offloaded
                                 .load(Ordering::Relaxed),
+                            branch_moves: server_state.metrics.branch_moves.load(Ordering::Relaxed),
+                            cache_scope_proofs: server_state
+                                .metrics
+                                .cache_scope_proofs
+                                .load(Ordering::Relaxed),
+                            cache_scope_proofs_reused: server_state
+                                .metrics
+                                .cache_scope_proofs_reused
+                                .load(Ordering::Relaxed),
                             read_mirror_failures: server_state
                                 .metrics
                                 .read_mirror_failures
@@ -2443,6 +2717,64 @@ impl ProxyServer {
         })
     }
 
+    /// Spawn the plugin directory's hot reload: every `[plugins]
+    /// hot_reload_interval_ms`, reconcile the loaded plugins with the
+    /// directory (`PluginManager::rescan`). Compiling a module is CPU-bound,
+    /// so each rescan runs on the blocking pool. `None` without plugins or
+    /// with `hot_reload` off.
+    #[cfg(feature = "wasm-plugins")]
+    fn spawn_plugin_watcher(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let pm = self.state.plugin_manager.clone()?;
+        let every = pm.hot_reload_interval()?;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(every);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The startup load already reconciled the directory.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let pm = Arc::clone(&pm);
+                        if let Err(e) = tokio::task::spawn_blocking(move || pm.rescan(false)).await {
+                            tracing::error!(error = %e, "plugin directory rescan panicked");
+                        }
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        }))
+    }
+
+    /// Spawn the rate limiter's maintenance: every `[rate_limit]
+    /// cleanup_interval_secs`, drop the state of idle buckets. `None` without
+    /// a limiter.
+    #[cfg(feature = "rate-limiting")]
+    fn spawn_rate_limit_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let limiter = self.state.rate_limiter.clone()?;
+        let every = Duration::from_secs(self.config.rate_limit.cleanup_interval_secs.max(1));
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(every);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let evicted = limiter.evict_idle();
+                        if evicted > 0 {
+                            tracing::debug!(
+                                evicted,
+                                remaining = limiter.tracked_keys(),
+                                "rate limiter: idle buckets dropped"
+                            );
+                        }
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        }))
+    }
+
     /// Shutdown the server
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
@@ -2579,6 +2911,17 @@ impl ProxyServer {
                 .backend_capacity_refusals
                 .load(Ordering::Relaxed),
             reads_offloaded: self.state.metrics.reads_offloaded.load(Ordering::Relaxed),
+            branch_moves: self.state.metrics.branch_moves.load(Ordering::Relaxed),
+            cache_scope_proofs: self
+                .state
+                .metrics
+                .cache_scope_proofs
+                .load(Ordering::Relaxed),
+            cache_scope_proofs_reused: self
+                .state
+                .metrics
+                .cache_scope_proofs_reused
+                .load(Ordering::Relaxed),
             read_mirror_failures: self
                 .state
                 .metrics

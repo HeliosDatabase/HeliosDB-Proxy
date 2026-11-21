@@ -676,8 +676,14 @@ impl RateLimiter {
         &self,
         key: &LimiterKey,
         cost: u32,
-        _config: &RateLimitConfig,
+        config: &RateLimitConfig,
     ) -> Result<(), SlidingWindowExceeded> {
+        // No window configured: the token bucket alone limits. (This used to
+        // be a hidden 60 000-per-minute window on every key, which capped
+        // any `default_qps` above 1 000 without saying so.)
+        if config.window_max_requests == 0 {
+            return Ok(());
+        }
         // Hit path: existing windows are looked up with `get_mut` (the same
         // shard write guard `entry()` used, still avoiding a key clone on
         // hit) rather than `get`'s read guard — see `check_token_bucket` for
@@ -690,11 +696,10 @@ impl RateLimiter {
             return window.try_record_n(cost);
         }
 
-        // Use a per-minute sliding window
         let window = self
             .sliding_windows
             .entry(key.clone())
-            .or_insert_with(|| SlidingWindow::per_minute(60_000)); // 60k per minute default
+            .or_insert_with(|| SlidingWindow::new(config.window_size, config.window_max_requests));
 
         window.try_record_n(cost)
     }
@@ -749,6 +754,42 @@ impl RateLimiter {
         }
     }
 
+    /// Drop the state of keys that hold nothing a fresh key would not: a
+    /// token bucket refilled to its capacity and a window with no event in
+    /// it are what the next request of that key would create anyway, so no
+    /// decision changes; their per-key statistics go with them. (In-flight
+    /// counters already drop their entry at zero.) Without this, every
+    /// distinct key (`key_by = "client_ip"`) stayed in memory for good.
+    /// Returns how many keys were dropped.
+    pub fn evict_idle(&self) -> usize {
+        let mut evicted: Vec<LimiterKey> = Vec::new();
+        self.token_buckets.retain(|key, bucket| {
+            let idle = bucket.is_full();
+            if idle {
+                evicted.push(key.clone());
+            }
+            !idle
+        });
+        self.sliding_windows.retain(|key, window| {
+            let idle = window.is_idle();
+            if idle && !self.token_buckets.contains_key(key) {
+                evicted.push(key.clone());
+            }
+            !idle
+        });
+        for key in &evicted {
+            if !self.token_buckets.contains_key(key) && !self.sliding_windows.contains_key(key) {
+                self.metrics.forget_key(&key.to_string());
+            }
+        }
+        evicted.len()
+    }
+
+    /// Keys with live state (token buckets or windows).
+    pub fn tracked_keys(&self) -> usize {
+        self.token_buckets.len().max(self.sliding_windows.len())
+    }
+
     /// Clean up expired entries
     pub fn cleanup(&self) {
         // `rcu` re-runs the closure against the latest snapshot if another
@@ -779,6 +820,72 @@ impl std::fmt::Debug for RateLimiter {
 
 #[cfg(test)]
 mod tests {
+
+    /// A `default_qps` above 1 000 is not capped by a hidden per-minute
+    /// window: 70 000 requests in well under a minute all pass a bucket that
+    /// allows them. A configured window still limits.
+    #[test]
+    fn no_hidden_window_caps_a_high_qps_bucket() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            default_qps: 1_000_000,
+            default_burst: 1_000_000,
+            ..RateLimitConfig::default()
+        });
+        let key = LimiterKey::User("bulk".into());
+        for i in 0..70_000 {
+            assert!(
+                matches!(limiter.check(&key, 1), RateLimitResult::Allowed),
+                "request {i} denied"
+            );
+        }
+        let windowed = RateLimiter::new(RateLimitConfig {
+            default_qps: 1_000_000,
+            default_burst: 1_000_000,
+            window_max_requests: 3,
+            ..RateLimitConfig::default()
+        });
+        for _ in 0..3 {
+            assert!(matches!(windowed.check(&key, 1), RateLimitResult::Allowed));
+        }
+        assert!(matches!(
+            windowed.check(&key, 1),
+            RateLimitResult::Denied(_)
+        ));
+    }
+
+    /// Idle keys are evicted without changing a decision: a bucket back at
+    /// its capacity is a fresh bucket. A key still under way keeps its state.
+    #[test]
+    fn idle_keys_are_evicted_and_busy_ones_kept() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            default_qps: 1_000_000,
+            default_burst: 10,
+            ..RateLimitConfig::default()
+        });
+        for i in 0..100 {
+            let key = LimiterKey::ClientIp(std::net::IpAddr::from([10, 0, 0, i as u8]));
+            assert!(matches!(limiter.check(&key, 1), RateLimitResult::Allowed));
+        }
+        assert_eq!(limiter.tracked_keys(), 100);
+        // At a million tokens a second the buckets refill at once.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(limiter.evict_idle(), 100);
+        assert_eq!(limiter.tracked_keys(), 0);
+        assert_eq!(limiter.metrics.tracked_keys(), 0);
+
+        let slow = RateLimiter::new(RateLimitConfig {
+            default_qps: 1,
+            default_burst: 5,
+            ..RateLimitConfig::default()
+        });
+        let busy = LimiterKey::User("busy".into());
+        for _ in 0..5 {
+            let _ = slow.check(&busy, 1);
+        }
+        assert_eq!(slow.evict_idle(), 0, "an emptied bucket is not idle");
+        assert!(matches!(slow.check(&busy, 1), RateLimitResult::Denied(_)));
+    }
+
     use super::*;
 
     #[test]
@@ -1270,11 +1377,16 @@ mod tests {
     /// produce identical verdicts.
     #[test]
     fn test_cached_key_shares_bucket_with_plain_key() {
-        let config = RateLimitConfig::builder()
-            .default_qps(1)
-            .default_burst(2)
-            .exceeded_action(ExceededAction::Reject)
-            .build();
+        // A window configured too (generous enough never to decide here),
+        // so both kinds of per-key state are created and checked below.
+        let config = RateLimitConfig {
+            window_max_requests: 1_000,
+            ..RateLimitConfig::builder()
+                .default_qps(1)
+                .default_burst(2)
+                .exceeded_action(ExceededAction::Reject)
+                .build()
+        };
         let limiter = RateLimiter::new(config);
 
         let key = LimiterKey::User("shared".to_string());

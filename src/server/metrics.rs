@@ -1,8 +1,23 @@
 use super::*;
 
+/// Additional daemon policy counters, attached directly to the admin API.
+/// Kept out of the public snapshot struct to preserve its construction API.
+#[derive(Default)]
+pub(crate) struct SessionPolicyCounters {
+    pub(crate) copy_input_timeouts: AtomicU64,
+    pub(crate) query_cache_context_bypassed: AtomicU64,
+    /// The process stopped accepting connections and is draining (SIGTERM,
+    /// SIGINT or a SIGUSR2 handoff): `/health/ready` answers 503.
+    pub(crate) draining: std::sync::atomic::AtomicBool,
+    /// Sessions the shutdown drain ended with `57P01` once they had nothing
+    /// in flight.
+    pub(crate) sessions_drained: AtomicU64,
+}
+
 /// Server metrics
 #[derive(Default)]
 pub(super) struct ServerMetrics {
+    pub(super) policy: Arc<SessionPolicyCounters>,
     /// Total connections accepted
     pub(super) connections_accepted: AtomicU64,
     /// Total connections refused because the `[limits] max_client_connections`
@@ -72,6 +87,13 @@ pub(super) struct ServerMetrics {
     pub(super) backend_capacity_refusals: AtomicU64,
     /// Requests served by a standby under `[load_balancer] standby_reads`.
     pub(super) reads_offloaded: AtomicU64,
+    /// Sessions moved to another branch database (`[branch] route_enabled`).
+    pub(super) branch_moves: AtomicU64,
+    /// Backend settings proofs (`SHOW ALL`) taken for result-cache reads.
+    pub(super) cache_scope_proofs: AtomicU64,
+    /// Result-cache reads that reused a connection's proof within
+    /// `[cache] proof_ttl_ms` instead of taking one.
+    pub(super) cache_scope_proofs_reused: AtomicU64,
     /// Offloaded reads that went to the primary instead: the standby
     /// connection could not be opened (e.g. it wants a password pass-through
     /// auth does not hold) or could not take the session's settings.
@@ -174,6 +196,12 @@ pub struct ServerMetricsSnapshot {
     pub backend_capacity_refusals: u64,
     /// Requests served by a standby (read offload).
     pub reads_offloaded: u64,
+    /// Sessions moved to another branch database.
+    pub branch_moves: u64,
+    /// Backend settings proofs taken for result-cache reads.
+    pub cache_scope_proofs: u64,
+    /// Result-cache reads that reused a recent proof.
+    pub cache_scope_proofs_reused: u64,
     /// Offloaded reads that fell back to the primary (standby connection or
     /// settings mirror failed).
     pub read_mirror_failures: u64,

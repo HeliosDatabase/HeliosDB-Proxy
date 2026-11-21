@@ -63,6 +63,14 @@ pub struct L2WarmCache {
     evicting: AtomicBool,
 }
 
+/// Entries above which the query cache runs an eviction pass on its
+/// `cache-reclaim` thread instead of on the connection whose store found L2
+/// full ([`L2WarmCache::make_room_paced`]). A pass reads every entry twice
+/// (the retired ones, then the least recently used): microseconds for a
+/// small map, but 645 000 entries held one request for tens of
+/// milliseconds every ~30 000 stores in the profile of 2026-11-20.
+pub(crate) const OFFLOAD_SCAN_ENTRIES: usize = 2048;
+
 /// File-backed spill storage. The index, including monotonic entry timing,
 /// lives only in this process; the first write creates/truncates the file.
 #[derive(Debug)]
@@ -278,10 +286,30 @@ impl L2WarmCache {
     pub(crate) fn put_payload_now(
         &self,
         key: CacheKey,
-        mut result: CachedResult,
+        result: CachedResult,
         payload: L2Payload,
         is_stale: impl Fn(&CachedResult) -> bool,
         hand_off: impl FnOnce(Vec<u64>) -> Result<(), Vec<u64>>,
+    ) -> usize {
+        self.put_payload_with(key, result, payload, |l2, entry_size| {
+            l2.make_room(entry_size, is_stale, hand_off)
+        })
+    }
+
+    /// [`Self::put_payload_now`] with the eviction pass left to the caller:
+    /// when the store needs room and no pass is running, `make_room` is
+    /// called with the entry's size, holding the pass. It runs
+    /// [`Self::make_room`] here, or has [`Self::make_room_paced`] run on a
+    /// thread that may block (the query cache does, above
+    /// [`OFFLOAD_SCAN_ENTRIES`]); either ends the pass. It returns the
+    /// entries it evicted before returning. The entry is inserted whatever
+    /// it did: the size bound is soft while a pass runs.
+    pub(crate) fn put_payload_with(
+        &self,
+        key: CacheKey,
+        mut result: CachedResult,
+        payload: L2Payload,
+        make_room: impl FnOnce(&Self, usize) -> usize,
     ) -> usize {
         if !self.config.enabled {
             return 0;
@@ -315,19 +343,7 @@ impl L2WarmCache {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
-            let retired: Vec<u64> = self
-                .memory_entries
-                .iter()
-                .filter(|e| e.is_expired() || is_stale(&e.result))
-                .map(|e| *e.key())
-                .collect();
-            if retired.is_empty() {
-                evicted += self.evict_to_fit(entry_size);
-                self.end_eviction();
-            } else if let Err(retired) = hand_off(retired) {
-                evicted += self.shed(&retired);
-                self.end_eviction();
-            }
+            evicted += make_room(self, entry_size);
         }
 
         let fingerprint = format!("{:016x}", hash);
@@ -336,6 +352,59 @@ impl L2WarmCache {
             None => L2Entry::new(key, fingerprint, result),
         };
         self.insert(hash, entry);
+        evicted
+    }
+
+    /// The hashes of the entries an eviction pass retires before it evicts
+    /// any live one: every expired entry and every entry `is_stale` names.
+    fn retired(&self, is_stale: impl Fn(&CachedResult) -> bool) -> Vec<u64> {
+        self.memory_entries
+            .iter()
+            .filter(|e| e.is_expired() || is_stale(&e.result))
+            .map(|e| *e.key())
+            .collect()
+    }
+
+    /// One eviction pass on the caller's path, for an entry of `entry_size`
+    /// bytes (the caller holds the pass, [`Self::put_payload_with`]): see
+    /// [`Self::put_evicting`]. Returns the entries evicted here; the pass is
+    /// ended here unless `hand_off` took the retired hashes.
+    pub(crate) fn make_room(
+        &self,
+        entry_size: usize,
+        is_stale: impl Fn(&CachedResult) -> bool,
+        hand_off: impl FnOnce(Vec<u64>) -> Result<(), Vec<u64>>,
+    ) -> usize {
+        let retired = self.retired(is_stale);
+        if retired.is_empty() {
+            let evicted = self.evict_to_fit(entry_size);
+            self.end_eviction();
+            evicted
+        } else if let Err(retired) = hand_off(retired) {
+            let evicted = self.shed(&retired);
+            self.end_eviction();
+            evicted
+        } else {
+            0
+        }
+    }
+
+    /// [`Self::make_room`] as a whole on a thread that may block (the
+    /// `cache-reclaim` thread; never an async worker): both scans of the map
+    /// run here, retired entries are shed paced ([`Self::shed_paced`]), and
+    /// the pass is ended. Returns the entries evicted.
+    pub(crate) fn make_room_paced(
+        &self,
+        entry_size: usize,
+        is_stale: impl Fn(&CachedResult) -> bool,
+    ) -> usize {
+        let retired = self.retired(is_stale);
+        let evicted = if retired.is_empty() {
+            self.evict_to_fit(entry_size)
+        } else {
+            self.shed_paced(&retired)
+        };
+        self.end_eviction();
         evicted
     }
 
@@ -472,53 +541,81 @@ impl L2WarmCache {
         }
     }
 
-    /// Evict entries to fit new data; returns how many it evicted.
+    /// Evict least-recently-used entries until `required_bytes` more fit,
+    /// and `evict_headroom_pct` of `max_bytes` more besides; returns how many
+    /// it evicted. One pass scans the map once: it takes every entry's last
+    /// access and size, selects the oldest entries whose sizes cover what
+    /// must go (expired ones first), and removes those not read since the
+    /// scan. Its work is bounded by the map's size, never by how far behind
+    /// the byte account is, and the headroom makes room for many puts per
+    /// pass. (It used to scan the whole map again for every entry it
+    /// evicted, while concurrent puts kept inserting: with L2 full under
+    /// load, one put could run for minutes without yielding.)
     fn evict_to_fit(&self, required_bytes: usize) -> usize {
         let max_bytes = self.config.max_bytes;
         let target = max_bytes.saturating_sub(required_bytes);
-        let mut evicted = 0;
+        let usage = self.memory_usage.load(Ordering::Relaxed);
+        if usage <= target {
+            return 0;
+        }
+        let headroom = max_bytes / 100 * usize::from(self.config.evict_headroom_pct);
+        let need = usage - target.saturating_sub(headroom);
 
-        // First, evict expired entries
-        let expired: Vec<u64> = self
+        // (expired, last access, key hash, size) of every entry; expired
+        // entries sort first, then the least recently used.
+        let mut candidates: Vec<(bool, Instant, u64, usize)> = self
             .memory_entries
             .iter()
-            .filter(|e| e.is_expired())
-            .map(|e| *e.key())
+            .map(|e| (!e.is_expired(), e.last_access, *e.key(), e.memory_size))
             .collect();
+        let chosen = Self::oldest_covering(&mut candidates, need);
 
-        for hash in expired {
-            if let Some((_, entry)) = self.memory_entries.remove(&hash) {
-                self.release(&entry);
-                evicted += 1;
-            }
-        }
-
-        // If still over limit, evict LRU entries
-        while self.memory_usage.load(Ordering::Relaxed) > target {
-            // Find LRU entry
-            let lru_hash = self
+        let mut evicted = 0;
+        for &(live, seen, hash, _) in &candidates[..chosen] {
+            // An entry read since the scan is no longer least recently used.
+            let Some((_, entry)) = self
                 .memory_entries
-                .iter()
-                .min_by_key(|e| e.last_access)
-                .map(|e| *e.key());
-
-            if let Some(hash) = lru_hash {
-                // Optionally move to mmap before evicting
-                if self.mmap_storage.is_some() {
-                    if let Some(entry) = self.memory_entries.get(&hash) {
-                        self.demote_to_mmap(hash, &entry);
-                    }
-                }
-
-                if let Some((_, entry)) = self.memory_entries.remove(&hash) {
-                    self.release(&entry);
-                    evicted += 1;
-                }
-            } else {
-                break;
+                .remove_if(&hash, |_, e| !live || e.last_access <= seen)
+            else {
+                continue;
+            };
+            if live && self.mmap_storage.is_some() {
+                self.demote_to_mmap(hash, &entry);
             }
+            self.release(&entry);
+            evicted += 1;
         }
         evicted
+    }
+
+    /// Order the first entries of `candidates` oldest first (expired ones
+    /// before live ones) until their sizes reach `need` bytes, and return
+    /// how many that is (all of them when the whole map does not reach it).
+    /// Expected linear time: each round selects about as many more entries as
+    /// the bytes still missing take at the average entry size.
+    fn oldest_covering(candidates: &mut [(bool, Instant, u64, usize)], need: usize) -> usize {
+        let total: usize = candidates.iter().map(|c| c.3).sum();
+        if total <= need {
+            return candidates.len();
+        }
+        let average = (total / candidates.len()).max(1);
+        let (mut chosen, mut covered) = (0, 0usize);
+        while covered < need && chosen < candidates.len() {
+            let rest = &mut candidates[chosen..];
+            let more = ((need - covered) / average + 1).min(rest.len());
+            if more < rest.len() {
+                rest.select_nth_unstable_by_key(more - 1, |c| (c.0, c.1));
+            }
+            rest[..more].sort_unstable_by_key(|c| (c.0, c.1));
+            for c in &rest[..more] {
+                if covered >= need {
+                    break;
+                }
+                covered += c.3;
+                chosen += 1;
+            }
+        }
+        chosen
     }
 
     /// Promote an entry from mmap to memory (the file keeps raw payloads:
@@ -1530,6 +1627,132 @@ mod tests {
         assert_eq!(evicted, 10 - small.len());
         assert!(evicted > 0);
         assert_eq!(small.compression_saved_bytes(), small.len() * one);
+    }
+
+    /// Stores that skipped eviction while a pass ran (the anti-herd rule)
+    /// can leave L2 far over its budget. One pass then brings it under the
+    /// budget less the headroom, in a single scan, least recently used
+    /// first: entries read since keep their place.
+    #[tokio::test]
+    async fn one_eviction_pass_clears_a_backlog_with_headroom_keeping_recent_reads() {
+        let cache = L2WarmCache::new(L2Config {
+            max_bytes: 1024 * 1024,
+            evict_headroom_pct: 20,
+            ..L2Config::default()
+        });
+        // About twice the budget, inserted without evicting.
+        for i in 0..200u64 {
+            let key = create_key(i);
+            cache.insert(
+                key.hash_value(),
+                L2Entry::new(key, format!("{i:016x}"), sized(10 * 1024)),
+            );
+        }
+        assert!(cache.memory_usage() > 2 * 1024 * 1024 - 64 * 1024);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        for i in 0..20u64 {
+            assert!(cache.get(&create_key(i)).await.is_some());
+        }
+        let need = 10 * 1024 + std::mem::size_of::<L2Entry>();
+        let evicted = cache.evict_to_fit(need);
+        let low = 1024 * 1024 - need - 1024 * 1024 / 100 * 20;
+        assert!(
+            cache.memory_usage() <= low,
+            "{} > {low}",
+            cache.memory_usage()
+        );
+        assert_eq!(evicted, 200 - cache.len());
+        for i in 0..20u64 {
+            assert!(
+                cache.get(&create_key(i)).await.is_some(),
+                "entry {i} was read after the others were stored"
+            );
+        }
+        // Under the budget now: the next pass evicts nothing.
+        assert_eq!(cache.evict_to_fit(need), 0);
+    }
+
+    /// Expired entries go before any live one, however recently used.
+    #[tokio::test]
+    async fn an_eviction_pass_takes_expired_entries_first() {
+        let cache = L2WarmCache::new(L2Config {
+            max_bytes: 1024 * 1024,
+            evict_headroom_pct: 0,
+            ..L2Config::default()
+        });
+        for i in 0..60u64 {
+            let key = create_key(i);
+            let mut result = sized(10 * 1024);
+            if i >= 50 {
+                result.ttl = Duration::from_millis(1);
+            }
+            cache.insert(key.hash_value(), L2Entry::new(key, format!("{i}"), result));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Room for one more entry, which the ten expired ones cover.
+        let usage = cache.memory_usage();
+        let need = 1024 * 1024 + 10 * 1024 - usage;
+        let evicted = cache.evict_to_fit(need);
+        assert!((1..=10).contains(&evicted), "{evicted} evicted");
+        for i in 0..50u64 {
+            assert!(cache
+                .memory_entries
+                .contains_key(&create_key(i).hash_value()));
+        }
+    }
+
+    /// `oldest_covering` picks exactly the shortest oldest-first prefix (an
+    /// expired entry before any live one) whose sizes reach `need`.
+    #[test]
+    fn oldest_covering_matches_a_full_sort() {
+        let base = Instant::now();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..200 {
+            let n = 1 + (next() % 500) as usize;
+            let mut candidates: Vec<(bool, Instant, u64, usize)> = (0..n as u64)
+                .map(|hash| {
+                    (
+                        next() % 8 != 0,
+                        // Distinct in practice: the expected count assumes no ties.
+                        base + Duration::from_nanos(next() % 1_000_000_000_000),
+                        hash,
+                        1 + (next() % 4096) as usize,
+                    )
+                })
+                .collect();
+            let total: usize = candidates.iter().map(|c| c.3).sum();
+            let need = if round % 10 == 0 {
+                total + 1
+            } else {
+                1 + (next() as usize % total)
+            };
+            let mut sorted = candidates.clone();
+            sorted.sort_by_key(|c| (c.0, c.1, c.2));
+            let mut expected = 0;
+            let mut covered = 0;
+            while covered < need && expected < sorted.len() {
+                covered += sorted[expected].3;
+                expected += 1;
+            }
+            let chosen = L2WarmCache::oldest_covering(&mut candidates, need);
+            assert_eq!(chosen, expected, "round {round}");
+            // The same entries up to ties in (expired, last access).
+            let cut = sorted[expected - 1];
+            let mut picked: Vec<_> = candidates[..chosen].iter().map(|c| (c.0, c.1)).collect();
+            picked.sort();
+            let mut want: Vec<_> = sorted[..expected].iter().map(|c| (c.0, c.1)).collect();
+            want.sort();
+            assert_eq!(picked, want, "round {round}");
+            assert!(candidates[..chosen]
+                .iter()
+                .all(|c| (c.0, c.1) <= (cut.0, cut.1)));
+        }
     }
 
     /// `put_evicting` reports the entries it evicted to make room: expired

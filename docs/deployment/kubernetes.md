@@ -135,7 +135,7 @@ spec:
         fsGroup: 65534
       containers:
         - name: heliosproxy
-          image: heliosdb/proxy:latest
+          image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0
           args:
             - "--config"
             - "/etc/heliosproxy/config.toml"
@@ -188,8 +188,15 @@ spec:
         - name: config
           configMap:
             name: heliosproxy-config
-      terminationGracePeriodSeconds: 30
+      # SIGTERM starts a drain bounded by shutdown_drain_timeout_secs (default 60):
+      # keep the grace period longer, or Kubernetes kills the pod mid-drain.
+      terminationGracePeriodSeconds: 75
 ```
+
+On pod termination the proxy closes its listeners, `/health/ready` answers 503 (so the
+pod leaves the Service endpoints), and each session ends with FATAL `57P01` once nothing
+of it is in flight. Set `terminationGracePeriodSeconds` above
+`shutdown_drain_timeout_secs`, or lower that key.
 
 ### Service
 
@@ -282,7 +289,7 @@ spec:
 
         # ── HeliosProxy Sidecar ───────────────────────────────
         - name: heliosproxy
-          image: heliosdb/proxy:latest
+          image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0
           args:
             - "--config"
             - "/etc/heliosproxy/config.toml"

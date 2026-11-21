@@ -285,11 +285,7 @@ impl NodeFilter {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(config.max_lag_ms);
 
-        if max_lag_ms < u64::MAX && node.lag_ms > max_lag_ms {
-            return false;
-        }
-
-        true
+        max_lag_ms == u64::MAX || node.lag_ms <= max_lag_ms
     }
 
     /// Get default criteria for a query type

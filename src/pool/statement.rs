@@ -130,29 +130,40 @@ impl StatementModeHandler {
     /// ASCII case-insensitive prefix/substring tests on the trimmed input
     /// replace the uppercased copy. Semantics are unchanged.
     pub fn is_safe_query(&self, sql: &str) -> bool {
-        let s = sql.trim();
+        let s = Self::trimmed(sql);
+        Self::leading_keyword(s).is_none() && !Self::creates_temp(s) && !Self::is_session_set(s)
+    }
 
-        // These are not safe for statement mode
-        if starts_with_ci(s, "LISTEN")
-            || starts_with_ci(s, "UNLISTEN")
-            || starts_with_ci(s, "PREPARE")
-            || starts_with_ci(s, "EXECUTE")
-            || starts_with_ci(s, "DEALLOCATE")
-            || starts_with_ci(s, "DECLARE")
-            || starts_with_ci(s, "FETCH")
-            || starts_with_ci(s, "CLOSE")
-            || starts_with_ci(s, "MOVE")
-            || Self::creates_temp(s)
-        {
-            return false;
+    /// `sql.trim()`. A statement that starts and ends on a visible ASCII
+    /// byte, the usual case, has nothing to trim and skips the Unicode
+    /// whitespace scan from both ends.
+    #[inline]
+    fn trimmed(sql: &str) -> &str {
+        match sql.as_bytes() {
+            [first, .., last] if first.is_ascii_graphic() && last.is_ascii_graphic() => sql,
+            _ => sql.trim(),
         }
+    }
 
-        // SET commands that affect session state
-        if Self::is_session_set(s) {
-            return false;
+    /// The session-bound command the trimmed statement starts with, if any.
+    /// A prefix test like the nine it replaces (`LISTENER` still counts as
+    /// `LISTEN`), entered by the first byte so a statement that starts with
+    /// none of them is compared against at most two keywords.
+    #[inline]
+    fn leading_keyword(trimmed: &str) -> Option<LeadingKeyword> {
+        let s = trimmed.as_bytes();
+        match s.first()? & !ASCII_CASE_BIT {
+            b'L' if starts_with_letters(s, b"LISTEN") => Some(LeadingKeyword::Notification),
+            b'U' if starts_with_letters(s, b"UNLISTEN") => Some(LeadingKeyword::Notification),
+            b'P' if starts_with_letters(s, b"PREPARE") => Some(LeadingKeyword::Prepared),
+            b'E' if starts_with_letters(s, b"EXECUTE") => Some(LeadingKeyword::Prepared),
+            b'D' if starts_with_letters(s, b"DEALLOCATE") => Some(LeadingKeyword::Prepared),
+            b'D' if starts_with_letters(s, b"DECLARE") => Some(LeadingKeyword::Cursor),
+            b'F' if starts_with_letters(s, b"FETCH") => Some(LeadingKeyword::Cursor),
+            b'C' if starts_with_letters(s, b"CLOSE") => Some(LeadingKeyword::Cursor),
+            b'M' if starts_with_letters(s, b"MOVE") => Some(LeadingKeyword::CursorMove),
+            _ => None,
         }
-
-        true
     }
 
     /// `CREATE TEMP ...` / `CREATE TEMPORARY ...` anywhere in the statement
@@ -174,24 +185,24 @@ impl StatementModeHandler {
 
     /// Get warning if query is unsafe for statement mode
     pub fn get_query_warning(&self, sql: &str) -> Option<&'static str> {
-        let s = sql.trim();
+        let s = Self::trimmed(sql);
 
-        if starts_with_ci(s, "LISTEN") || starts_with_ci(s, "UNLISTEN") {
-            return Some(
-                "LISTEN/UNLISTEN not supported in statement mode - notifications will be lost",
-            );
-        }
-
-        if starts_with_ci(s, "PREPARE")
-            || starts_with_ci(s, "EXECUTE")
-            || starts_with_ci(s, "DEALLOCATE")
-        {
-            return Some("Prepared statements not supported in statement mode");
-        }
-
-        if starts_with_ci(s, "DECLARE") || starts_with_ci(s, "FETCH") || starts_with_ci(s, "CLOSE")
-        {
-            return Some("Cursors not supported in statement mode outside explicit transactions");
+        match Self::leading_keyword(s) {
+            Some(LeadingKeyword::Notification) => {
+                return Some(
+                    "LISTEN/UNLISTEN not supported in statement mode - notifications will be lost",
+                );
+            }
+            Some(LeadingKeyword::Prepared) => {
+                return Some("Prepared statements not supported in statement mode");
+            }
+            Some(LeadingKeyword::Cursor) => {
+                return Some(
+                    "Cursors not supported in statement mode outside explicit transactions",
+                );
+            }
+            // MOVE is unsafe but has no warning of its own.
+            Some(LeadingKeyword::CursorMove) | None => {}
         }
 
         if Self::creates_temp(s) {
@@ -204,6 +215,37 @@ impl StatementModeHandler {
 
         None
     }
+}
+
+/// The bit that separates an ASCII letter from its other case.
+const ASCII_CASE_BIT: u8 = b'a' ^ b'A';
+
+/// [`starts_with_ci`] for a keyword of upper-case ASCII letters only. A byte
+/// with the case bit cleared equals an upper-case letter exactly when it is
+/// that letter in either case, so each byte takes one mask and one compare
+/// and a keyword of known length compiles to a few word compares.
+#[inline(always)]
+fn starts_with_letters(s: &[u8], keyword: &[u8]) -> bool {
+    debug_assert!(keyword.iter().all(u8::is_ascii_uppercase));
+    s.len() >= keyword.len()
+        && s[..keyword.len()]
+            .iter()
+            .zip(keyword)
+            .all(|(byte, letter)| byte & !ASCII_CASE_BIT == *letter)
+}
+
+/// The session-bound command a statement starts with
+/// ([`StatementModeHandler::leading_keyword`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeadingKeyword {
+    /// `LISTEN` / `UNLISTEN`.
+    Notification,
+    /// `PREPARE` / `EXECUTE` / `DEALLOCATE`.
+    Prepared,
+    /// `DECLARE` / `FETCH` / `CLOSE`.
+    Cursor,
+    /// `MOVE`.
+    CursorMove,
 }
 
 #[cfg(test)]
@@ -329,6 +371,135 @@ mod tests {
         assert!(handler.is_safe_query("CREATE TABLE t (i int)"));
         assert!(handler.get_query_warning("SET").is_none());
         assert!(handler.get_query_warning("SEt LOCAL x = 1").is_none());
+    }
+
+    /// The scan before it dispatched on the first byte, kept as the oracle.
+    fn reference(sql: &str) -> (bool, Option<&'static str>) {
+        let s = sql.trim();
+        let starts = |keywords: &[&str]| keywords.iter().any(|k| starts_with_ci(s, k));
+        let temp = contains_ci(s, "CREATE TEMP");
+        let session_set = starts_with_ci(s, "SET ")
+            && !starts_with_ci(s, "SET LOCAL")
+            && !starts_with_ci(s, "SET TRANSACTION");
+        let safe = !starts(&[
+            "LISTEN",
+            "UNLISTEN",
+            "PREPARE",
+            "EXECUTE",
+            "DEALLOCATE",
+            "DECLARE",
+            "FETCH",
+            "CLOSE",
+            "MOVE",
+        ]) && !temp
+            && !session_set;
+        let warning = if starts(&["LISTEN", "UNLISTEN"]) {
+            Some("LISTEN/UNLISTEN not supported in statement mode - notifications will be lost")
+        } else if starts(&["PREPARE", "EXECUTE", "DEALLOCATE"]) {
+            Some("Prepared statements not supported in statement mode")
+        } else if starts(&["DECLARE", "FETCH", "CLOSE"]) {
+            Some("Cursors not supported in statement mode outside explicit transactions")
+        } else if temp {
+            Some("Temporary tables may not persist correctly in statement mode")
+        } else if session_set {
+            Some("Session variables may not persist in statement mode - use SET LOCAL within transaction")
+        } else {
+            None
+        };
+        (safe, warning)
+    }
+
+    /// Every keyword, its truncations and extensions, in three casings, behind
+    /// each kind of leading and trailing blank (ASCII, Unicode, none) and in
+    /// front of each tail: the first-byte dispatch and the trim shortcut
+    /// answer exactly as the sequential scan did.
+    #[test]
+    fn safety_scan_matches_the_sequential_reference() {
+        let handler = StatementModeHandler::new();
+        let words = [
+            "LISTEN",
+            "UNLISTEN",
+            "PREPARE",
+            "EXECUTE",
+            "DEALLOCATE",
+            "DECLARE",
+            "FETCH",
+            "CLOSE",
+            "MOVE",
+            "SET",
+            "SET LOCAL",
+            "SET TRANSACTION",
+            "CREATE TEMP",
+            "CREATE TEMPORARY",
+            "CREATE",
+            "SELECT",
+            "DELETE",
+            "DROP",
+            "COMMIT",
+            "UPDATE",
+            "EXPLAIN",
+            "LOCK",
+            "MERGE",
+            "PREPARED",
+            "FETCHX",
+            "",
+        ];
+        let edges = [
+            "",
+            " ",
+            "\t\n",
+            "\u{a0}",
+            "\u{2003} ",
+            "\u{e9}",
+            "\u{0}",
+            "-",
+        ];
+        let tails = [
+            "",
+            " x",
+            " x; create temp table t (i int)",
+            " x = 1",
+            "x",
+            "\u{e9}",
+        ];
+        let mut checked = 0usize;
+        for word in words {
+            for cut in 0..=word.len() {
+                // Truncations only at the full word and one byte short of it
+                // keep the corpus small without losing the boundary cases.
+                if cut != word.len() && cut + 1 != word.len() && cut != 1 {
+                    continue;
+                }
+                let stem = &word[..cut];
+                let mixed: String = stem
+                    .chars()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if i % 2 == 0 {
+                            c.to_ascii_lowercase()
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                for cased in [stem.to_string(), stem.to_ascii_lowercase(), mixed] {
+                    for lead in edges {
+                        for tail in tails {
+                            for trail in edges {
+                                let sql = format!("{lead}{cased}{tail}{trail}");
+                                assert_eq!(
+                                    (handler.is_safe_query(&sql), handler.get_query_warning(&sql)),
+                                    reference(&sql),
+                                    "{sql:?}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "corpus shrank to {checked}");
     }
 
     #[test]

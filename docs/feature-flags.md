@@ -27,16 +27,16 @@ All of the following are **off by default**. Enable them individually or via the
 | `query-cache` | `lru`, `zstd`, `lz4_flex` | L1 hot / L2 warm / L3 semantic query result caching. `zstd` and `lz4_flex` back the opt-in L2 payload compression (`[cache] l2_compression`). |
 | `routing-hints` | None | SQL comment-based query routing hints. |
 | `lag-routing` | None | Replica lag-aware routing with read-your-writes consistency. |
-| `rate-limiting` | None | Token bucket, sliding window, and concurrency rate limiting. |
-| `circuit-breaker` | None | Adaptive circuit breaker pattern per backend node. |
-| `query-analytics` | None | Query fingerprinting, slow query log, N+1 detection, intent classification. |
-| `multi-tenancy` | None | Tenant-aware routing, per-tenant pools, resource quotas. |
-| `auth-proxy` | None | Proxy-level authentication scaffolding (JWT, OAuth, API keys). |
+| `rate-limiting` | None | Token bucket, opt-in sliding window, and per-bucket concurrency limiting. |
+| `circuit-breaker` | None | Circuit breaker per backend node, with half-open recovery probes. |
+| `query-analytics` | None | Query fingerprinting and per-fingerprint statistics (`/analytics`); N+1, intent and slow-query results are library-only. |
+| `multi-tenancy` | None | Tenant identification, row-level tenant filter, per-tenant client, active-query, replay and journal budgets. |
+| `auth-proxy` | None | `[auth] mode = "passthrough" \| "scram"` client authentication; the JWT, OAuth and API-key modules are a library API. |
 | `ldap-auth` | `ldap3` | LDAP search + bind auth. Implies `auth-proxy`. Off by default even within `auth-proxy` because it pulls the `ldap3` client and its rustls stack. |
 | `query-rewriting` | None | Rule-based SQL query transformation. |
 | `wasm-plugins` | `wasmtime` | Sandboxed WASM plugin runtime with hot-reload. |
-| `graphql-gateway` | None | GraphQL-to-SQL gateway with schema introspection. |
-| `schema-routing` | None | Schema-aware routing and workload classification. |
+| `graphql-gateway` | None | GraphQL-to-SQL gateway over the tables listed in `[[graphql_gateway.tables]]`. |
+| `schema-routing` | None | Sends analytical reads to `[schema_routing] analytics_node`. |
 | `distribcache` | `zstd`, `lz4_flex` | DistribCache library module (see caveat under Feature Details). |
 | `anomaly-detection` | None | In-process anomaly heuristics: rate spikes, credential stuffing, SQL-injection patterns, novel query shapes. |
 | `edge-proxy` | `lru` | Edge / geo proxy mode: cache-first handling, last-write-wins TTL coherence, pull-on-miss + invalidation push. |
@@ -48,7 +48,7 @@ All of the following are **off by default**. Enable them individually or via the
 | `postgres-topology` | No | PostgreSQL primary discovery via `pg_is_in_recovery()` polling. Used throughout `src/primary_tracker.rs`. |
 | `heliosdb-topology` | No | Bridge to the HeliosDB-Lite internal `TopologyManager` (event-driven). Compiles a provider module that is only usable when HeliosProxy is built as part of the HeliosDB-Lite workspace. |
 
-Topology providers are independent of each other. Choose one based on your backend. If neither is enabled, the proxy operates in standalone mode with manual primary management via the Admin API.
+Topology providers are independent of each other. Choose one based on your backend. If neither is enabled, the daemon uses static topology: the configured `role = "primary"` node that passes its health check (there is no admin endpoint to set the primary). The prebuilt release binaries and the Docker image are built with `all-features,postgres-topology` (since 3.0.0 for the binaries), so they include the `postgres` and `patroni` providers.
 
 ### Observability
 
@@ -89,7 +89,7 @@ Enables three connection pooling modes that control when backend connections are
 | Transaction | COMMIT / ROLLBACK | Web applications, microservices, APIs |
 | Statement | Each individual statement | Read-heavy workloads, connection-constrained environments |
 
-Includes prepared statement tracking, connection reset sequences, lease management, and pool hardening.
+Includes prepared statement tracking, connection reset sequences, lease management, and pool hardening. Statement mode returns the connection after every statement, so no transaction block may stay open across statements: a lone `BEGIN` / `START TRANSACTION` is refused with `0A000`, and a request that leaves a block open ends its session (FATAL `0A000`), as in PgBouncer's statement mode. See `[pool_mode]` in [configuration.md](configuration.md#pool-mode-pool_mode).
 
 ### `ha-tr` -- deprecated no-op (Transaction Replay is in the default build)
 
@@ -119,7 +119,10 @@ The operator tooling built on the same journal:
    embedded use.
 
 `session_migrate` and `cursor_restore` are library modules and are **not** on the recovery
-path: prepared statements and cursors do not survive a failover.
+path. Protocol-level prepared statements are re-prepared on the replacement backend, but a
+session holding SQL `PREPARE`d statements, `WITH HOLD` cursors, temporary tables, `LISTEN`
+registrations or session-level advisory locks is ended with `08006` at a failover instead
+of continuing without them.
 
 Recovery is transparent where it can be. Where it cannot be — an unknown `COMMIT` outcome,
 a response already partly delivered, a snapshot-pinned transaction — the client gets a
@@ -162,39 +165,46 @@ Includes a read-your-writes (RYW) consistency module that tracks the last write 
 
 **Modules:** `src/rate_limit/`
 
-Provides three rate limiting algorithms:
+What the daemon enforces under `[rate_limit] enabled = true`, per bucket (`key_by` =
+`user`, `client_ip`, `database` or `global`):
 
-- **Token bucket:** Sustained rate with configurable burst.
-- **Sliding window:** Fixed-window counting with sub-window smoothing.
-- **Concurrency guard:** Limits the number of concurrent in-flight queries.
+- **Token bucket:** `default_qps` sustained with a `default_burst` depth, enforced at the
+  configured rate (before 3.0.0 a hidden 60 000-per-minute window capped it near 1 000/s).
+- **Sliding window (opt-in):** at most `window_max_requests` requests within any
+  `window_secs`.
+- **Concurrency cap:** at most `max_concurrent` requests in flight (`53400` above it).
 
-Supports per-user, per-tenant, and per-IP policies. Includes a query cost estimator that weights complex queries higher than simple ones.
+Every request costs 1. Idle buckets are dropped every `cleanup_interval_secs`. The
+library's tenant-keyed limits and query cost estimator are not wired into the daemon
+(planned for a later 3.x release).
 
 ### `circuit-breaker` -- Circuit Breaker
 
 **Modules:** `src/circuit_breaker/`
 
-Adaptive circuit breaker with three states:
+Per-node circuit breaker with three states:
 
 | State | Behavior |
 |-------|----------|
-| Closed | Normal operation. Failures are counted. |
-| Open | All requests to the affected node are rejected immediately. Entered after `failure_threshold` consecutive failures. |
-| Half-Open | After `recovery_timeout_secs`, a single probe request is sent. If it succeeds, the circuit closes. If it fails, the circuit remains open. |
+| Closed | Normal operation. Backend faults are counted in a 30-second window. |
+| Open | Entered after `failure_threshold` faults in the window. Requests to the node are fast-failed (`08006`, HTTP 503 on the gateways) and reads prefer other nodes. |
+| Half-Open | After `open_secs`, requests are admitted as probes (at most two at once). `success_threshold` successes close the circuit; a failed probe opens it again. |
 
-Each backend node has an independent breaker. The breaker uses a sliding-window failure counter to avoid false triggers from transient errors.
+Each backend node has an independent breaker. Before 3.0.0 the daemon never moved an open
+circuit to half-open, so it stayed open until a restart. The adaptive threshold is a
+library option the daemon does not set (planned for a later 3.x release).
 
 ### `query-analytics` -- Query Analytics
 
 **Modules:** `src/analytics/`
 
-Real-time query analysis:
+Real-time query analysis, exposed at `GET /analytics` (`/api/analytics`):
 
 - **Fingerprinting:** Normalizes queries by replacing literals with placeholders, grouping identical query patterns.
-- **Statistics:** Per-fingerprint execution count, latency histogram (P50/P95/P99), rows returned.
-- **Slow query log:** Logs queries exceeding the configured threshold with full SQL, parameters, and execution time.
-- **N+1 detection:** Identifies repeated identical queries within a session that indicate an N+1 query pattern.
-- **Intent classification:** Classifies queries as OLTP, OLAP, DDL, or administrative.
+- **Statistics:** Per-fingerprint calls, average and P99 latency, rows and errors, plus the number of slow queries.
+
+The library also implements a slow-query log, N+1 detection and intent classification;
+the daemon does not expose their results (planned for a later 3.x release).
 
 ### `multi-tenancy` -- Multi-Tenancy
 
@@ -202,16 +212,19 @@ Real-time query analysis:
 
 Tenant-aware proxy operation:
 
-- **Identification:** Extracts tenant ID from connection metadata (database name, username, or application_name).
-- **Isolation:** Per-tenant connection pools with independent sizing.
-- **Quotas:** Per-tenant rate limits and maximum connection limits.
-- **Schema isolation:** Optional schema-prefix transformation for shared-database multi-tenancy.
+- **Identification:** Reads the tenant from a startup parameter (`identify_by`: `database`, `user`, `application_name` or another key); `<db>@<branch>` resolves to `<db>`.
+- **Row isolation:** Adds a tenant filter to statements on `tenant_tables`, on both wire protocols and the gateways; refuses shapes it cannot rewrite (`42501`) and, by default, sessions with no identified tenant (`unknown_tenant = "refuse"`).
+- **Budgets:** Per-tenant client caps, active-query caps (PG-wire and gateways), replay-byte and recovery-journal budgets; a SIGHUP can resize them.
+
+Per-tenant connection pools and schema isolation are not built (planned for a later 3.x
+release). Proxy-side filtering is not a hard isolation boundary: use PostgreSQL
+row-level security for that.
 
 ### `auth-proxy` -- Authentication Proxy
 
 **Modules:** `src/auth/`
 
-Proxy-level authentication scaffolding: JWT validation, OAuth 2.0 token flows, and API-key validation, plus a role mapper that translates authentication identities to PostgreSQL roles.
+The daemon authenticates clients with `[auth] mode = "passthrough"` (the backend checks the password) or `"scram"` (against `auth_file`), plus an Authenticate plugin hook. The module also contains JWT validation, OAuth 2.0 token flows, API-key validation and a role mapper as a **library API**: they cannot be selected in `proxy.toml` in 3.0.0 (planned for a later 3.x release).
 
 > Note: the wired `proxy.toml` `[auth]` section currently exposes only `mode = "passthrough" | "scram"` plus `auth_file` (see `ProxyConfig` in `src/config.rs`). LDAP is a separate feature -- see `ldap-auth` below.
 
@@ -219,7 +232,7 @@ Proxy-level authentication scaffolding: JWT validation, OAuth 2.0 token flows, a
 
 **Implies:** `auth-proxy` · **Pulls:** `ldap3`
 
-Search + bind authentication against an LDAP directory. Kept as a distinct feature (rather than folded into `auth-proxy`) because it pulls the `ldap3` client and its rustls TLS stack. Off by default even when `auth-proxy` is enabled; excluded from `msrv-features`.
+Search + bind authentication against an LDAP directory, as a library API (not selectable in `proxy.toml` in 3.0.0). Kept as a distinct feature (rather than folded into `auth-proxy`) because it pulls the `ldap3` client and its rustls TLS stack. Off by default even when `auth-proxy` is enabled; excluded from `msrv-features`.
 
 ### `query-rewriting` -- Query Rewriting
 
@@ -238,10 +251,21 @@ Rule-based SQL transformation engine. Rules are evaluated in order and can:
 
 Sandboxed WebAssembly plugin runtime:
 
-- **Hooks:** query-start, query-complete, connection, and error events.
-- **Hot-reload:** Plugins can be updated without restarting the proxy.
-- **Sandbox:** Each plugin runs in an isolated WASM sandbox with configurable memory limits and an execution timeout.
-- **Host functions:** Plugins can call back into the proxy to read metrics, log messages, and modify query routing.
+- **Hooks the proxy calls:** `pre_query` (block, rewrite or answer from a plugin cache),
+  `route` (node, branch or block), `post_query` and `authenticate`, on simple queries
+  and on every `Parse` (and later `Bind`) of the extended protocol. A plugin declaring
+  any other hook, or missing a declared export, is refused at load.
+- **Distribution:** bare `.wasm` modules (with `.sig`, `.yaml` / `.json` sidecars) or
+  signed `.tar.gz` artefacts built with the `helios-plugin` CLI (`keygen`, `pack`,
+  `sign`, `inspect`, `verify`, `install`, `list`, `new`); `[plugins] trust_root` and
+  `require_signed_manifest` decide what loads.
+- **Hot reload:** the plugin directory is reconciled at startup, on SIGHUP, on
+  `POST /plugins/reload` and, with `hot_reload = true`, every `hot_reload_interval_ms`;
+  a new version replaces the running one only once it has loaded.
+- **Sandbox:** each call runs in an isolated store with `memory_limit_mb`, `timeout_ms`
+  and optional fuel metering.
+- **Host functions:** per-plugin KV (`kv_get` / `kv_set` / `kv_delete`) and
+  `sha256_hex`.
 
 The proxy and Wasmtime runtime build for the host target (for example,
 `x86_64-unknown-linux-gnu`). Installing `wasm32-unknown-unknown` is unnecessary
@@ -268,23 +292,21 @@ Excluded from `msrv-features` because `wasmtime` significantly slows the MSRV co
 
 **Modules:** `src/graphql/` (`src/graphql_gateway.rs`)
 
-GraphQL endpoint (separate HTTP listener):
-
-- **Schema introspection:** Reflects the database schema into a GraphQL schema.
-- **Query translation:** Converts GraphQL queries into SQL.
-- **Validation:** Validates GraphQL queries against the reflected schema before execution.
-
-Tables are exposed via `[[graphql_gateway.tables]]` in `proxy.toml`.
+GraphQL endpoint (separate HTTP listener) that converts GraphQL queries into SQL over
+the tables exposed via `[[graphql_gateway.tables]]` in `proxy.toml` (columns typed as
+text). Results are capped by `max_result_rows` / `max_result_bytes`. The library's schema
+introspector is not wired into the daemon: there is no schema introspection and no result
+cache (planned for a later 3.x release).
 
 ### `schema-routing` -- Schema-Aware Routing
 
 **Modules:** `src/schema_routing/`
 
-Routes queries based on table-level metadata:
-
-- **Data temperature:** Classify tables as hot, warm, or cold and route accordingly.
-- **Workload type:** OLTP tables to low-latency nodes, analytics tables to read replicas.
-- **Admin API:** Runtime management of schema routing rules.
+The daemon sends analytical reads to `[schema_routing] analytics_node` (a configured
+`[[nodes]]` entry), statement by statement on both protocols; an extended cycle goes
+there only when every statement of it is an analytical read. Table metadata discovery,
+data temperature and workload classes are library features the daemon does not populate,
+and there is no admin API for schema routing rules.
 
 ### `distribcache` -- Distributed Cache (library module)
 

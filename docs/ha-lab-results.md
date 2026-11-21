@@ -15,7 +15,7 @@ is not in recovery, with no config edit and no restart.
 
 Binary sha256 `605d3ac6…1cfc08` (`--features all-features,postgres-topology`, release).
 Host gpc001ca, every container on the host network, 127.0.0.1 ports 35701-35792. Evidence:
-`/home/gpc/HDB/sprint/baselines/proxy/stack-20261012/lab-main-*`.
+`sprint/baselines/proxy/stack-20261012/lab-main-*`.
 
 ### promote-under-load: PASS
 
@@ -81,7 +81,7 @@ correct. The drill now uses a second table (11ffcad).
 
 The local branch stack: routing snapshot, P-03, H-02, C-02 slice 2, H-06, H-05, TR-08,
 TR-09, L2 shed pacing and the dependency bump. Binary `tip3`, same build features.
-Evidence: `/home/gpc/HDB/sprint/baselines/proxy/stack-20261012/window-M/lab-tip2-*`.
+Evidence: `sprint/baselines/proxy/stack-20261012/window-M/lab-tip2-*`.
 
 | scenario | result | committed / attempted | not_sent | unknown | lost / phantom | write gap |
 |---|---|---|---|---|---|---|
@@ -99,7 +99,7 @@ full invalidations.
 ## 2026-10-14, reconnect wave (H-05), main 24416af + reconnect limit
 
 Binary `wave2` (sha256 in the evidence), same build features, lab ports 27701-27792.
-Evidence: `/home/gpc/HDB/sprint/baselines/proxy/wave-20261014/lab-reconnect-wave` and
+Evidence: `sprint/baselines/proxy/wave-20261014/lab-reconnect-wave` and
 `lab-wave-control`.
 
 `proxy-a` runs `proxy-wave.toml`. Two tenants drive it through pgbench, named by
@@ -123,7 +123,7 @@ rather than the ring filling.
 ## 2026-10-14, reconnect wave at the default limit (16), main 0c73797
 
 Binary `rdef2` (sha256 in the evidence), same drill. Evidence:
-`/home/gpc/HDB/sprint/baselines/proxy/rdef2-20261014/lab-reconnect-wave` and
+`sprint/baselines/proxy/rdef2-20261014/lab-reconnect-wave` and
 `lab-wave-default`. `max_concurrent_reconnects_per_node` now defaults to 16. The drill
 reads the new `heliosdb_proxy_backend_reconnects_peak` gauge, the most connections
 opened at once to one node, instead of sampling the in-progress gauge every 250 ms:
@@ -142,7 +142,7 @@ slower recovery.
 `POST /api/chaos force_unhealthy` and `POST /nodes/{addr}/disable` now reach routing (before
 this fix they only changed the admin API's display copy). Binary sha256 `bf8cf1ac…9f539b`
 (`--features all-features,postgres-topology`, release). Evidence:
-`/home/gpc/HDB/sprint/baselines/proxy/b251750f1d54-20261020/ha-lab-*`.
+`sprint/baselines/proxy/b251750f1d54-20261020/ha-lab-*`.
 
 | scenario | result | committed / attempted | not_sent | unknown | lost / phantom | write gap |
 |---|---|---|---|---|---|---|
@@ -170,7 +170,7 @@ the override (`restored: ["127.0.0.1:27701"]`) and pg-a was stopped (fenced) at 
 
 Binary labverbs-heliosdb-proxy (sha256 `d9269655…9248a8`, `--features all-features,postgres-topology`,
 release), main c85b0bf plus the reloadable client TLS acceptor. Evidence:
-`/home/gpc/HDB/sprint/baselines/proxy/lab-verbs-20261022/ha-lab-*`.
+`sprint/baselines/proxy/lab-verbs-20261022/ha-lab-*`.
 
 | scenario | result | committed / attempted | not_sent | unknown | lost / phantom | proxy-a write gap |
 |---|---|---|---|---|---|---|
@@ -200,7 +200,7 @@ built once at startup, so a rotation needed the `SIGUSR2` drain and a restart.
 
 ### Patroni demo, same day (`examples/patroni-failover`, three-member etcd)
 
-Evidence: `/home/gpc/HDB/sprint/baselines/proxy/lab-verbs-20261022/patroni-*.log`.
+Evidence: `sprint/baselines/proxy/lab-verbs-20261022/patroni-*.log`.
 
 **`dcs` (DCS member loss): PASS.** Under three writers (one fresh session per `INSERT`) and
 a `/topology` sampler: `etcd1` stopped, 20 s later `etcd2` (quorum lost), 38 s later both
@@ -231,7 +231,7 @@ is missing on the leader. 566 writes in all, 0 errors, 0 unknown.
 
 Binary `heliosdb-proxy-tenant-a6344f4-topo` (sha256 `4af41997…ddb43`, `--features
 all-features,postgres-topology`, release). Evidence:
-`/home/gpc/HDB/sprint/baselines/proxy/ac858d61400b-20261023/live/lab-reconnect-wave-2`
+`sprint/baselines/proxy/ac858d61400b-20261023/live/lab-reconnect-wave-2`
 (candidate config) and `lab-reconnect-wave-control` (main's `proxy-wave.toml` through
 `LAB_WAVE_CONFIG`, no heavy tenant). A third tenant, `heavy`, runs 6 clients of
 transactions with four 64 KiB statements against its active-query cap (2, 10 s wait) and

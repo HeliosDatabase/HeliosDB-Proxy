@@ -7,10 +7,30 @@ This guide covers installing and running HeliosProxy as a standalone binary on a
 ## Prerequisites
 
 - Linux (x86_64 or aarch64), macOS, or Windows
-- Rust 1.82+ (for building from source)
+- Rust 1.86+ (for building from source; not needed for the prebuilt binaries)
 - One or more PostgreSQL-compatible backends
 
 ---
+
+## Prebuilt Binaries and crates.io
+
+Each [GitHub release](https://github.com/HeliosDatabase/HeliosDB-Proxy/releases) carries
+`heliosdb-proxy-{linux,macos}-{x86_64,aarch64}.tar.gz` with a `.sha256` file, built with
+`all-features,postgres-topology`:
+
+```bash
+curl -LO https://github.com/HeliosDatabase/HeliosDB-Proxy/releases/download/v3.0.0/heliosdb-proxy-linux-x86_64.tar.gz
+curl -LO https://github.com/HeliosDatabase/HeliosDB-Proxy/releases/download/v3.0.0/heliosdb-proxy-linux-x86_64.tar.gz.sha256
+sha256sum -c heliosdb-proxy-linux-x86_64.tar.gz.sha256
+tar xzf heliosdb-proxy-linux-x86_64.tar.gz
+sudo install -m 0755 heliosdb-proxy-linux-x86_64 /usr/local/bin/heliosdb-proxy
+```
+
+Or from crates.io (this also installs the `helios-plugin` CLI):
+
+```bash
+cargo install heliosdb-proxy --version 3.0.0 --locked --features "all-features,postgres-topology"
+```
 
 ## Building from Source
 
@@ -18,7 +38,7 @@ This guide covers installing and running HeliosProxy as a standalone binary on a
 
 ```bash
 git clone https://github.com/HeliosDatabase/HeliosDB-Proxy.git
-cd heliosdb-proxy
+cd HeliosDB-Proxy
 cargo build --release
 ```
 
@@ -27,8 +47,10 @@ The binary is written to `target/release/heliosdb-proxy`.
 ### Production Build (All Features + PostgreSQL Topology)
 
 ```bash
-cargo build --release --features "all-features,postgres-topology,observability"
+cargo build --release --features "all-features,postgres-topology"
 ```
+
+(`observability` is a reserved no-op; adding it changes nothing.)
 
 ### Lightweight HA Build
 
@@ -201,7 +223,9 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 TimeoutStartSec=30
-TimeoutStopSec=30
+# SIGTERM (systemd's default stop signal) drains for up to
+# shutdown_drain_timeout_secs (default 60): keep this longer than that.
+TimeoutStopSec=75
 
 # Security hardening
 NoNewPrivileges=yes
@@ -300,7 +324,7 @@ To upgrade HeliosProxy to a new version:
 
 ```bash
 # 1. Build the new version
-cd heliosdb-proxy
+cd HeliosDB-Proxy
 git pull
 cargo build --release --features "all-features,postgres-topology"
 
@@ -318,7 +342,14 @@ curl http://localhost:9090/version
 curl http://localhost:9090/health/ready
 ```
 
-Active client connections will be terminated during the restart. For zero-downtime upgrades, deploy multiple proxy instances behind a TCP load balancer and perform rolling restarts.
+`systemctl stop` sends SIGTERM: the proxy stops accepting, `/health/ready` answers 503,
+and each session is ended with FATAL `57P01` once nothing of it is in flight (idle
+sessions at once), so clients reconnect without losing a statement; the drain lasts at
+most `shutdown_drain_timeout_secs`. Clients cannot connect between stop and start. For a
+zero-downtime upgrade, start the new binary on the same addresses first and send
+`SIGUSR2` to the old process, which drains the same way while the new one accepts (see
+[Signals](../configuration.md#signals)); or run several instances behind a TCP load
+balancer and restart them one at a time.
 
 ---
 

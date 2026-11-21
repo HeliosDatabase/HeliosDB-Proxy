@@ -416,18 +416,28 @@ impl GatewayPolicy {
         Ok(())
     }
 
-    /// Fast-fail while `node`'s circuit is open.
-    pub fn check_node(&self, node: &str) -> Result<(), PolicyDenied> {
+    /// Admit a request to `node` through its circuit breaker: fast-fail
+    /// while the circuit is open (or every half-open probe slot is taken).
+    /// Once the circuit's cooldown has passed it turns half-open and the
+    /// request may be one of its probes: hold the returned admission for the
+    /// length of the request, and record its outcome with [`Self::record`].
+    pub fn check_node(&self, node: &str) -> Result<NodeAdmission, PolicyDenied> {
         #[cfg(feature = "circuit-breaker")]
         if let Some(cb) = &self.circuit {
-            if cb.get_breaker(node).get_state() == crate::circuit_breaker::CircuitState::Open {
-                return Err(PolicyDenied::CircuitOpen {
-                    node: node.to_string(),
-                });
-            }
+            return match cb.get_breaker(node).admit() {
+                crate::circuit_breaker::Admission::Allowed => Ok(NodeAdmission::default()),
+                crate::circuit_breaker::Admission::Probe(permit) => Ok(NodeAdmission {
+                    _probe: Some(permit),
+                }),
+                crate::circuit_breaker::Admission::Rejected { .. } => {
+                    Err(PolicyDenied::CircuitOpen {
+                        node: node.to_string(),
+                    })
+                }
+            };
         }
         let _ = node;
-        Ok(())
+        Ok(NodeAdmission::default())
     }
 
     /// Apply `[query_rewrite]` to a statement.
@@ -458,6 +468,16 @@ impl GatewayPolicy {
         }
         let _ = (node, reached, err);
     }
+}
+
+/// A gateway request's admission through a node's circuit breaker
+/// ([`GatewayPolicy::check_node`]): while the circuit is half-open it holds
+/// one of the probe slots, freed when the admission is dropped.
+#[derive(Debug, Default)]
+#[must_use = "hold the admission for the length of the request"]
+pub struct NodeAdmission {
+    #[cfg(feature = "circuit-breaker")]
+    _probe: Option<crate::circuit_breaker::ProbePermit>,
 }
 
 impl std::fmt::Debug for GatewayPolicy {
@@ -586,7 +606,7 @@ mod tests {
             database: None,
         };
         assert_eq!(p.admit_request(who).await, Ok(()));
-        assert_eq!(p.check_node("n:5432"), Ok(()));
+        assert!(p.check_node("n:5432").is_ok());
         assert!(matches!(p.rewrite("SELECT 1"), Cow::Borrowed("SELECT 1")));
         p.record("n:5432", false, "x");
     }
@@ -609,7 +629,36 @@ mod tests {
         let denied = p.check_node("db:5432").unwrap_err();
         assert_eq!(denied.http_status(), 503);
         assert!(denied.to_string().contains("circuit open for node db:5432"));
-        assert_eq!(p.check_node("other:5432"), Ok(()));
+        assert!(p.check_node("other:5432").is_ok());
+    }
+
+    /// A gateway's circuit recovers: after the cooldown a request is admitted
+    /// as a probe, and a success closes the circuit again.
+    #[cfg(feature = "circuit-breaker")]
+    #[test]
+    fn a_gateway_circuit_half_opens_and_closes_after_its_cooldown() {
+        let cb = Arc::new(crate::circuit_breaker::CircuitBreakerManager::new(
+            crate::circuit_breaker::ManagerConfig::new(
+                crate::circuit_breaker::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    cooldown: std::time::Duration::from_millis(30),
+                    half_open_success_threshold: 1,
+                    ..Default::default()
+                },
+            ),
+        ));
+        let p = GatewayPolicy::default().with_circuit_breaker(cb.clone());
+        p.record("db:5432", false, "connection refused");
+        assert!(p.check_node("db:5432").is_err());
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let probe = p.check_node("db:5432").expect("a probe after the cooldown");
+        p.record("db:5432", true, "");
+        drop(probe);
+        assert_eq!(
+            cb.get_breaker("db:5432").get_state(),
+            crate::circuit_breaker::CircuitState::Closed
+        );
+        assert!(p.check_node("db:5432").is_ok());
     }
 
     #[cfg(feature = "rate-limiting")]

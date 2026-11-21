@@ -39,7 +39,7 @@ fn admin_cfg(cfg: &BranchConfig) -> BackendConfig {
 /// A database identifier must be a simple `[A-Za-z_][A-Za-z0-9_]*` name. We
 /// validate (rather than escape) because `CREATE DATABASE` cannot be
 /// parameterised, so a strict allowlist is the safe path.
-fn valid_ident(name: &str) -> bool {
+pub(crate) fn valid_ident(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 63
         && name

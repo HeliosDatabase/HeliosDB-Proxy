@@ -63,7 +63,7 @@ curl -s http://127.0.0.1:9090/nodes     # backend health as the proxy sees it
 docker rm -f hp-demo-pg
 ```
 
-Add standbys with repeated `--standby host:port`, or use a config file (smallest valid file: [config/proxy.minimal.toml](config/proxy.minimal.toml); fuller examples under [Quick Start: config file](#connect-to-a-postgresql-cluster) below). A plain `cargo install` builds the default feature set (pooling and Transaction Replay); the `postgres` / `patroni` topology providers need `--features postgres-topology` (the prebuilt release binaries are built with `all-features` only and do not include them), and cache, auth, and plugins have their own flags (see [Feature Flags](#feature-flags)).
+Add standbys with repeated `--standby host:port`, or use a config file (smallest valid file: [config/proxy.minimal.toml](config/proxy.minimal.toml); fuller examples under [Quick Start: config file](#connect-to-a-postgresql-cluster) below). A plain `cargo install` builds the default feature set (pooling and Transaction Replay); the `postgres` / `patroni` topology providers need `--features postgres-topology` (the prebuilt release binaries and the Docker image are built with `all-features,postgres-topology` and include them), and cache, auth, and plugins have their own flags (see [Feature Flags](#feature-flags)).
 
 If HeliosProxy saves you a PgBouncer plus an HAProxy, a ⭐ helps others find it.
 
@@ -106,7 +106,7 @@ Sources: [1] [PgBouncer features](https://www.pgbouncer.org/features.html) · [2
 
 ## Status & guarantees
 
-**Verification status (2026-10-30, 2.2.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
+**Verification status (2026-11-18, 3.0.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
 found reproducible Transaction Replay safety defects; all of them are fixed as of
 1.7.0, verified against live PostgreSQL, and replay now checks its own work — a
 replayed statement whose results diverge from what the client already saw is rolled
@@ -117,9 +117,18 @@ offloads reads to standbys, tracks session settings across both wire protocols s
 offloaded reads and failover re-homes carry them (or refuse with `08006`), and bounds the
 Patroni authority lease by Patroni's own. 2.2.0 caps tenants' concurrent requests and
 replay bytes, adds an opt-in semantic cache tier, table exclusions and per-table TTLs, and
-keys the caches so that statements returning different rows never share an entry. The query
-cache stays opt-in: its identity does not yet include session state (`SET ROLE`,
-`search_path`, tenant settings), see docs/configuration.md. The audit also records
+keys the caches so that statements returning different rows never share an entry. 3.0.0
+runs plugin hooks, rewrite rules and the tenant filter on the extended protocol, drains on
+SIGTERM and SIGINT, loads signed plugin artefacts with hot reload, routes sessions to branch
+databases, and caches extended-protocol reads; it changes some defaults and the library API
+(see the [3.0.0 release notes](docs/releases/3.0.0.md)). The query cache stays opt-in and
+conservative: entries are keyed by every startup parameter and by the backend's effective
+settings (`SHOW ALL`, proved per connection for `[cache] proof_ttl_ms`), a session that
+writes or runs `SET`, `SET ROLE` or another statement that may change its execution context
+stops using the cache, and without `[cache] trust_backend_read_effects = true` only literal
+scalar `SELECT`s are cached. Dependencies hidden in views, functions and row-level security
+policies are not resolved to base tables (declare them with the `cache_tables` hint); see
+[docs/configuration.md](docs/configuration.md#query-cache-cache). The audit also records
 advertised library capabilities that are not wired into the daemon. Consult it and the
 [prioritized improvement backlog](docs/internal/audit-2026-09/IMPROVEMENTS.md) when
 evaluating HA, replay, or distributed deployment guarantees.
@@ -127,9 +136,9 @@ evaluating HA, replay, or distributed deployment guarantees.
 Plainly:
 
 - **Database promotion and fencing require an external HA manager.** The daemon tracks the primary; `[ha] auto_failover` is rejected at startup. The opt-in `[auto_promote]` section (off by default) can promote a standby from a single proxy, but it is not a quorum: it does not stop a second proxy or operator from also promoting, so it is no substitute for Patroni ([docs/configuration.md](docs/configuration.md)).
-- **Transaction Replay is bounded.** Unknown `COMMIT` outcomes, snapshot-pinned (`SERIALIZABLE` / `REPEATABLE READ`) transactions, and diverging replays are never silently continued. Cursors, temp tables and `PREPARE`d state are not migrated. Details: [docs/transaction-replay.md](docs/transaction-replay.md).
+- **Transaction Replay is bounded.** Unknown `COMMIT` outcomes, snapshot-pinned (`SERIALIZABLE` / `REPEATABLE READ`) transactions, and diverging replays are never silently continued. Cursors, temp tables, `PREPARE`d statements, `LISTEN` and advisory locks are not migrated: a session holding them is ended with `08006` at a failover rather than continued without them. Details: [docs/transaction-replay.md](docs/transaction-replay.md).
 - **No zero-RPO claim.** A healthy tracked primary says nothing about asynchronous replica lag; use synchronous replication if you need that.
-- **Some modules are library-only** (for example Session Migration, Cursor Restore, Failover Controller primitives, `distribcache`); the module tables below mark which.
+- **Some modules are library-only** (for example Session Migration, Cursor Restore, Failover Controller primitives, `distribcache`, the JWT/OAuth/API-key/LDAP auth modules); the module tables below mark which. The [3.0.0 release notes](docs/releases/3.0.0.md#not-in-300-planned) list what is planned for later 3.x releases and what is longer term.
 
 ---
 
@@ -141,15 +150,31 @@ The feature modules operate at the PostgreSQL wire protocol level. They inspect,
 
 ### Supported Backends
 
-| Backend | Status | Notes |
-|---------|--------|-------|
-| **PostgreSQL** 12+ | Fully supported | Including Aurora, RDS, Cloud SQL |
-| **HeliosDB-Lite** | Fully supported | Native topology integration available |
-| **HeliosDB-Full** | Fully supported | Cluster-aware routing |
-| **CockroachDB** | Compatible | PostgreSQL wire protocol |
-| **YugabyteDB** | Compatible | PostgreSQL wire protocol |
-| **TimescaleDB** | Compatible | PostgreSQL extension |
-| **Citus** | Compatible | PostgreSQL extension |
+What each release is tested against, and what is only expected to work. "Tested" means
+the integration suite runs it through a live proxy against that backend on every pull
+request (`.github/workflows/ci.yml`).
+
+| | **PostgreSQL 18** | **HeliosDB-Nano 4.42.1** | Other PostgreSQL-wire backends |
+|---|---|---|---|
+| CI job | Blocking, primary + standby | Non-blocking, primary + standby | None |
+| Authentication, simple and extended protocol | Tested | Tested | Not tested |
+| Read/write split and standby routing | Tested | Tested | Not tested |
+| Routing hints (`/* route=primary */`) | Tested | Tested (Nano 4.42.0 or newer) | Not tested |
+| Lag-aware routing | Tested | Tested | Not tested |
+| Query cache with commit-aware invalidation | Tested | Tested (Nano 4.42.1 or newer) | Not tested |
+| Transaction journal | Tested | Tested | Not tested |
+| Committed-history replay (`/api/replay`) | Tested | Not tested: Nano does not describe array parameters | Not tested |
+| Session restore on another connection | Tested | Not available: needs SQL `PREPARE`/`EXECUTE` and `RESET ALL` as PostgreSQL answers them | Not tested |
+| Admin UI and REST | Tested | Tested | Not tested |
+
+- **PostgreSQL** 12 and newer, including Aurora, RDS and Cloud SQL, is the reference
+  backend. CI runs PostgreSQL 18 only; older majors and the managed services are expected
+  to work and are not run in CI.
+- **HeliosDB-Nano** before 4.42.1 works as a backend with the query cache bypassed: the
+  cache is used only when the backend answers `SHOW ALL` in PostgreSQL's form.
+- **CockroachDB, YugabyteDB, TimescaleDB, Citus** speak the PostgreSQL wire protocol and
+  are expected to work for pooling and routing. This project does not test them, and the
+  query cache stays bypassed on any backend whose `SHOW ALL` differs from PostgreSQL's.
 
 ---
 
@@ -163,11 +188,11 @@ The four core jobs above are the product; everything below is optional. HeliosPr
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Connection Pooling** | `pool-modes` | Session, Transaction, and Statement pooling with automatic lease management, prepared statement forwarding, and configurable reset sequences. `[pool_mode].skip_clean_reset` opts into conditional connection reset (the G2c throughput win in the benchmarks below) |
+| **Connection Pooling** | `pool-modes` | Session, Transaction, and Statement pooling with automatic lease management, prepared statement forwarding, and configurable reset sequences. Statement mode refuses a lone `BEGIN` (`0A000`) and ends a session that leaves a transaction block open, as PgBouncer's statement mode does. `[pool_mode].skip_clean_reset` opts into conditional connection reset (the G2c throughput win in the benchmarks below) |
 | **Load Balancer** | *(core)* | Round-robin, least-connections, and latency-based routing with automatic read/write splitting across primary and standby nodes |
 | **Health Checker** | *(core)* | Continuous node health monitoring with configurable check intervals, failure thresholds, and custom health-check queries |
-| **Pipeline** | *(core)* | PostgreSQL extended query protocol pipelining — batches Parse/Bind/Execute messages for reduced round trips |
-| **Batch Operations** | *(core)* | Automatic INSERT coalescing — groups individual INSERT statements into multi-row batches for higher throughput |
+| **Pipeline** | *(core)* | Extended-protocol messages are relayed per cycle: everything a client sends up to its `Sync`, `Flush`-chained pipelines included, goes to the backend as one write. Several `Sync`-terminated cycles in flight on one backend connection at once are not overlapped. `src/pipeline.rs` is a library batching module the relay does not use |
+| **Batch Operations** | *(library API)* | INSERT coalescing primitives (`src/batch.rs`) that group single-row INSERTs into multi-row batches; the daemon does not coalesce client INSERTs |
 
 ### High Availability
 
@@ -175,39 +200,41 @@ The four core jobs above are the product; everything below is optional. HeliosPr
 |--------|-------------|-------------|
 | **Failover Controller** | *(library API)* | Candidate ranking and promotion primitives for external orchestration; the daemon tracks an externally promoted primary |
 | **Transaction Replay (TR)** | *(default build)* | `tr_mode` keeps client sessions alive across a backend failure: `session` re-homes the connection to the new primary and restores `SET` state, `select` transparently re-runs interrupted reads, and opt-in `transaction` replays the uncommitted transaction on the new primary and continues. A `COMMIT` with unknown outcome is never retried (client gets SQLSTATE 08007), a replay whose results diverge from what the client already saw is rolled back (40001), and a transaction pinned to a `SERIALIZABLE`/`REPEATABLE READ` snapshot is never replayed. Failing over onto password-protected backends requires the proxy to be the auth boundary (`[auth] mode = "scram"`). `tr_enabled = false` turns TR off (journaling, in-session recovery, `/api/replay`) |
-| **Session Migration** | *(default build; library)* | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes — not wired into the recovery path |
-| **Cursor Restore** | *(default build; library)* | Preserves open cursor positions across failover — not wired into the recovery path |
-| **Switchover Buffer** | *(core)* | Buffers incoming queries during planned switchover, drains them to the new primary once promotion completes |
-| **Primary Tracker** | *(core)* | Pluggable topology discovery — tracks the current primary via `pg_is_in_recovery()` polling (PostgreSQL), HeliosDB topology events, or manual API calls |
+| **Session Migration** | *(default build; library)* | Captures a session's parameters, prepared statements and empty temporary tables and restores them on a connection the caller supplies (refusing to drop temp-table rows); advisory locks are not restored — not wired into the recovery path |
+| **Cursor Restore** | *(default build; library)* | Tracks open cursors and their positions, and recreates one at its saved row on a connection the caller supplies (`DECLARE` + `MOVE`) — not wired into the recovery path |
+| **Switchover Buffer** | *(library API)* | Buffering primitives for planned switchover (`src/switchover_buffer.rs`); the daemon does not hold client queries during a switchover, it re-homes sessions through Transaction Replay |
+| **Graceful shutdown** | *(core)* | SIGTERM / SIGINT close the listeners, flip `/health/ready` to 503 and end each session with FATAL `57P01` once nothing of it is in flight, bounded by `shutdown_drain_timeout_secs` (default 60); SIGUSR2 runs the same drain for a zero-downtime binary handoff |
+| **Primary Tracker** | *(core)* | Pluggable topology discovery — the daemon tracks the current primary via `pg_is_in_recovery()` polling or Patroni's REST API (`postgres-topology`); HeliosDB topology events and manual updates are library APIs |
 | **Transaction Journal** | *(default build)* | Write-ahead journal for in-flight transactions with statement-level granularity, parameter capture, and configurable retention |
 
 ### Query Intelligence
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Query Cache** | `query-cache` | Result cache (L1 hot / L2 warm / opt-in L3 semantic: `[cache] semantic_enabled` + `/*helios:cache=semantic*/`) with TTL-based expiration (per table too), commit-aware table-generation invalidation, table exclusions, and normalized query fingerprinting. (`distribcache` is a separate, experimental in-tree library module for distributed cache tiers — it is not wired into this proxy cache path; see the feature-flags table) |
-| **Query Routing** | `routing-hints` | Hint-based routing via SQL comments (`/*helios:route=primary*/`) and automatic classification of read vs. write queries |
+| **Query Cache** | `query-cache` | Result cache (L1 hot / L2 warm / opt-in L3 semantic: `[cache] semantic_enabled` + `/*helios:cache=semantic*/`) for simple and extended-protocol reads, with TTL-based expiration (per table too), commit-aware table-generation invalidation, a per-connection backend settings proof (`proof_ttl_ms`), table exclusions, tier sizes and optional L2 lz4/zstd compression, opt-in refresh-ahead and a per-table heatmap (`/api/cache/heatmap`). Caching reads other than literal scalars needs `[cache] trust_backend_read_effects = true` (see [Status & guarantees](#status--guarantees)). (`distribcache` is a separate, experimental in-tree library module for distributed cache tiers — it is not wired into this proxy cache path; see the feature-flags table) |
+| **Query Routing** | `routing-hints` | Hint-based routing via SQL comments (`/*helios:route=primary*/`, `node=` naming a configured node) and automatic classification of read vs. write queries |
+| **Branch Routing** | *(config-gated, `[branch] route_enabled`)* | A `/*helios:branch=<name>*/` hint or a route plugin's `branch` answer moves the session to a branch database (PostgreSQL database, or `<db>@<branch>` on HeliosDB-Nano) at a request boundary |
 | **Lag-Aware Routing** | `lag-routing` | Routes reads to replicas within an acceptable replication lag threshold, with read-your-writes (RYW) session consistency guarantees |
 | **Query Rewriter** | `query-rewriting` | Rule-based SQL transformation engine — rewrite, redirect, or annotate queries before they reach the backend |
-| **Query Analytics** | `query-analytics` | Real-time query fingerprinting, execution statistics, slow query log, N+1 detection, and intent classification |
-| **Schema Routing** | `schema-routing` | Routes queries based on table schema metadata, data temperature classification, and workload type (OLTP vs. analytics vs. vector) |
+| **Query Analytics** | `query-analytics` | Real-time query fingerprinting and execution statistics (`/analytics`, `/api/analytics`); the library's N+1, intent and slow-query results are not exposed by the daemon |
+| **Schema Routing** | `schema-routing` | Sends analytical reads to `[schema_routing] analytics_node`, statement by statement on both protocols. Table metadata, data temperature and the `vector` workload class are library features the daemon does not populate |
 
 ### Security & Access Control
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Auth Proxy** | `auth-proxy` | Authentication gateway supporting JWT, OAuth 2.0, API keys, LDAP, and certificate-based authentication with pluggable role mapping |
-| **Rate Limiter** | `rate-limiting` | Token bucket and sliding window rate limiting with per-user, per-tenant, and per-IP policies, query cost estimation, and concurrency guards |
-| **Circuit Breaker** | `circuit-breaker` | Adaptive circuit breaker with sliding-window failure detection, automatic recovery probes, and per-node breaker state |
+| **Auth Proxy** | `auth-proxy` | The daemon authenticates clients by passthrough to the backend or by SCRAM against `[auth] auth_file`, plus an Authenticate plugin hook. The JWT, OAuth 2.0, API-key and LDAP modules in `src/auth/` are a library API not selectable from `proxy.toml` |
+| **Rate Limiter** | `rate-limiting` | Token bucket per user, database, client address or globally (`key_by`), enforced at the configured `default_qps`, with an opt-in sliding window (`window_max_requests`, `window_secs`) and a per-bucket in-flight cap (`max_concurrent`, `53400`); every request costs 1 (no tenant or cost keys) |
+| **Circuit Breaker** | `circuit-breaker` | Per-node circuit breaker with sliding-window failure detection and half-open recovery probes after `open_secs` (the adaptive threshold is a library option the daemon does not set) |
 
 ### Multi-Tenancy & Extensibility
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Multi-Tenancy** | `multi-tenancy` | Tenant-aware connection routing with per-tenant pools, schema isolation, resource quotas, and automatic tenant identification from connection metadata |
-| **WASM Plugins** | `wasm-plugins` | Sandboxed WebAssembly plugin runtime with hot-reload, host function bindings, and per-plugin resource limits |
-| **GraphQL Gateway** | `graphql-gateway` | GraphQL-to-SQL translation layer with automatic schema introspection, DataLoader batching, and query validation |
-| **MCP Agent Gateway** | *(config-gated, `[mcp]`)* | JSON-RPC 2.0 over HTTP for AI agents — `query`, `list_tables`, `explain` tools. Optional bearer-token auth via `[mcp].auth_token` |
+| **Multi-Tenancy** | `multi-tenancy` | Tenant identification from startup parameters, row-level isolation (tenant filter on every statement, both protocols), per-tenant client, active-query, replay and journal budgets. Per-tenant pools and schema or database isolation are not built |
+| **WASM Plugins** | `wasm-plugins` | Sandboxed WebAssembly plugin runtime: pre-query, route, post-query and authenticate hooks on both wire protocols, hot reload of the plugin directory (`hot_reload`, SIGHUP, `POST /plugins/reload`), signed `.tar.gz` artefacts, and per-call memory, time and fuel limits |
+| **GraphQL Gateway** | `graphql-gateway` | GraphQL-to-SQL over the tables listed in `[[graphql_gateway.tables]]` (columns typed as text); no schema introspection or result cache |
+| **MCP Agent Gateway** | *(config-gated, `[mcp]`)* | JSON-RPC 2.0 over HTTP for AI agents — `query`, `list_tables`, `explain` tools, with result caps. Per-agent principals (`[[mcp.principals]]`, or the shared `[mcp].auth_token`), an opt-in per-principal tool-result cache (`tool_cache_*`, `/api/mcp/cache`) and opt-in PostgreSQL-backed agent memory tools (`memory_put`/`get`/`list`/`search`/`delete`) |
 
 ## Platform Tier
 
@@ -234,17 +261,17 @@ A two-region edge cache in front of a **HeliosDB-Nano** origin: reads are answer
 |--------|-------------|-------------|
 | **Plugin Host KV** | `wasm-plugins` | `env.kv_get` / `kv_set` / `kv_delete` host imports with per-plugin namespaced state that persists across hook invocations |
 | **Plugin Host Crypto** | `wasm-plugins` | `env.sha256_hex` host import backed by the audited `sha2` crate — plugins compute real SHA-256 without embedding the algorithm |
-| **Plugin Signatures** | `wasm-plugins` | Optional Ed25519 trust root: every loaded `.wasm` requires a verifying `.sig` sidecar. Interoperates with `openssl` / `signify` |
-| **OCI Plugin Artefacts** | `wasm-plugins` | `.tar.gz` distribution format (`manifest.json` + `plugin.wasm` + optional `plugin.sig`); the loader validates the wasm SHA-256 against the manifest |
+| **Plugin Signatures** | `wasm-plugins` | Optional Ed25519 trust root: every loaded plugin requires a verifying signature (`.sig` sidecar or the artefact's `plugin.sig`); an artefact's `manifest.sig` binds its name, version and hooks (`require_signed_manifest`). Keys interoperate with `openssl` |
+| **OCI Plugin Artefacts** | `wasm-plugins` | `.tar.gz` distribution format (`manifest.json` + `plugin.wasm` + optional `plugin.sig` / `manifest.sig`), loaded from `plugin_dir`; the loader validates the wasm SHA-256 against the manifest and refuses unknown entries, oversized content and plugins that could never run |
 | **Plugin Route-Block** | `wasm-plugins` | `RouteResult::Block { reason }` ABI variant — a plugin can hard-reject a query, synthesising a PostgreSQL `ErrorResponse` + `ReadyForQuery` |
-| **Plugin Trust Root Config** | `wasm-plugins` | `[plugins].trust_root` in `proxy.toml` auto-attaches the signature verifier; permissive when unset for dev-loop ergonomics |
+| **Plugin Trust Root Config** | `wasm-plugins` | `[plugins].trust_root` in `proxy.toml` (a directory of `*.pub` keys, one key file, or a hex key) attaches the signature verifier; when unset, signatures are not checked and startup warns |
 
 ### Admin Surface
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
 | **Admin Web UI** | *(core)* | Single embedded HTML dashboard at `/` and `/ui`. Ten auto-refreshing panels: Nodes, Topology, Plugins, Anomalies, Edge Mode, Chaos Mode, Shadow Execution, Time-Travel Replay, SQL Console, and Traffic |
-| **Admin REST** | *(core)* | Endpoints surfacing platform capabilities: `/topology`, `/plugins`, `/admin/kv/*` (plugin runtime KV), `/anomalies`, `/api/edge*`, `/api/chaos`, `/api/shadow`, `/api/replay`. Operator and UI consume the same JSON |
+| **Admin REST** | *(core)* | Endpoints surfacing platform capabilities: `/topology`, `/plugins` (+`/plugins/files`, `POST /plugins/reload`), `/admin/kv/*` (plugin runtime KV), `/anomalies`, `/api/edge*`, `/api/chaos`, `/api/shadow`, `/api/replay`, `/api/stats` (one versioned document for pollers). Operator and UI consume the same JSON |
 
 ### First-Party Plugins
 
@@ -265,7 +292,7 @@ Eight signed WASM plugins (shipped in the companion `HDB-HeliosDB-Proxy-Plugins`
 
 | Module | Description |
 |--------|-------------|
-| **`helios-plugin` CLI** | Pack, inspect, and verify WASM plugin artefacts as portable `.tar.gz` using the same Ed25519 trust-root format as the proxy loader |
+| **`helios-plugin` CLI** | Ships with this crate (`cargo install heliosdb-proxy` installs it): `keygen`, `pack`, `sign`, `inspect`, `verify`, `install`, `list`, `new` — Ed25519 keys, signed `.tar.gz` artefacts in the proxy loader's trust-root format, and a plugin scaffold that builds and loads |
 | **Kubernetes Operator** | CRDs for `HeliosProxy`, `PoolProfile`, `RoutingRule`, `AuditPolicy`, `TenantQuota`; reconciler renders ConfigMap + Deployment + Service and polls `/topology` for status. Available on request from [sales@heliosdb.com](mailto:sales@heliosdb.com); to deploy on Kubernetes without it, see the [Kubernetes deployment guide](https://heliosdb.com/docs/proxy/deployment/kubernetes/) |
 | **Terraform Provider** | Five resources mirroring the operator CRDs (`heliosproxy_instance`, `_pool_profile`, `_routing_rule`, `_audit_policy`, `_tenant_quota`) |
 | **Pulumi Provider** | Wraps the Terraform provider via `pulumi-terraform-bridge` — same five resources in TypeScript / Python / Go / .NET |
@@ -283,7 +310,7 @@ together across the same family.
 - **[HeliosDatabase/HeliosDB-Nano](https://github.com/HeliosDatabase/HeliosDB-Nano)** — Single-binary embedded database with PostgreSQL/MySQL wire compatibility, HNSW vector search, branching, time-travel, and MCP endpoint support. Apache 2.0.
 - **[HeliosDB Lite](https://www.heliosdb.com/lite.html)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0; source is not publicly released.
 - **[HeliosDB Full](https://www.heliosdb.com/full.html)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0; source is not publicly released.
-- **[HeliosDatabase/HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer drop-in + WASM plugins + zero-downtime PG-12->17 upgrade). Apache 2.0.
+- **[HeliosDatabase/HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer-style pooling + read/write routing + Transaction Replay + WASM plugins). Apache 2.0.
 - **[HeliosDatabase/HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** — Plugin interfaces and examples for extending HeliosProxy. Apache 2.0. The Kubernetes Operator, Terraform provider, and Pulumi provider are not publicly released; they are available on request from [sales@heliosdb.com](mailto:sales@heliosdb.com). For Kubernetes, see the public [Kubernetes deployment guide](https://heliosdb.com/docs/proxy/deployment/kubernetes/).
 
 **[HeliosDatabase/HeliosDB-CodeKB-MCP](https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP)** provides an MCP server that turns HeliosDB codebases and docs into queryable technical knowledge for Claude Code, Codex, and other MCP clients.
@@ -370,22 +397,22 @@ export DATABASE_URL="postgres://myapp:password@localhost:6432/mydb"
 | `query-cache` | No | L1/L2/L3 multi-tier query result caching |
 | `routing-hints` | No | SQL comment-based query routing hints |
 | `lag-routing` | No | Replica lag-aware routing with read-your-writes |
-| `rate-limiting` | No | Token bucket and sliding window rate limiting |
-| `circuit-breaker` | No | Adaptive circuit breaker pattern |
-| `query-analytics` | No | Query fingerprinting, slow query log, intent classification |
-| `multi-tenancy` | No | Tenant-aware routing, isolation, and resource quotas |
-| `auth-proxy` | No | JWT, OAuth 2.0, API key, and LDAP authentication |
+| `rate-limiting` | No | Token bucket, opt-in sliding window and per-bucket concurrency limiting |
+| `circuit-breaker` | No | Per-node circuit breaker with half-open recovery |
+| `query-analytics` | No | Query fingerprinting and execution statistics (`/analytics`) |
+| `multi-tenancy` | No | Tenant identification, row-level filter, per-tenant client/query/replay/journal budgets |
+| `auth-proxy` | No | Passthrough or SCRAM client authentication (`[auth]`) and the Authenticate plugin hook; the JWT, OAuth 2.0, API-key and LDAP modules are a library API, not selectable in `proxy.toml` |
 | `query-rewriting` | No | Rule-based SQL query transformation |
-| `wasm-plugins` | No | Sandboxed WASM plugin runtime with hot-reload |
-| `graphql-gateway` | No | GraphQL-to-SQL translation with introspection |
-| `schema-routing` | No | Schema-aware routing and workload classification |
+| `wasm-plugins` | No | Sandboxed WASM plugin runtime with signed artefacts and hot reload |
+| `graphql-gateway` | No | GraphQL-to-SQL over the tables listed in `[[graphql_gateway.tables]]` (no schema introspection or result cache) |
+| `schema-routing` | No | Sends analytical reads to `[schema_routing] analytics_node` |
 | `distribcache` | No | Experimental in-tree library module (`src/distribcache`) for distributed cache tiers. Compiling it in only makes the module available to library consumers — it is **not** wired into the proxy request path and has no `proxy.toml` section |
 | `anomaly-detection` | No | In-process anomaly detection (rate spikes, credential stuffing, SQLi heuristics, novel queries) |
 | `edge-proxy` | No | Cache-first edge / geo proxy mode with last-write-wins TTL coherence |
 | `postgres-topology` | No | PostgreSQL primary discovery via `pg_is_in_recovery()` |
-| `heliosdb-topology` | No | HeliosDB native topology integration |
+| `heliosdb-topology` | No | HeliosDB native topology adapter (library API, usable inside the HeliosDB-Lite workspace; not selectable by the standalone daemon) |
 | `observability` | No | Reserved no-op. It does not pull any dependency or wire any metrics/tracing; `/metrics` and `/metrics/prometheus` are always available regardless of this flag |
-| `ldap-auth` | No | LDAP directory authentication (search + bind) inside `auth-proxy`; pulls the `ldap3` client. Enable in addition to `auth-proxy` for directory-backed auth |
+| `ldap-auth` | No | LDAP directory authentication (search + bind) library module inside `auth-proxy`; pulls the `ldap3` client. Not selectable from `proxy.toml` in 3.0.0 |
 | `all-features` | No | Enables all proxy features (choose a topology provider separately) |
 | `msrv-features` | No | MSRV verification bundle — `all-features` minus `wasm-plugins` and `ldap-auth` so the Rust 1.86 `cargo check` step compiles in reasonable time |
 
@@ -474,7 +501,8 @@ curl -X POST http://localhost:9090/nodes/pg-standby-async.internal:5432/disable
 
 > Failover is automatic: a backend that fails a query is demoted within ~1
 > query and the next query reroutes. There is no `/failover` endpoint. Graceful
-> whole-proxy drain is triggered by `SIGUSR2`, not an HTTP call.
+> whole-proxy drain is triggered by a signal, not an HTTP call: `SIGTERM` / `SIGINT`
+> to shut down, `SIGUSR2` for a binary handoff.
 
 ### Platform endpoints
 
@@ -482,8 +510,13 @@ curl -X POST http://localhost:9090/nodes/pg-standby-async.internal:5432/disable
 # Cluster topology for external controllers (currentPrimary, healthy/unhealthy nodes)
 curl http://localhost:9090/topology
 
-# Loaded WASM plugins with invocation + error counts
+# Loaded WASM plugins with invocation + error counts; each plugin file's state; rescan now
 curl http://localhost:9090/plugins
+curl http://localhost:9090/plugins/files
+curl -X POST http://localhost:9090/plugins/reload
+
+# One versioned stats document (schema_version 1) for pollers and dashboards
+curl http://localhost:9090/api/stats
 
 # Recent anomaly events (rate spikes, credential bursts, SQLi patterns, novel queries)
 curl http://localhost:9090/anomalies?limit=50
@@ -519,9 +552,15 @@ The embedded admin Web UI exposes all of the above at `/` and `/ui`.
 ### Standalone Binary
 
 ```bash
-cargo install heliosdb-proxy
+cargo install heliosdb-proxy --locked
 heliosdb-proxy --config /etc/heliosproxy/proxy.toml
 ```
+
+Prebuilt binaries for Linux and macOS (x86_64, aarch64; built with
+`all-features,postgres-topology`) are attached to each
+[GitHub release](https://github.com/HeliosDatabase/HeliosDB-Proxy/releases). On SIGTERM
+the proxy drains for up to `shutdown_drain_timeout_secs` (60 s by default): give your
+service manager at least that long before it kills the process.
 
 ### Docker
 
@@ -539,6 +578,10 @@ ENTRYPOINT ["heliosdb-proxy"]
 
 ```bash
 docker run -v /etc/heliosproxy:/config heliosdb-proxy --config /config/proxy.toml
+
+# or the published image (all-features,postgres-topology); allow the drain on stop
+docker run --stop-timeout 70 -v /etc/heliosproxy:/config \
+  ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0 --config /config/proxy.toml
 ```
 
 ### Kubernetes Sidecar
@@ -553,7 +596,7 @@ containers:
       - name: DATABASE_URL
         value: "postgres://user:pass@localhost:6432/mydb"
   - name: heliosproxy
-    image: heliosdb/heliosproxy:latest
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0
     args: ["--config", "/config/proxy.toml"]
     ports:
       - containerPort: 6432
@@ -578,7 +621,7 @@ conditions):
 | Backend-connection fan-in | 32 bursty clients served by ~35 backend connections (session/transaction pooling) |
 | Transaction-pooling throughput after conditional reset (G2c) | +48% at 16 clients, +31% at 64 clients vs always-reset |
 | Idle-relay Flush latency (G3b) | 202 ms → 0.8 ms |
-| Cached read | sub-millisecond, no backend round-trip |
+| Cached read | served by the proxy without running the read on the backend; the backend settings proof costs one `SHOW ALL` per connection per `proof_ttl_ms` (see [docs/configuration.md](docs/configuration.md#query-cache-cache)) |
 | Failover | automatic — a failing backend is demoted within ~1 query and the next query reroutes |
 
 Raw scalability (direct vs proxy tps at 1/4/16/64 clients) is tabulated in the

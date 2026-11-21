@@ -334,6 +334,7 @@ impl ProxyServer {
         if state.auth_file.is_some() {
             if let Err(e) = Self::proxy_scram_auth(client_stream, user, state).await {
                 tracing::info!(%user, error = %e, "proxy SCRAM auth failed");
+                Self::record_auth_outcome(state, user, session, false);
                 let err =
                     Self::create_error_response("28P01", &format!("authentication failed: {}", e));
                 *error_response_started = true;
@@ -348,8 +349,15 @@ impl ProxyServer {
         // session for downstream plugins to consume. Happens before any
         // backend connection is opened so denials cost nothing on the
         // backend side.
-        Self::apply_authenticate_hook(params, session, state).await?;
+        if let Err(e) = Self::apply_authenticate_hook(params, session, state).await {
+            if matches!(e, ProxyError::Auth(_)) {
+                Self::record_auth_outcome(state, user, session, false);
+            }
+            return Err(e);
+        }
 
+        #[cfg(feature = "wasm-plugins")]
+        let client_params = params;
         // Migration cutover: when active, redirect this connection to the
         // promoted target, substituting the target's credentials/database for
         // the client's so the cutover is transparent to the application.
@@ -441,11 +449,22 @@ impl ProxyServer {
                     backend = Self::dial_backend_startup(&node_addr, params, config, state).await?;
                 }
                 other => {
+                    // Pass-through: the backend refused the client's own
+                    // credentials (SQLSTATE class 28). Under an auth_file the
+                    // backend checks the proxy's, not the client's.
+                    if state.auth_file.is_none() {
+                        if let Err(ProxyError::Auth(reason)) = &other {
+                            if reason.starts_with("28") {
+                                Self::record_auth_outcome(state, user, session, false);
+                            }
+                        }
+                    }
                     other?;
                     break;
                 }
             }
         }
+        Self::record_auth_outcome(state, user, session, true);
 
         *session.startup_slot.lock() = slot;
 
@@ -456,8 +475,53 @@ impl ProxyServer {
                 vars.insert(k.clone(), v.clone());
             }
         }
+        // What plugin hook calls of this session carry (the client's own
+        // startup parameters, not a cutover's substitutes).
+        #[cfg(feature = "wasm-plugins")]
+        if state.plugin_manager.is_some() {
+            let identity = session.plugin_identity.read().await.clone();
+            let _ = session.plugin_context.set(Self::plugin_session_context(
+                client_params,
+                identity.as_ref(),
+                state.tenant_slots.configured_tenant_of(client_params),
+                &session.client_ip_str,
+                &session.session_id_str,
+            ));
+        }
 
         Ok((Some(backend), node_addr))
+    }
+
+    /// Feed the credential-stuffing detector (`[anomaly] auth_*`) one client
+    /// authentication outcome: a failure counts toward the burst of its
+    /// `(user, client address)`, a success forgets that source. Failures are
+    /// the proxy's own SCRAM check, a plugin's Authenticate denial, and the
+    /// backend's class-28 refusal of the client's credentials.
+    pub(super) fn record_auth_outcome(
+        state: &ServerState,
+        user: &str,
+        session: &ClientSession,
+        succeeded: bool,
+    ) {
+        #[cfg(feature = "anomaly-detection")]
+        {
+            let at = if succeeded {
+                String::new()
+            } else {
+                chrono::Utc::now().to_rfc3339()
+            };
+            if let Some(ev) = state.anomaly_detector.record_auth(
+                user,
+                &session.client_ip_str,
+                succeeded,
+                std::time::Instant::now(),
+                &at,
+            ) {
+                tracing::warn!(anomaly = ?ev, "anomaly detected");
+            }
+        }
+        #[cfg(not(feature = "anomaly-detection"))]
+        let _ = (state, user, session, succeeded);
     }
 
     /// Dial `node_addr` and send the startup packet for `params`. A connect

@@ -6,17 +6,40 @@ This guide covers building and running HeliosProxy in Docker, including Docker C
 
 ## Docker Image
 
+### Published Image
+
+Each release tag publishes `ghcr.io/heliosdatabase/hdb-heliosdb-proxy` (tags `3.0.0`,
+`3.0`, `latest`), built from [`docker/Dockerfile`](../../docker/Dockerfile) with
+`all-features,postgres-topology`. Its entrypoint is `heliosdb-proxy` and its default
+command `--config /etc/helios/proxy.toml`:
+
+```bash
+docker run -d --name heliosproxy --stop-timeout 70 \
+  -p 6432:6432 -p 127.0.0.1:9090:9090 \
+  -v $(pwd)/proxy.toml:/etc/helios/proxy.toml:ro \
+  ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0
+```
+
+### Graceful Stop
+
+`docker stop` sends SIGTERM, which starts a drain: the listeners close, `/health/ready`
+answers 503 and each session ends with FATAL `57P01` once nothing of it is in flight,
+for at most `shutdown_drain_timeout_secs` (default 60). Docker sends SIGKILL after 10
+seconds unless told otherwise: use `docker stop -t 70`, `docker run --stop-timeout 70`,
+or `stop_grace_period: 70s` in Compose, or lower `shutdown_drain_timeout_secs`.
+
 ### Building the Image
 
-Create a multi-stage Dockerfile for a minimal production image:
+Build your own image from source, for example with other features. The build context
+must be the whole repository (the binary embeds `.claude/skills`, and `Cargo.toml`
+declares benches and tests):
 
 ```dockerfile
 # Stage 1: Build
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.86-bookworm AS builder
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
+COPY . .
 
 # Build with desired features
 ARG FEATURES="all-features,postgres-topology"
@@ -133,7 +156,8 @@ version: "3.8"
 
 services:
   heliosproxy:
-    image: heliosdb/proxy:latest
+    image: heliosdb/proxy:latest      # built above; or ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.0 (config at /etc/helios/proxy.toml)
+    stop_grace_period: 70s            # longer than shutdown_drain_timeout_secs (60)
     ports:
       - "6432:6432"
       - "9090:9090"

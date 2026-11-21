@@ -37,7 +37,7 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    with `--no-run`). All available benchmarks must be non-negative vs the recorded
    baseline, and CUMULATIVE performance degradation across a work session must stay under
    3% vs baseline. Criterion baselines are recorded in
-   `/home/gpc/HDB/Proxy/benches/BASELINE.md` (bench name, metric, value, date, host,
+   `benches/BASELINE.md` (bench name, metric, value, date, host,
    features, commit; entries through 2026-09-21) — add a new entry there when a change
    introduces a benchable code path with no prior baseline. The gate tool is
    `scripts/bench-gate.sh <baseline-tree> <candidate-tree> <label>`: 3 interleaved rounds
@@ -47,11 +47,28 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    candidate; it is INVALID (exit 2) when any declared case is missing, malformed or stale
    in any round, when outputs for the label already exist (labels are single-use per tree),
    or when the executables that ran are not the ones built. Cases only the candidate
-   declares are reported as NEW (add a BASELINE.md entry). Every separated regression must
-   still be attributed by the reviewer; `bench-gate.json` / the summary classify each bench
-   executable pair by function body (`scripts/bench-gate-fde.py`): `body-identical` means
-   only placement changed (layout class), `code-changed` means a function body differs.
-   Comparator tests: `python3 scripts/tests/bench_gate_compare_test.py`. The
+   declares are reported as NEW (add a BASELINE.md entry). `bench-gate.json` / the summary
+   classify each bench executable pair by function body (`scripts/bench-gate-fde.py`):
+   `body-identical` means only placement changed (layout class), `code-changed` means a
+   function body differs. **Second-build confirmation** (owner decision 2026-11-17,
+   `CONFIRM=1` by default, `scripts/bench-gate-confirm.py`): when the primary comparison
+   fails only on separated regressions, those on body-identical executables are reported,
+   not failing, and those on changed code are re-measured on a second, independent build
+   of both trees (`CONFIRM_TARGET`, default `<tree>/target-confirm`) over the same
+   interleaved rounds; one fails the gate only if it is again separated and slower there.
+   **Per-function check** (owner decision 2026-11-19, `HOT_CHECK=1` by default,
+   `scripts/bench-gate-hot.py`): each case that reproduced is then run alone in both
+   primary executables under a cycles sampler (`perf_event_open`, user space only); when
+   at most `HOT_MAX_CHANGED_PCT` (default 0.5) of its samples in either build fall in a
+   function whose body the other build does not hold, the case is `function-identical`
+   (the executable changed elsewhere) and is reported, not failing. A case that runs
+   changed code, or that the sampler could not classify, still fails.
+   The mean budget, removed cases and INVALID runs are final as before. The final verdict
+   is `bench-gate-final.json` (and the summary's last lines); every reproduced regression
+   must still be attributed by the reviewer. Comparator tests:
+   `python3 scripts/tests/bench_gate_compare_test.py`,
+   `python3 scripts/tests/bench_gate_confirm_test.py`,
+   `python3 scripts/tests/bench_gate_hot_test.py`. The
    proxy-path scalability harness is `scripts/regress/bench-scalability.sh
    <proxy-binary>` (Dockerized pgbench against an already-running PG 18.4 backend at
    `127.0.0.1:25433`; heavy — see Resource Constraints); its evidence
@@ -69,7 +86,9 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    (`CLIENTS="16 64" DUR=12 PGOPTIONS="-c synchronous_commit=off" MODES="session transaction"`)
    and gates on `scripts/regress/compare-usertp.py`, which exits 1 if any proxy-mode
    `committed_write` cell regresses beyond a 3% budget (`BUDGET_PCT`) in TPS or p99 (medians
-   over passes). Like every Docker/pgbench harness here it needs a live PostgreSQL backend
+   over passes). `ORDER=alternate` with an even `PASSES` runs the candidate first in every
+   other pass, so neither arm always measures on the backend state the other just left
+   (the default `fixed` runs the base first in every pass). Like every Docker/pgbench harness here it needs a live PostgreSQL backend
    and explicit owner approval per run (see Resource Constraints) — record that approval in
    the GATE-RECORD.
 4. **Lint gates** (exact CI commands):
@@ -91,12 +110,15 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
     (both CLI-mode only: rejected together with `--config`), `--primary <host:port>`,
     `--standby <host:port>` (repeatable), `--tr` (default true), `--log-level`, `--json-logs`
   - Subcommand: `install skills [--target claude|codex|both] [--symlink] [--force] [--dry-run]`
-  - Signals: SIGHUP = live config reload; SIGUSR2 = graceful drain for zero-downtime
-    binary handoff (bounded by `shutdown_drain_timeout_secs`, env override
-    `HELIOS_DRAIN_TIMEOUT_SECS`). There is NO SIGTERM/ctrl-c handler — SIGTERM kills
-    the process immediately
-- **CLI `helios-plugin`** (src/bin/helios-plugin.rs): `install`, `list`, `verify`, `new`
-  (plugin registry / Ed25519 signature tooling)
+  - Signals: SIGHUP = live config reload; SIGTERM / SIGINT = shutdown drain bounded by
+    `shutdown_drain_timeout_secs` (env override `HELIOS_DRAIN_TIMEOUT_SECS`): listeners
+    closed (PG wire and the HTTP/MCP/GraphQL gateways), `/health/ready` 503, each
+    session ended with FATAL `57P01` once nothing of it is in flight, accepted gateway
+    requests answered, recovery journal flushed, exit 0; a second signal exits at once.
+    SIGUSR2 = the same drain for a zero-downtime binary handoff
+- **CLI `helios-plugin`** (src/bin/helios-plugin.rs, format in src/plugin_artefact.rs):
+  `keygen`, `pack`, `sign`, `inspect`, `verify`, `install`, `list`, `new` (artefacts,
+  Ed25519 signatures, registry install, plugin scaffold)
 - **Config file** `proxy.toml` — examples in `config/proxy.minimal.toml` (smallest valid
   file: one `[[nodes]]` with `host` + `role`; every other key/section has a serde default),
   `config/proxy.example.toml`, `config/proxy.full.toml`, `config/proxy.postgres.toml`; the working configs under
@@ -104,14 +126,14 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `ProxyConfig` in `src/config.rs` (~4300 lines).
   Top-level keys: `listen_address`, `admin_address`, `admin_token`,
   `admin_allow_insecure`, `tr_enabled`, `tr_mode`, `write_timeout_secs`,
-  `optimize_unnamed_parse`, `shutdown_drain_timeout_secs`, `strict_config`.
+  `optimize_unnamed_parse`, `function_call`, `shutdown_drain_timeout_secs`, `strict_config`.
   Sections: `[pool]`, `[pool_mode]`, `[load_balancer]`, `[health]`, `[[nodes]]`, `[tls]`,
   `[cache]`, `[routing_hints]`, `[lag_routing]`, `[rate_limit]`, `[circuit_breaker]`,
   `[limits]`, `[analytics]`, `[anomaly]`, `[multi_tenancy]`, `[auth]` (only `mode = "passthrough"|"scram"` +
   `auth_file`), `[[hba]]`, `[query_rewrite]` (+`[[query_rewrite.rules]]`), `[plugins]`,
   `[graphql_gateway]` (+`[[graphql_gateway.tables]]`), `[schema_routing]`, `[mcp]`,
   `[[agent_contracts]]`, `[http_gateway]`, `[mirror]`, `[edge]`, `[branch]`, `[topology]`,
-  `[journal]`, `[auto_promote]` (opt-in, off by default).
+  `[journal]`, `[admin]` (`stats_max_items` for `GET /api/stats`), `[auto_promote]` (opt-in, off by default).
   `[ha]` is REJECTED at startup even without `strict_config` (the proxy promotes only via the opt-in
   `[auto_promote]` section, single-proxy; otherwise an external HA manager must, and
   `[topology]` tracks it); an empty
@@ -138,9 +160,11 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   aliases `/healthz`→`/health`, `/livez`→`/health/live`, `/readyz`→`/health/ready`,
   routed and identical to their slash-form twins), `/metrics`,
   `/metrics/prometheus`, `/version`, `/config`, `/topology`, `/nodes`, `/nodes/{addr}`,
-  `/nodes/{addr}/enable|disable`, `/sessions`, `/pools`, `/plugins`, `/analytics`,
-  `/anomalies`, `/branch`, `/api/sql`, `/api/chaos`, `/api/replay`, `/api/shadow`,
+  `/nodes/{addr}/enable|disable`, `/sessions`, `/pools`, `/plugins` (+`/plugins/files`,
+  `POST /plugins/reload`), `/analytics`, `/anomalies`, `/branch`, `/api/sql`,
+  `/api/chaos`, `/api/replay`, `/api/shadow`,
   `/api/branch`, `/api/circuit`, `/api/promotion`, `/api/analytics`,
+  `/api/stats` (schema version 1), `/api/cache/heatmap`,
   `/api/edge` (+`/register`, `/subscribe`, `/invalidate`),
   `/api/migration/{snapshot,cutover,cutover/rollback,status}`
 - **Web UI**: embedded admin dashboard at `GET /` and `/ui` on the admin port
@@ -151,24 +175,32 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   (default `0.0.0.0:9091`), `POST` body `{"query": "..."}` → `{"data": ...}`
   (src/graphql_gateway.rs; tables exposed via `[[graphql_gateway.tables]]`)
 - **MCP agent gateway** (`[mcp] enabled = true`): JSON-RPC 2.0 over HTTP POST; tools
-  `query`, `list_tables`, `explain` (src/mcp.rs)
+  `query`, `list_tables`, `explain`, plus opt-in PostgreSQL-backed `memory_put`,
+  `memory_get`, `memory_list`, `memory_search`, `memory_delete` (src/mcp.rs).
+  `[mcp] principals` binds authenticated agent identity; `tool_cache_*` controls
+  per-principal tool-result caching, and `memory_*` controls conversation/RAG
+  memory with a separate backend role and owner quotas. See docs/configuration.md.
 
 ## Resource Constraints
 
-This host crashed on 2026-07-08 (suspected OOM; see
-`/home/gpc/HDB/sprint/status/incident-2026-07-08.md`) and runs production-like services.
+The development host crashed on 2026-07-08 (suspected OOM; see the maintainers'
+incident record `sprint/status/incident-2026-07-08.md`) and runs production-like services.
 Therefore:
 
 - Run at most ONE heavy build/test/benchmark at a time — never in parallel; no
   `cargo build & cargo test &`, no parallel feature-matrix runs. Prefer sequential
   matrix runs and let one finish before starting the next.
+- Give each isolated worktree its own debug and plain-release target directories.
+  Do not reuse a sibling worktree's `CARGO_TARGET_DIR`: copied source timestamps
+  can leave stale artifacts that omit a new regression. Record Cargo's source
+  path and require each named regression to run a nonzero test count.
 - Cap benchmark dataset sizes and client counts to what the recorded baselines used
   (`bench-scalability.sh` defaults: `CLIENTS="1 16 64"`, `DUR=8`; the 2026-07-04
   evidence baseline in `docs/perf-2026-07/README.md` was run with `CLIENTS="1 4 16 64"`,
   `DUR=10` — match whichever baseline you compare against); never scale them up
   to "stress" the host.
-- NEVER touch `/home/gpc/heliosdb-ada-data`, any `/data` directories, or running
-  heliosdb services/containers. Docker-backed harnesses vary: `tests/docker/*` compose up
+- NEVER touch production data directories (`heliosdb-ada-data` and the like), any `/data`
+  directories, or running heliosdb services/containers. Docker-backed harnesses vary: `tests/docker/*` compose up
   their own cluster and `scripts/regress/ldap-test.sh` starts its own LDAP container, but
   `scripts/regress/run.sh`, `scripts/regress/bench-scalability.sh`, and
   `benchmarks/bench-engines.sh` use Docker only for the psql/pgbench client tooling and
@@ -185,4 +217,4 @@ A runaway benchmark (38 GiB RSS) livelocked this host for 16h. Run ANY heavy ben
 ```bash
 systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 <bench command>
 ```
-Full incident report: /home/gpc/HDB/sprint/status/incident-2026-07-08.md
+Full incident report: the maintainers' `sprint/status/incident-2026-07-08.md`.

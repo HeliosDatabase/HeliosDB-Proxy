@@ -1,10 +1,19 @@
-//! L3 Distributed Cache - Cache mesh with <10ms access time
+//! L3 Distributed Cache - peer cache mesh over TCP
 //!
 //! Features:
 //! - Consistent hashing for key distribution
-//! - Replication for availability
+//! - Replication to the `replication_factor` owners of each key
 //! - TCP-based peer-to-peer communication
-//! - Gossip protocol for peer discovery (planned)
+//!
+//! Peers are configured explicitly ([`DistributedCache::new`],
+//! [`DistributedCache::add_peer`]); there is no peer discovery. Replication
+//! and invalidation are sent to each peer and awaited: every call returns a
+//! [`PeerOpReport`] naming the peers that acknowledged and the ones that did
+//! not (with the reason), and failures are counted in
+//! [`DistributedCache::replication_failures`] /
+//! [`DistributedCache::invalidation_failures`]. A peer that missed an
+//! invalidation can serve a stale entry until its TTL expires, which is why
+//! those failures are surfaced rather than dropped.
 
 use dashmap::DashMap;
 use std::collections::BTreeMap;
@@ -28,6 +37,54 @@ enum MessageType {
     Invalidate = 5,
     Ping = 6,
     Pong = 7,
+    InvalidateResponse = 8,
+    InvalidateTable = 9,
+}
+
+/// `PutResponse` status: the entry was stored.
+const PUT_STORED: u32 = 0;
+/// `PutResponse` status: the payload did not decode; nothing was stored.
+const PUT_REJECTED: u32 = 1;
+
+/// Outcome of an operation sent to several peers (replication or
+/// invalidation).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerOpReport {
+    /// Peers that acknowledged the operation.
+    pub acknowledged: Vec<SocketAddr>,
+    /// Peers that did not, with the reason (unreachable, rejected, or
+    /// marked unhealthy and therefore not attempted).
+    pub failed: Vec<(SocketAddr, String)>,
+}
+
+impl PeerOpReport {
+    /// `true` when every targeted peer acknowledged.
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// Outcome of [`DistributedCache::insert`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicationReport {
+    /// Whether this node is an owner of the key and stored it locally.
+    pub stored_locally: bool,
+    /// Per-peer outcome of replicating to the remote owners.
+    pub peers: PeerOpReport,
+}
+
+impl ReplicationReport {
+    /// Whether at least one owner (local or remote) holds the entry.
+    pub fn stored_anywhere(&self) -> bool {
+        self.stored_locally || !self.peers.acknowledged.is_empty()
+    }
+}
+
+/// A mesh-wide invalidation to broadcast.
+#[derive(Debug, Clone)]
+enum Invalidation {
+    Entry(QueryFingerprint),
+    Table(String),
 }
 
 impl TryFrom<u8> for MessageType {
@@ -42,6 +99,8 @@ impl TryFrom<u8> for MessageType {
             5 => Ok(MessageType::Invalidate),
             6 => Ok(MessageType::Ping),
             7 => Ok(MessageType::Pong),
+            8 => Ok(MessageType::InvalidateResponse),
+            9 => Ok(MessageType::InvalidateTable),
             _ => Err(()),
         }
     }
@@ -221,8 +280,12 @@ impl PeerConnection {
             return Err("Failed to read response header");
         }
 
-        let _msg_type =
-            MessageType::try_from(resp_header[0]).map_err(|_| "Invalid message type")?;
+        if !matches!(
+            MessageType::try_from(resp_header[0]),
+            Ok(MessageType::GetResponse)
+        ) {
+            return Err("Unexpected response type");
+        }
         let length = u32::from_le_bytes([
             resp_header[1],
             resp_header[2],
@@ -282,13 +345,12 @@ impl PeerConnection {
             return Err("Failed to write");
         }
 
-        // Read response (ack)
-        let mut resp_header = [0u8; 5];
-        if reader.read_exact(&mut resp_header).await.is_err() {
-            return Err("Failed to read ack");
+        // Read the ack: [PutResponse][status: u32]
+        match read_response(&mut reader, MessageType::PutResponse).await? {
+            PUT_STORED => Ok(()),
+            PUT_REJECTED => Err("Peer rejected the entry"),
+            _ => Err("Unknown PUT status"),
         }
-
-        Ok(())
     }
 
     /// Ping peer to check health
@@ -327,8 +389,26 @@ impl PeerConnection {
         }
     }
 
-    /// Send invalidation message to peer
+    /// Send an entry invalidation to the peer and wait for its ack.
     pub async fn invalidate(&self, fingerprint: &QueryFingerprint) -> Result<(), &'static str> {
+        let fp_bytes = postcard::to_stdvec(fingerprint).map_err(|_| "Serialization failed")?;
+        self.send_invalidation(MessageType::Invalidate, &fp_bytes)
+            .await
+            .map(|_| ())
+    }
+
+    /// Send a table invalidation to the peer and wait for its ack. Returns
+    /// the number of entries the peer removed.
+    pub async fn invalidate_table(&self, table: &str) -> Result<u32, &'static str> {
+        self.send_invalidation(MessageType::InvalidateTable, table.as_bytes())
+            .await
+    }
+
+    async fn send_invalidation(
+        &self,
+        msg_type: MessageType,
+        payload: &[u8],
+    ) -> Result<u32, &'static str> {
         let stream = match tokio::time::timeout(
             std::time::Duration::from_millis(self.timeout_ms),
             TcpStream::connect(self.addr),
@@ -340,20 +420,40 @@ impl PeerConnection {
             Err(_) => return Err("Connection timeout"),
         };
 
-        let fp_bytes = postcard::to_stdvec(fingerprint).map_err(|_| "Serialization failed")?;
+        let mut message = vec![msg_type as u8];
+        message.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        message.extend_from_slice(payload);
 
-        let mut message = vec![MessageType::Invalidate as u8];
-        message.extend_from_slice(&(fp_bytes.len() as u32).to_le_bytes());
-        message.extend_from_slice(&fp_bytes);
-
-        let (_, mut writer) = stream.into_split();
+        let (mut reader, mut writer) = stream.into_split();
         writer
             .write_all(&message)
             .await
             .map_err(|_| "Write failed")?;
 
-        Ok(())
+        tokio::time::timeout(
+            std::time::Duration::from_millis(self.timeout_ms),
+            read_response(&mut reader, MessageType::InvalidateResponse),
+        )
+        .await
+        .map_err(|_| "Ack timeout")?
     }
+}
+
+/// Read a `[type: u8][value: u32]` response and check its type.
+async fn read_response(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    expected: MessageType,
+) -> Result<u32, &'static str> {
+    let mut header = [0u8; 5];
+    if reader.read_exact(&mut header).await.is_err() {
+        return Err("Failed to read ack");
+    }
+    if header[0] != expected as u8 {
+        return Err("Unexpected response type");
+    }
+    Ok(u32::from_le_bytes([
+        header[1], header[2], header[3], header[4],
+    ]))
 }
 
 /// L3 Distributed Cache - Cache mesh with consistent hashing
@@ -378,6 +478,10 @@ pub struct DistributedCache {
     misses: AtomicU64,
     remote_hits: AtomicU64,
     healthy_peers: AtomicU32,
+    /// Owner replications that were not acknowledged
+    replication_failures: AtomicU64,
+    /// Peer invalidations that were not acknowledged
+    invalidation_failures: AtomicU64,
 }
 
 impl DistributedCache {
@@ -405,6 +509,8 @@ impl DistributedCache {
             misses: AtomicU64::new(0),
             remote_hits: AtomicU64::new(0),
             healthy_peers: AtomicU32::new(peer_addrs.len() as u32),
+            replication_failures: AtomicU64::new(0),
+            invalidation_failures: AtomicU64::new(0),
         }
     }
 
@@ -438,7 +544,8 @@ impl DistributedCache {
                 continue;
             }
 
-            if let Some(peer) = self.peers.get(&owner) {
+            let peer = self.peers.get(&owner).map(|p| p.value().clone());
+            if let Some(peer) = peer {
                 if peer.healthy {
                     if let Ok(entry) = peer.get(fingerprint).await {
                         // Cache locally
@@ -455,36 +562,79 @@ impl DistributedCache {
         None
     }
 
-    /// Insert an entry into the distributed cache
-    pub async fn insert(&self, fingerprint: QueryFingerprint, entry: CacheEntry) {
+    /// Insert an entry into the distributed cache.
+    ///
+    /// Stores it locally when this node is one of the key's owners and sends
+    /// it to every remote owner, awaiting each acknowledgement. The report
+    /// lists the remote owners that stored it and the ones that did not; an
+    /// owner marked unhealthy is reported as failed without being contacted.
+    /// Each failure also increments [`Self::replication_failures`].
+    pub async fn insert(
+        &self,
+        fingerprint: QueryFingerprint,
+        entry: CacheEntry,
+    ) -> ReplicationReport {
         let key = self.fingerprint_to_hash(&fingerprint);
         let key_bytes = key.to_le_bytes();
 
         // Determine owners
         let owners = {
-            let ring = self.hash_ring.read().unwrap();
+            let ring = self
+                .hash_ring
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             ring.get_nodes(&key_bytes, self.replication_factor)
         };
 
         // Insert locally if we own it
-        if owners.contains(&self.local_peer_id) {
+        let stored_locally = owners.contains(&self.local_peer_id);
+        if stored_locally {
             self.local.insert(key, entry.clone());
         }
 
-        // Replicate to other owners (fire and forget for now)
+        let mut report = PeerOpReport::default();
         for owner in owners {
             if owner == self.local_peer_id {
                 continue;
             }
-
-            if let Some(peer) = self.peers.get(&owner) {
-                if peer.healthy {
-                    let fp = fingerprint.clone();
-                    let e = entry.clone();
-                    let _ = peer.insert(fp, e).await;
-                }
+            let Some(peer) = self.peers.get(&owner).map(|p| p.value().clone()) else {
+                continue;
+            };
+            if !peer.healthy {
+                report.failed.push((
+                    peer.addr,
+                    "peer marked unhealthy; replication not attempted".to_string(),
+                ));
+                continue;
+            }
+            match peer.insert(fingerprint.clone(), entry.clone()).await {
+                Ok(()) => report.acknowledged.push(peer.addr),
+                Err(e) => report.failed.push((peer.addr, e.to_string())),
             }
         }
+
+        if !report.failed.is_empty() {
+            self.replication_failures
+                .fetch_add(report.failed.len() as u64, Ordering::Relaxed);
+            tracing::warn!(
+                failed = ?report.failed,
+                "L3 replication incomplete"
+            );
+        }
+        ReplicationReport {
+            stored_locally,
+            peers: report,
+        }
+    }
+
+    /// Owner replications that were not acknowledged since creation.
+    pub fn replication_failures(&self) -> u64 {
+        self.replication_failures.load(Ordering::Relaxed)
+    }
+
+    /// Peer invalidations that were not acknowledged since creation.
+    pub fn invalidation_failures(&self) -> u64 {
+        self.invalidation_failures.load(Ordering::Relaxed)
     }
 
     /// Add a peer to the cache mesh
@@ -507,8 +657,11 @@ impl DistributedCache {
             ring.remove_peer(peer_id);
         }
 
-        if self.peers.remove(&peer_id).is_some() {
-            self.healthy_peers.fetch_sub(1, Ordering::Relaxed);
+        // Only a healthy peer is counted in `healthy_peers`.
+        if let Some((_, peer)) = self.peers.remove(&peer_id) {
+            if peer.healthy {
+                self.healthy_peers.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -536,25 +689,72 @@ impl DistributedCache {
         }
     }
 
-    /// Invalidate an entry across the mesh
-    pub async fn invalidate(&self, fingerprint: &QueryFingerprint) {
+    /// Invalidate an entry across the mesh.
+    ///
+    /// Removes it locally and sends the invalidation to every peer
+    /// concurrently, awaiting each acknowledgement. See [`PeerOpReport`].
+    pub async fn invalidate(&self, fingerprint: &QueryFingerprint) -> PeerOpReport {
         let key = self.fingerprint_to_hash(fingerprint);
-
-        // Remove locally
         self.local.remove(&key);
+        self.broadcast_invalidation(Invalidation::Entry(fingerprint.clone()))
+            .await
+    }
 
-        // Broadcast invalidation to all healthy peers
-        for peer_ref in self.peers.iter() {
-            let peer = peer_ref.value();
-            if peer.healthy {
-                // Fire and forget - don't wait for ack
-                let fp = fingerprint.clone();
-                let peer_clone = peer.clone();
-                tokio::spawn(async move {
-                    let _ = peer_clone.invalidate(&fp).await;
-                });
+    /// Invalidate every entry that reads `table` (ASCII case-insensitive),
+    /// locally and on every peer, awaiting each acknowledgement.
+    pub async fn invalidate_table(&self, table: &str) -> PeerOpReport {
+        self.remove_local_table(table);
+        self.broadcast_invalidation(Invalidation::Table(table.to_string()))
+            .await
+    }
+
+    /// Remove local entries that read `table`; returns how many.
+    fn remove_local_table(&self, table: &str) -> u32 {
+        let before = self.local.len();
+        self.local
+            .retain(|_, entry| !entry.tables.iter().any(|t| t.eq_ignore_ascii_case(table)));
+        before.saturating_sub(self.local.len()) as u32
+    }
+
+    async fn broadcast_invalidation(&self, invalidation: Invalidation) -> PeerOpReport {
+        let mut report = PeerOpReport::default();
+        let mut sends = tokio::task::JoinSet::new();
+        let peers: Vec<PeerConnection> = self.peers.iter().map(|p| p.value().clone()).collect();
+        for peer in peers {
+            if !peer.healthy {
+                report.failed.push((
+                    peer.addr,
+                    "peer marked unhealthy; invalidation not attempted".to_string(),
+                ));
+                continue;
+            }
+            let invalidation = invalidation.clone();
+            sends.spawn(async move {
+                let result = match &invalidation {
+                    Invalidation::Entry(fp) => peer.invalidate(fp).await,
+                    Invalidation::Table(table) => peer.invalidate_table(table).await.map(|_| ()),
+                };
+                (peer.addr, result)
+            });
+        }
+        while let Some(joined) = sends.join_next().await {
+            match joined {
+                Ok((addr, Ok(()))) => report.acknowledged.push(addr),
+                Ok((addr, Err(e))) => report.failed.push((addr, e.to_string())),
+                Err(e) => tracing::error!(error = %e, "L3 invalidation task failed"),
             }
         }
+
+        if !report.failed.is_empty() {
+            self.invalidation_failures
+                .fetch_add(report.failed.len() as u64, Ordering::Relaxed);
+            tracing::warn!(
+                failed = ?report.failed,
+                "L3 invalidation incomplete: peers that missed it may serve stale entries \
+                 until their TTL expires"
+            );
+        }
+        report
     }
 
     /// Convert fingerprint to hash key
@@ -685,17 +885,21 @@ impl DistributedCache {
                 let mut entry_bytes = vec![0u8; entry_len];
                 reader.read_exact(&mut entry_bytes).await?;
 
-                if let (Ok(fp), Ok(entry)) = (
+                let status = match (
                     postcard::from_bytes::<QueryFingerprint>(&fp_bytes),
                     postcard::from_bytes::<CacheEntry>(&entry_bytes),
                 ) {
-                    let key = self.fingerprint_to_hash(&fp);
-                    self.local.insert(key, entry);
-                }
+                    (Ok(fp), Ok(entry)) => {
+                        let key = self.fingerprint_to_hash(&fp);
+                        self.local.insert(key, entry);
+                        PUT_STORED
+                    }
+                    _ => PUT_REJECTED,
+                };
 
-                // Acknowledge (the client reads a 5-byte response header).
+                // [PutResponse][status: u32]
                 let mut out = vec![MessageType::PutResponse as u8];
-                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&status.to_le_bytes());
                 writer.write_all(&out).await?;
             }
             MessageType::Ping => {
@@ -711,14 +915,38 @@ impl DistributedCache {
                 let fp_len = u32::from_le_bytes(len_buf) as usize;
                 let mut fp_bytes = vec![0u8; fp_len];
                 reader.read_exact(&mut fp_bytes).await?;
-                if let Ok(fp) = postcard::from_bytes::<QueryFingerprint>(&fp_bytes) {
-                    let key = self.fingerprint_to_hash(&fp);
-                    self.local.remove(&key);
-                }
-                // Invalidate is fire-and-forget; no response expected.
+                // An undecodable fingerprint is not acknowledged: the
+                // sender reports the invalidation as failed.
+                let fp = match postcard::from_bytes::<QueryFingerprint>(&fp_bytes) {
+                    Ok(fp) => fp,
+                    Err(_) => return Ok(()),
+                };
+                let key = self.fingerprint_to_hash(&fp);
+                let removed = u32::from(self.local.remove(&key).is_some());
+                let mut out = vec![MessageType::InvalidateResponse as u8];
+                out.extend_from_slice(&removed.to_le_bytes());
+                writer.write_all(&out).await?;
+            }
+            MessageType::InvalidateTable => {
+                let mut len_buf = [0u8; 4];
+                reader.read_exact(&mut len_buf).await?;
+                let name_len = u32::from_le_bytes(len_buf) as usize;
+                let mut name = vec![0u8; name_len];
+                reader.read_exact(&mut name).await?;
+                let table = match String::from_utf8(name) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(()),
+                };
+                let removed = self.remove_local_table(&table);
+                let mut out = vec![MessageType::InvalidateResponse as u8];
+                out.extend_from_slice(&removed.to_le_bytes());
+                writer.write_all(&out).await?;
             }
             // Response-type frames are never received server-side.
-            MessageType::GetResponse | MessageType::PutResponse | MessageType::Pong => {}
+            MessageType::GetResponse
+            | MessageType::PutResponse
+            | MessageType::Pong
+            | MessageType::InvalidateResponse => {}
         }
         Ok(())
     }
@@ -783,7 +1011,9 @@ mod tests {
         let entry = CacheEntry::new(vec![1, 2, 3], vec!["users".to_string()], 1)
             .with_ttl(Duration::from_secs(300));
 
-        cache.insert(fp.clone(), entry).await;
+        let report = cache.insert(fp.clone(), entry).await;
+        assert!(report.stored_locally);
+        assert!(report.peers.is_complete());
 
         let result = cache.get(&fp).await;
         assert!(result.is_some());
@@ -807,6 +1037,8 @@ mod tests {
 
         cache.remove_peer(&addr1);
         assert_eq!(cache.stats().peer_count, Some(2)); // 1 remote + 1 local
+                                                       // Removing an already-unhealthy peer must not decrement again.
+        assert_eq!(cache.stats().healthy_peers, Some(2));
     }
 
     #[tokio::test]
@@ -865,15 +1097,9 @@ mod tests {
         // PING must get a Pong.
         assert!(client.ping().await, "peer did not answer ping");
 
-        // INVALIDATE must remove it server-side; the next GET then misses.
+        // INVALIDATE must remove it server-side (acknowledged before the
+        // call returns); the next GET then misses.
         client.invalidate(&fp).await.unwrap();
-        // brief await so the fire-and-forget invalidate is processed
-        for _ in 0..50 {
-            if !server.local.contains_key(&key) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
         assert!(
             !server.local.contains_key(&key),
             "INVALIDATE did not remove entry"
@@ -882,5 +1108,133 @@ mod tests {
             client.get(&fp).await.is_err(),
             "GET should miss after invalidate"
         );
+    }
+
+    /// Replication to an owner that is down is reported per owner and
+    /// counted, not dropped.
+    #[tokio::test]
+    async fn test_replication_failure_is_reported_and_counted() {
+        // A port with nothing listening: connect is refused.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        // Replication factor 2 with one remote peer: that peer owns every key.
+        let cache = DistributedCache::new(2, vec![dead_addr]);
+        let fp = QueryFingerprint::from_query("SELECT * FROM users");
+        let entry = CacheEntry::new(vec![1], vec!["users".to_string()], 1)
+            .with_ttl(Duration::from_secs(60));
+
+        let report = cache.insert(fp, entry).await.peers;
+        assert!(!report.is_complete());
+        assert!(report.acknowledged.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, dead_addr);
+        assert_eq!(cache.replication_failures(), 1);
+
+        // An owner marked unhealthy is reported as not attempted.
+        cache.mark_unhealthy(&dead_addr);
+        let report = cache
+            .insert(
+                QueryFingerprint::from_query("SELECT * FROM orders"),
+                CacheEntry::new(vec![2], vec![], 1),
+            )
+            .await
+            .peers;
+        assert!(report.failed[0].1.contains("not attempted"), "{report:?}");
+        assert_eq!(cache.replication_failures(), 2);
+    }
+
+    /// Replication to a live owner is acknowledged and lands on the peer.
+    #[tokio::test]
+    async fn test_replication_to_live_peer_is_acknowledged() {
+        let server = Arc::new(DistributedCache::new(1, Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(Arc::clone(&server).serve_on(listener));
+
+        let cache = DistributedCache::new(2, vec![addr]);
+        let fp = QueryFingerprint::from_query("SELECT * FROM users");
+        let report = cache
+            .insert(
+                fp.clone(),
+                CacheEntry::new(vec![5], vec!["users".to_string()], 1),
+            )
+            .await
+            .peers;
+        assert_eq!(report.acknowledged, vec![addr]);
+        assert!(report.is_complete());
+        assert_eq!(cache.replication_failures(), 0);
+        assert!(server.local.contains_key(&server.fingerprint_to_hash(&fp)));
+    }
+
+    /// A PUT whose payload the peer cannot decode is rejected, not acked.
+    #[tokio::test]
+    async fn test_peer_rejects_undecodable_put() {
+        let server = Arc::new(DistributedCache::new(1, Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(Arc::clone(&server).serve_on(listener));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut msg = vec![MessageType::Put as u8];
+        msg.extend_from_slice(&2u32.to_le_bytes());
+        msg.extend_from_slice(&2u32.to_le_bytes());
+        msg.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        stream.write_all(&msg).await.unwrap();
+        let mut resp = [0u8; 5];
+        stream.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[0], MessageType::PutResponse as u8);
+        assert_eq!(
+            u32::from_le_bytes([resp[1], resp[2], resp[3], resp[4]]),
+            PUT_REJECTED
+        );
+        assert!(server.local.is_empty());
+    }
+
+    /// Table invalidation reaches peers, is acknowledged, and an unreachable
+    /// peer is reported and counted.
+    #[tokio::test]
+    async fn test_invalidate_table_across_mesh_reports_each_peer() {
+        let server = Arc::new(DistributedCache::new(1, Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        tokio::spawn(Arc::clone(&server).serve_on(listener));
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        // Seed the live peer with a "users" entry and an "orders" entry.
+        let client = PeerConnection::new(live);
+        let users = QueryFingerprint::from_query("SELECT * FROM users");
+        let orders = QueryFingerprint::from_query("SELECT * FROM orders");
+        client
+            .insert(
+                users.clone(),
+                CacheEntry::new(vec![1], vec!["users".to_string()], 1),
+            )
+            .await
+            .unwrap();
+        client
+            .insert(
+                orders.clone(),
+                CacheEntry::new(vec![2], vec!["orders".to_string()], 1),
+            )
+            .await
+            .unwrap();
+
+        let cache = DistributedCache::new(1, vec![live, dead_addr]);
+        let report = cache.invalidate_table("USERS").await;
+        assert_eq!(report.acknowledged, vec![live]);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, dead_addr);
+        assert_eq!(cache.invalidation_failures(), 1);
+
+        assert!(!server
+            .local
+            .contains_key(&server.fingerprint_to_hash(&users)));
+        assert!(server
+            .local
+            .contains_key(&server.fingerprint_to_hash(&orders)));
     }
 }

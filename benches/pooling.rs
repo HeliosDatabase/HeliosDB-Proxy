@@ -8,6 +8,21 @@ use heliosdb_proxy::connection_pool::{ConnectionPool, PoolConfig};
 use heliosdb_proxy::{NodeEndpoint, NodeId, NodeRole};
 use std::time::Duration;
 
+#[path = "support/fake_pg.rs"]
+mod fake_pg;
+use fake_pg::FakePg;
+
+/// A pool with one node whose connections go to a scripted backend
+/// ([`FakePg`]), so acquire opens, validates and reuses real connections.
+async fn live_pool(config: PoolConfig) -> (ConnectionPool, NodeId, FakePg) {
+    let backend = FakePg::start().await;
+    let pool = ConnectionPool::new(config).with_backend_template(backend.template());
+    let node_id = NodeId::new();
+    pool.add_node_with_endpoint(node_id, backend.addr.ip().to_string(), backend.addr.port())
+        .await;
+    (pool, node_id, backend)
+}
+
 /// Benchmark pool creation with various max-connection sizes.
 fn bench_pool_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("pool/create");
@@ -64,19 +79,14 @@ fn bench_acquire_release(c: &mut Criterion) {
     let mut group = c.benchmark_group("pool/acquire_release");
     group.throughput(Throughput::Elements(1));
 
-    let pool = rt.block_on(async {
-        let pool = ConnectionPool::new(PoolConfig {
-            min_connections: 2,
-            max_connections: 100,
-            ..Default::default()
-        });
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
-        (pool, node_id)
-    });
+    let pool = rt.block_on(live_pool(PoolConfig {
+        min_connections: 2,
+        max_connections: 100,
+        ..Default::default()
+    }));
 
     group.bench_function("single", |b| {
-        let (ref pool, node_id) = pool;
+        let (ref pool, node_id, _) = pool;
         b.to_async(&rt).iter(|| async {
             let conn = pool.get_connection(&node_id).await.unwrap();
             pool.return_connection(conn).await;
@@ -97,16 +107,11 @@ fn bench_pool_throughput(c: &mut Criterion) {
             BenchmarkId::new("sequential_acquire", batch_size),
             &batch_size,
             |b, &n| {
-                let (pool, node_id) = rt.block_on(async {
-                    let pool = ConnectionPool::new(PoolConfig {
-                        min_connections: 2,
-                        max_connections: 200,
-                        ..Default::default()
-                    });
-                    let node_id = NodeId::new();
-                    pool.add_node(node_id).await;
-                    (pool, node_id)
-                });
+                let (pool, node_id, _backend) = rt.block_on(live_pool(PoolConfig {
+                    min_connections: 2,
+                    max_connections: 200,
+                    ..Default::default()
+                }));
 
                 b.to_async(&rt).iter(|| {
                     let pool = &pool;
@@ -130,23 +135,22 @@ fn bench_pool_throughput(c: &mut Criterion) {
 /// Benchmark the acquire/release cycle under real concurrency.
 ///
 /// Extends `pool/acquire_release/single` onto the contended path: an
-/// `Arc`-shared skeleton pool is hit by K tasks on the multi-thread tokio
-/// runtime, each looping acquire+return, so the `RwLock<HashMap>` write lock and
-/// the per-node `Semaphore` are exercised under genuine parallelism rather than
-/// sequentially. No backend is involved (skeleton mode, `add_node` only).
+/// `Arc`-shared pool is hit by K tasks on the multi-thread tokio runtime, each
+/// looping acquire+return, so the `RwLock<HashMap>` write lock and the per-node
+/// `Semaphore` are exercised under genuine parallelism rather than
+/// sequentially. Connections go to a scripted loopback backend ([`FakePg`]).
 fn bench_acquire_release_contention(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("pool/acquire_release/contention");
 
-    let (pool, node_id) = rt.block_on(async {
-        let pool = std::sync::Arc::new(ConnectionPool::new(PoolConfig {
+    let (pool, node_id, _backend) = rt.block_on(async {
+        let (pool, node_id, backend) = live_pool(PoolConfig {
             min_connections: 2,
             max_connections: 256,
             ..Default::default()
-        }));
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
-        (pool, node_id)
+        })
+        .await;
+        (std::sync::Arc::new(pool), node_id, backend)
     });
 
     // Each task performs a small fixed number of acquire+return cycles per
@@ -220,16 +224,14 @@ fn bench_pool_metrics(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("pool/metrics");
 
-    let pool = rt.block_on(async {
-        let pool = ConnectionPool::new(PoolConfig::default());
-        let node_id = NodeId::new();
-        pool.add_node(node_id).await;
+    let (pool, _backend) = rt.block_on(async {
+        let (pool, node_id, backend) = live_pool(PoolConfig::default()).await;
         // Do a few acquire/release cycles to populate metrics
         for _ in 0..5 {
             let conn = pool.get_connection(&node_id).await.unwrap();
             pool.return_connection(conn).await;
         }
-        pool
+        (pool, backend)
     });
 
     group.bench_function("read_metrics", |b| {

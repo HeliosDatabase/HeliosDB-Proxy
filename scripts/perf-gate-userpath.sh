@@ -17,6 +17,10 @@
 #   CLIENTS       pgbench client counts to sweep      (default "16 64")
 #   DUR            seconds per pgbench run              (default 12)
 #   PASSES         interleaved base/cand pass count     (default 3)
+#   ORDER          which arm runs first in each pass     (default fixed = base
+#                  first every pass; alternate = base first in odd passes,
+#                  cand first in even ones, so neither arm always runs on the
+#                  backend state the other one left; use an even PASSES)
 #   MODES          proxy pool modes to test             (default "session transaction")
 #   PGOPTIONS      passed through to pgbench            (default "-c synchronous_commit=off")
 #   PGBENCH_PROTOCOL  pgbench query protocol, -M (simple|extended|prepared;
@@ -24,12 +28,15 @@
 #                  extended-protocol relay; use a distinct label per protocol
 #   TR_MODE        the proxies' tr_mode                  (default unset = session;
 #                  `transaction` exercises the in-session replay recording)
+#   TR_ENABLED     enable or disable Transaction Replay on both arms
+#                  (default true; diagnostic ablations may set false)
 #   EXTRA_TOML     TOML appended to both proxies' config  (default empty; e.g. a
 #                  `[multi_tenancy]` section for a capped run, both arms alike)
 #   BUDGET_PCT     regression budget, TPS and p99        (default 3.0, see compare-usertp.py)
-#   BASELINE_ROOT  where labelled runs are archived      (default /home/gpc/HDB/sprint/baselines/proxy)
+#   BASELINE_ROOT  where labelled runs are archived      (default $HELIOS_SPRINT/baselines/proxy)
 #   OUT            this run's archive dir                (default $BASELINE_ROOT/$LABEL/usertp)
-#   LOCK           fleet-wide heavy-job lock file         (default /home/gpc/HDB/sprint/coordination/build.lock)
+#   LOCK           fleet-wide heavy-job lock file         (default $HELIOS_SPRINT/coordination/build.lock)
+#   HELIOS_SPRINT  the maintainers' sprint tree            (default $HOME/HDB/sprint)
 #   MEM            systemd-run MemoryMax per heavy job    (default 24G)
 #   NO_LOCK=1      skip the per-pass flock/systemd-run (CI containers, or when the
 #                  caller already holds the lock around the whole run, see below)
@@ -68,14 +75,16 @@ IMG="postgres:18.4-bookworm"
 CLIENTS="${CLIENTS:-16 64}"
 DUR="${DUR:-12}"
 PASSES="${PASSES:-3}"
+ORDER="${ORDER:-fixed}"
+case "$ORDER" in fixed|alternate) ;; *) echo "FATAL: ORDER must be fixed or alternate" >&2; exit 2;; esac
 MODES="${MODES:-session transaction}"
 PGOPTIONS="${PGOPTIONS:--c synchronous_commit=off}"
 PGBENCH_PROTOCOL="${PGBENCH_PROTOCOL:-}"
 case "$PGBENCH_PROTOCOL" in ""|simple|extended|prepared) ;; *) echo "FATAL: PGBENCH_PROTOCOL must be simple, extended or prepared" >&2; exit 2;; esac
 BUDGET_PCT="${BUDGET_PCT:-3.0}"
-BASELINE_ROOT="${BASELINE_ROOT:-/home/gpc/HDB/sprint/baselines/proxy}"
+BASELINE_ROOT="${BASELINE_ROOT:-${HELIOS_SPRINT:-$HOME/HDB/sprint}/baselines/proxy}"
 OUT="${OUT:-$BASELINE_ROOT/$LABEL/usertp}"
-LOCK="${LOCK:-/home/gpc/HDB/sprint/coordination/build.lock}"
+LOCK="${LOCK:-${HELIOS_SPRINT:-$HOME/HDB/sprint}/coordination/build.lock}"
 MEM="${MEM:-24G}"
 NO_LOCK="${NO_LOCK:-0}"
 
@@ -99,10 +108,12 @@ mkdir -p "$OUT"
   echo "CLIENTS=$CLIENTS"
   echo "DUR=$DUR"
   echo "PASSES=$PASSES"
+  echo "ORDER=$ORDER"
   echo "MODES=$MODES"
   echo "PGOPTIONS=$PGOPTIONS"
   echo "PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple}"
   echo "TR_MODE=${TR_MODE:-session}"
+  echo "TR_ENABLED=${TR_ENABLED:-true}"
   printf 'EXTRA_TOML=%q\n' "${EXTRA_TOML:-}"
   echo "BUDGET_PCT=$BUDGET_PCT"
 } > "$OUT/$LABEL-env.txt"
@@ -123,7 +134,7 @@ if ! pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -tAc "select 1" >/d
   exit 2
 fi
 
-rows="$(pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -tAc "select count(*) from pgbench_accounts" 2>/dev/null | tr -d '[:space:]')"
+rows="$(pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -tAc "select count(*) from pgbench_accounts" 2>/dev/null | tr -d '[:space:]' || true)"
 if [ "${rows:-0}" != "1000000" ]; then
   echo "pgbench_accounts has ${rows:-0} row(s) (want 1,000,000) — initializing with pgbench -i -s 10"
   # inlined rather than via the pg() shell function: heavy()'s systemd-run
@@ -139,14 +150,20 @@ run_pass(){
   # invoked via `bash` rather than relying on the file's executable bit —
   # scripts/regress/bench-usertp.sh is tracked without +x in git.
   heavy env OUT="$OUT" CLIENTS="$CLIENTS" DUR="$DUR" MODES="$MODES" PGOPTIONS="$PGOPTIONS" \
-    PGBENCH_PROTOCOL="$PGBENCH_PROTOCOL" TR_MODE="${TR_MODE:-}" EXTRA_TOML="${EXTRA_TOML:-}" \
+    PGBENCH_PROTOCOL="$PGBENCH_PROTOCOL" TR_MODE="${TR_MODE:-}" TR_ENABLED="${TR_ENABLED:-true}" \
+    EXTRA_TOML="${EXTRA_TOML:-}" \
     bash "$HERE/regress/bench-usertp.sh" "$bin" "$plabel"
 }
 
-echo "== perf-gate-userpath($LABEL): $PASSES interleaved pass(es), CLIENTS=\"$CLIENTS\" DUR=$DUR MODES=\"$MODES\" PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple} =="
+echo "== perf-gate-userpath($LABEL): $PASSES interleaved pass(es), ORDER=$ORDER, CLIENTS=\"$CLIENTS\" DUR=$DUR MODES=\"$MODES\" PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple} =="
 for p in $(seq 1 "$PASSES"); do
-  run_pass "$BASE_BIN" base "$p"
-  run_pass "$CAND_BIN" cand "$p"
+  if [ "$ORDER" = alternate ] && [ $((p % 2)) = 0 ]; then
+    run_pass "$CAND_BIN" cand "$p"
+    run_pass "$BASE_BIN" base "$p"
+  else
+    run_pass "$BASE_BIN" base "$p"
+    run_pass "$CAND_BIN" cand "$p"
+  fi
 done
 
 echo "== perf-gate-userpath($LABEL): compare (budget ${BUDGET_PCT}%) =="

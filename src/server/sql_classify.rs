@@ -362,7 +362,7 @@ impl ProxyServer {
     /// observed-home domain and lets the home's own event follow.
     #[cfg(feature = "edge-proxy")]
     pub(super) async fn edge_invalidate_write(
-        state: &Arc<ServerState>,
+        state: &ServerState,
         config: &ProxyConfig,
         tables: Vec<String>,
     ) {
@@ -498,7 +498,7 @@ impl ProxyServer {
             || Self::starts_with_word_ci(t, "VALUES")
             || Self::starts_with_word_ci(t, "TABLE")
             || Self::starts_with_word_ci(t, "WITH");
-        if !read_lead || Self::tr_classify(t, policy) != StmtKind::Read {
+        if !read_lead || Self::tr_routing_classify(t, policy) != StmtKind::Read {
             return false;
         }
         if Self::contains_word_ci(t, "for")
@@ -506,19 +506,12 @@ impl ProxyServer {
         {
             return false;
         }
-        let mut primary_bound = false;
-        let scanned = crate::replay_sql::words(t, |w| {
-            if w.call
-                && STANDBY_UNSAFE_FUNCTIONS
-                    .iter()
-                    .any(|f| w.text.eq_ignore_ascii_case(f))
-            {
-                primary_bound = true;
-                return false;
-            }
-            true
-        });
-        scanned.is_ok() && !primary_bound
+        crate::replay_sql::all_calls_satisfy(t, |w| {
+            !STANDBY_UNSAFE_FUNCTIONS
+                .iter()
+                .any(|f| w.text.eq_ignore_ascii_case(f))
+        })
+        .unwrap_or(false)
     }
 
     /// Whether the session's named statement `name` is a standby-safe read,
@@ -571,17 +564,20 @@ impl ProxyServer {
         // Token-exact checks outside literals, comments and quoted names:
         // `set_config(…)` and `… INTO TEMP[ORARY] …`.
         let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
-        let (mut set_config, mut into_temp, mut after_into) = (false, false, false);
+        if !crate::replay_sql::all_calls_satisfy(core, |w| !is(w.text, "set_config"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // INTO TEMP needs the original ordered token stream; call eligibility
+        // above separately checks every possible string reading.
+        let (mut into_temp, mut after_into) = (false, false);
         let scanned = crate::replay_sql::words(core, |w| {
-            if w.call && is(w.text, "set_config") {
-                set_config = true;
-                return false;
-            }
             into_temp |= !w.quoted && after_into && (is(w.text, "temp") || is(w.text, "temporary"));
             after_into = !w.quoted && is(w.text, "into");
             true
         });
-        if scanned.is_err() || set_config {
+        if scanned.is_err() {
             return true;
         }
         if (kw("SELECT") || kw("WITH")) && into_temp {

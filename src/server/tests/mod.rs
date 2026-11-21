@@ -12,6 +12,7 @@ fn test_config() -> ProxyConfig {
 }
 
 // ---- single-pass statement facts ----
+mod commit_flush;
 mod ext_set;
 mod mcp_memory;
 mod node_overrides;
@@ -32,6 +33,8 @@ fn watch(session: &ClientSession, keep_session: bool) -> IdleWatch<'_> {
     IdleWatch {
         session,
         keep_session,
+        copy_end_wait: None,
+        drain: false,
     }
 }
 
@@ -243,6 +246,8 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         tx_cache_stage: std::sync::Mutex::new(TxCacheStage::default()),
         #[cfg(feature = "query-cache")]
         cache_unseen_write: std::sync::atomic::AtomicBool::new(false),
+        journal_response_prefix: std::sync::Mutex::new(None),
+        journal_response_pending: std::sync::atomic::AtomicBool::new(false),
         journal: std::sync::Mutex::new(crate::journal_capture::SessionCapture::default()),
         journal_armed: std::sync::atomic::AtomicBool::new(false),
         journal_open: std::sync::atomic::AtomicBool::new(false),
@@ -256,6 +261,18 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         pool_client_id: crate::pool::lease::ClientId::default(),
         #[cfg(feature = "wasm-plugins")]
         plugin_identity: RwLock::new(None),
+        #[cfg(feature = "wasm-plugins")]
+        plugin_context: std::sync::OnceLock::new(),
+        #[cfg(feature = "query-cache")]
+        cache_ineligible: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        parameter_changes: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        cache_startup_namespace: std::sync::OnceLock::new(),
+        branch_blockers: std::sync::atomic::AtomicU8::new(0),
+        branch_home: std::sync::OnceLock::new(),
+        #[cfg(feature = "query-cache")]
+        cache_effective_namespace: std::sync::Mutex::new(None),
         #[cfg(feature = "edge-proxy")]
         edge_ineligible: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "edge-proxy")]
@@ -270,6 +287,7 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         last_write: parking_lot::Mutex::new(None),
         tenant_charge: std::sync::OnceLock::new(),
         cancel_key: std::sync::OnceLock::new(),
+        drain_waker: parking_lot::Mutex::new(None),
     })
 }
 
@@ -317,9 +335,11 @@ async fn test_apply_pre_query_hook_no_plugin_manager_forwards() {
     .encode();
     let original_bytes = original.encode().to_vec();
 
-    let (msg_out, action) = ProxyServer::apply_pre_query_hook(original, &server.state, &session);
+    let (msg_out, action, rewritten) =
+        ProxyServer::apply_pre_query_hook(original, &server.state, &session);
 
     assert!(matches!(action, PreQueryAction::Forward));
+    assert!(!rewritten);
     // The message must survive the hook byte-for-byte when no plugins run.
     assert_eq!(msg_out.encode().to_vec(), original_bytes);
 }
@@ -493,6 +513,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         limits: ResolvedLimits::default(),
         client_slots: None,
         sessions: DashMap::new(),
+        draining: std::sync::atomic::AtomicBool::new(false),
         health: ArcSwap::from_pointee(HashMap::new()),
         health_write: parking_lot::Mutex::new(()),
         live_config: ArcSwap::from_pointee(ProxyConfig::default()),
@@ -787,6 +808,9 @@ fn patroni_provider_makes_the_tracker_authoritative() {
     assert!(matches!(poller, TopologyPoller::Static));
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+mod cache_effects_contract;
+
 // ---- query-cache: which read SQL is safe to cache ----
 
 #[cfg(feature = "query-cache")]
@@ -839,10 +863,10 @@ async fn capture_excludes_async_frames_from_cacheable() {
     ]
     .concat();
 
-    for (bytes, want_cacheable) in [
-        (clean, true),
-        (with_notify, false),
-        (with_param_status, false),
+    for (bytes, want_cacheable, want_context_bypass) in [
+        (clean, true, false),
+        (with_notify, false, false),
+        (with_param_status, false, true),
     ] {
         let (mut backend, mut backend_peer) = pair().await;
         let (client_raw, mut client_peer) = pair().await;
@@ -871,6 +895,21 @@ async fn capture_excludes_async_frames_from_cacheable() {
         .await
         .expect("capture ok");
         assert_eq!(cacheable, want_cacheable, "cacheable flag");
+        assert_eq!(
+            session
+                .cache_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed),
+            want_context_bypass,
+            "a backend ParameterStatus must retire future cache use for this session",
+        );
+        #[cfg(feature = "edge-proxy")]
+        assert_eq!(
+            session
+                .edge_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed),
+            want_context_bypass,
+            "a backend ParameterStatus must retire future edge-cache use for this session",
+        );
         assert_eq!(sent as usize, bytes.len());
         assert_eq!(captured, bytes, "capture is byte-exact");
         assert_eq!(
@@ -2190,6 +2229,30 @@ fn stmt_classifier_dirty_tokens_stay_case_insensitive() {
     assert!(!dirty("SELECT name FROM café"), "plain non-ASCII select");
 }
 
+/// Only `DISCARD ALL` counts as restoring a connection's settings for the
+/// settings proof parked with it (`RESET ALL` keeps the role).
+#[cfg(feature = "pool-modes")]
+#[test]
+fn only_discard_all_restores_the_settings_a_proof_describes() {
+    for sql in [
+        "DISCARD ALL",
+        "discard all;",
+        "  Discard\n  ALL ; ",
+        "DISCARD ALL;;",
+    ] {
+        assert!(ProxyServer::reset_restores_settings(sql), "{sql:?}");
+    }
+    for sql in [
+        "RESET ALL",
+        "DISCARD PLANS",
+        "DISCARD ALL; SET statement_timeout = 0",
+        "SELECT 1",
+        "",
+    ] {
+        assert!(!ProxyServer::reset_restores_settings(sql), "{sql:?}");
+    }
+}
+
 /// `reset_backend` must only report success when the reset query cleanly
 /// completed — no ErrorResponse and an idle ReadyForQuery. A poisoned reset
 /// (error, or a non-idle transaction status) must return `Err` so the caller
@@ -2214,16 +2277,31 @@ async fn reset_backend_rejects_error_and_nonidle() {
     resp.extend_from_slice(&rfq(b'I'));
     server.write_all(&resp).await.unwrap();
     assert!(
-        ProxyServer::reset_backend(
+        !ProxyServer::reset_backend(
             &mut client,
             "DISCARD ALL",
             Duration::from_secs(30),
             usize::MAX
         )
         .await
-        .is_ok(),
-        "clean reset must succeed"
+        .expect("clean reset must succeed"),
+        "no parameter reported"
     );
+
+    // A ParameterStatus in the reply is reported to the caller.
+    let (mut client, mut server) = tokio::io::duplex(4096);
+    let mut resp = frame(b'S', b"TimeZone\0UTC\0");
+    resp.extend_from_slice(&cc);
+    resp.extend_from_slice(&rfq(b'I'));
+    server.write_all(&resp).await.unwrap();
+    assert!(ProxyServer::reset_backend(
+        &mut client,
+        "DISCARD ALL",
+        Duration::from_secs(30),
+        usize::MAX
+    )
+    .await
+    .expect("a reported parameter is no failure"));
 
     // ErrorResponse before RFQ -> Err (connection is poisoned).
     let (mut client, mut server) = tokio::io::duplex(4096);

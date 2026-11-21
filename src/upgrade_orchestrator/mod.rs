@@ -10,9 +10,10 @@
 //!    a deterministic sample) confirms target ≡ source.
 //! 4. **Cutover** — pause client writes via `SwitchoverBuffer`,
 //!    promote the new-version node to primary, swap proxy topology.
-//! 5. **Drain** — replay any in-flight transactions onto the new
-//!    primary via the existing `FailoverReplay` engine.
-//! 6. **Retire** — mark the old-version primary disabled.
+//! 5. **Drain** — with writes paused, wait until the target has
+//!    applied everything the source committed.
+//! 6. **Retire** — resume traffic, replay the writes buffered during the
+//!    pause onto the new primary, drop the replication artefacts.
 //!
 //! ## Status
 //!
@@ -26,15 +27,22 @@
 //!   accumulating the rows checked into `validated_rows`; a mismatch
 //!   fails the job.
 //! - **Stage 4** engages the `SwitchoverBuffer` and runs `pg_promote`.
-//! - **Stage 5** drains buffered writes onto the new primary.
-//! - **Stage 6** releases the buffer and drops the replication
-//!   artefacts.
+//! - **Stage 5** compares the source's `pg_current_wal_lsn()` with the
+//!   `confirmed_flush_lsn` of the subscription's replication slot; the
+//!   job stays in `Cutover` until the target has confirmed it.
+//! - **Stage 6** releases the buffer, replays the buffered writes onto
+//!   the new primary, and drops the replication artefacts.
+//!
+//! Any stage error fails the job; once the buffer is engaged, a failure
+//! also releases it and fails every buffered write explicitly, so client
+//! traffic never stalls and no buffered write is silently dropped.
 //!
 //! The orchestrator does not own the shadow workload (the runner drives
 //! pgbench / production traffic); a per-row checksum on top of the
 //! row-count parity check is a stricter follow-on.
 
 use crate::backend::{BackendClient, BackendConfig, BackendResult, TextValue};
+use crate::failover_replay::pg_lsn_to_u64;
 use crate::switchover_buffer::SwitchoverBuffer;
 use crate::{ProxyError, Result};
 use chrono::{DateTime, Utc};
@@ -218,19 +226,21 @@ impl UpgradeOrchestrator {
     ///    source, `CREATE SUBSCRIPTION` on target.
     /// 2. **StandbyCatchingUp → ShadowExecuting**: poll
     ///    `pg_subscription` on target until subscription is active.
-    /// 3. **ShadowExecuting → Validated**: operator-gated transition;
-    ///    today this advances after a brief settle delay. The
+    /// 3. **ShadowExecuting → Validated**: row-count parity of a
+    ///    deterministic table sample between source and target. The
     ///    runner is expected to call `tick` only when its shadow
     ///    workload says drift is zero.
     /// 4. **Validated → Cutover**: `switchover.start_buffering()`
     ///    pauses client writes; `SELECT pg_promote(true, ...)` on
     ///    the target promotes it to primary.
-    /// 5. **Cutover → Draining**: brief pause for the buffered writes
-    ///    to flush onto the new primary via the proxy's normal
-    ///    routing path (next admin sync picks up the new primary).
+    /// 5. **Cutover → Draining**: once the subscription's replication
+    ///    slot on the source has confirmed the source's current WAL
+    ///    position (writes are paused, so it is final). While the target
+    ///    lags, the job stays in `Cutover`; tick again (or `cancel`).
     /// 6. **Draining → Complete**: `switchover.stop_buffering()`
-    ///    resumes traffic; `DROP SUBSCRIPTION` + `DROP PUBLICATION`
-    ///    clean up the upgrade artefacts.
+    ///    resumes traffic and the buffered writes are replayed onto the
+    ///    new primary; `DROP SUBSCRIPTION` + `DROP PUBLICATION` clean up
+    ///    the upgrade artefacts.
     pub async fn tick(&self, id: Uuid) -> Result<UpgradeJob> {
         let mut snap = self
             .get(id)
@@ -471,11 +481,17 @@ impl UpgradeOrchestrator {
         self.switchover.start_buffering();
         tracing::info!(job = %job.id, "stage 4: switchover_buffer engaged; promoting target");
 
-        let target_cfg = self.backend_for(&job.to_address)?;
+        let target_cfg = match self.backend_for(&job.to_address) {
+            Ok(c) => c,
+            Err(e) => {
+                self.abort_buffer("upgrade cutover failed");
+                return Err(e);
+            }
+        };
         let mut target = BackendClient::connect(&target_cfg).await.map_err(|e| {
             // On connect failure here we MUST release the buffer;
             // otherwise client traffic stalls forever.
-            self.switchover.stop_buffering();
+            self.abort_buffer("upgrade cutover failed");
             ProxyError::FailoverFailed(format!("connect target for promote: {}", e))
         })?;
 
@@ -489,19 +505,19 @@ impl UpgradeOrchestrator {
         let row = match result {
             Ok(r) => r,
             Err(e) => {
-                self.switchover.stop_buffering();
+                self.abort_buffer("upgrade cutover failed");
                 return Err(e);
             }
         };
         let promoted = row
             .as_bool("pg_promote")
             .map_err(|e| {
-                self.switchover.stop_buffering();
+                self.abort_buffer("upgrade cutover failed");
                 ProxyError::FailoverFailed(format!("pg_promote result: {}", e))
             })?
             .unwrap_or(false);
         if !promoted {
-            self.switchover.stop_buffering();
+            self.abort_buffer("upgrade cutover failed");
             return Err(ProxyError::FailoverFailed(
                 "pg_promote returned false".into(),
             ));
@@ -511,53 +527,144 @@ impl UpgradeOrchestrator {
         Ok(UpgradeState::Cutover)
     }
 
-    /// Stage 5: drain — let the buffered writes flush onto the new
-    /// primary. The proxy's primary tracker picks up the new primary
-    /// on its next poll. Brief sleep + advance.
+    /// Stage 5: drain — writes are paused, so the source's current WAL
+    /// position is final; the target has applied everything once the
+    /// subscription's replication slot on the source has confirmed it.
+    /// Returns `Draining` when it has, `Cutover` (unchanged: tick again)
+    /// while the target lags. Any error releases the buffer, failing the
+    /// buffered writes, and fails the job.
     async fn stage_drain(&self, job: &UpgradeJob) -> Result<UpgradeState> {
-        tracing::info!(job = %job.id, "stage 5: draining buffered writes");
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        Ok(UpgradeState::Draining)
+        match self.replication_lag(job).await {
+            Ok(0) => {
+                tracing::info!(job = %job.id, "stage 5: target confirmed the source's WAL");
+                Ok(UpgradeState::Draining)
+            }
+            Ok(lag) => {
+                tracing::info!(job = %job.id, lag_bytes = lag, "stage 5: target still catching up");
+                Ok(UpgradeState::Cutover)
+            }
+            Err(e) => {
+                self.abort_buffer(&format!("upgrade drain failed: {}", e));
+                Err(e)
+            }
+        }
+    }
+
+    /// Bytes of source WAL the subscription has not yet confirmed.
+    async fn replication_lag(&self, job: &UpgradeJob) -> Result<u64> {
+        let slot = publication_name(job.id);
+        let source_cfg = self.backend_for(&job.from_address)?;
+        let mut source = BackendClient::connect(&source_cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect source for drain: {}", e)))?;
+        let probe = async {
+            let current = source
+                .query_scalar("SELECT pg_current_wal_lsn()::text")
+                .await
+                .map_err(|e| ProxyError::FailoverFailed(format!("source WAL position: {}", e)))?;
+            let confirmed = source
+                .query_scalar(&format!(
+                    "SELECT confirmed_flush_lsn::text FROM pg_replication_slots \
+                     WHERE slot_name = '{}'",
+                    slot.replace('\'', "''")
+                ))
+                .await
+                .map_err(|e| {
+                    ProxyError::FailoverFailed(format!(
+                        "replication slot {} on source: {}",
+                        slot, e
+                    ))
+                })?;
+            Ok::<_, ProxyError>((current, confirmed))
+        }
+        .await;
+        source.close().await;
+        let (current, confirmed) = probe?;
+        replication_lag(&slot, current.as_str(), confirmed.as_str())
     }
 
     /// Stage 6: retire — release the switchover buffer (clients
-    /// resume), drop the subscription on target, drop the publication
-    /// on source. Best-effort cleanup; failure here logs but does NOT
-    /// fail the job, because the upgrade itself has already
-    /// succeeded (clients are talking to the new primary).
+    /// resume), replay the writes buffered during the pause onto the new
+    /// primary, then drop the subscription on target and the publication
+    /// on source. A buffered write the new primary refuses is answered
+    /// with that error. If the new primary cannot be reached, every
+    /// buffered write fails explicitly and so does the job. Dropping the
+    /// artefacts is best-effort: a failure is logged (a leftover
+    /// subscription keeps a replication slot, and WAL, on the source)
+    /// but does not fail the job, because the upgrade itself has
+    /// succeeded.
     async fn stage_retire(&self, job: &UpgradeJob) -> Result<UpgradeState> {
         self.switchover.stop_buffering();
         tracing::info!(job = %job.id, "stage 6: switchover_buffer released");
 
-        let pub_name = publication_name(job.id);
-
-        // Best-effort drop on target.
-        if let Ok(target_cfg) = self.backend_for(&job.to_address) {
-            if let Ok(mut target) = BackendClient::connect(&target_cfg).await {
-                let _ = target
-                    .execute(&format!(
-                        "DROP SUBSCRIPTION IF EXISTS {}",
-                        quote_ident(&pub_name)
-                    ))
-                    .await;
-                target.close().await;
+        let target = match self.backend_for(&job.to_address) {
+            Ok(cfg) => BackendClient::connect(&cfg)
+                .await
+                .map_err(|e| ProxyError::FailoverFailed(format!("connect new primary: {}", e))),
+            Err(e) => Err(e),
+        };
+        let target = match target {
+            Ok(t) => t,
+            Err(e) => {
+                self.abort_buffer(&format!("cannot replay buffered writes: {}", e));
+                return Err(e);
             }
+        };
+
+        let before = self.switchover.stats();
+        let target = Arc::new(tokio::sync::Mutex::new(target));
+        self.switchover
+            .drain(|sql, params| {
+                let target = target.clone();
+                async move { replay_buffered(&target, &sql, &params).await }
+            })
+            .await;
+        let after = self.switchover.stats();
+        let failed = (after.failed_replays - before.failed_replays)
+            + (after.timed_out_queries - before.timed_out_queries);
+        if failed > 0 {
+            tracing::warn!(
+                job = %job.id,
+                failed,
+                "stage 6: buffered writes not applied on the new primary (their clients got the error)"
+            );
+        }
+        if let Ok(target) = Arc::try_unwrap(target) {
+            target.into_inner().close().await;
         }
 
-        // Best-effort drop on source.
-        if let Ok(source_cfg) = self.backend_for(&job.from_address) {
-            if let Ok(mut source) = BackendClient::connect(&source_cfg).await {
-                let _ = source
-                    .execute(&format!(
-                        "DROP PUBLICATION IF EXISTS {}",
-                        quote_ident(&pub_name)
-                    ))
-                    .await;
-                source.close().await;
-            }
+        let pub_name = publication_name(job.id);
+        let drop_sub = format!("DROP SUBSCRIPTION IF EXISTS {}", quote_ident(&pub_name));
+        if let Err(e) = self.run_on(&job.to_address, &drop_sub).await {
+            tracing::warn!(job = %job.id, "stage 6: {} on target failed: {}", drop_sub, e);
+        }
+        let drop_pub = format!("DROP PUBLICATION IF EXISTS {}", quote_ident(&pub_name));
+        if let Err(e) = self.run_on(&job.from_address, &drop_pub).await {
+            tracing::warn!(job = %job.id, "stage 6: {} on source failed: {}", drop_pub, e);
         }
 
         Ok(UpgradeState::Complete)
+    }
+
+    /// Run one statement on a fresh connection to `addr`.
+    async fn run_on(&self, addr: &str, sql: &str) -> Result<()> {
+        let cfg = self.backend_for(addr)?;
+        let mut client = BackendClient::connect(&cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect {}: {}", addr, e)))?;
+        let outcome = client.execute(sql).await;
+        client.close().await;
+        outcome
+            .map(|_| ())
+            .map_err(|e| ProxyError::FailoverFailed(e.to_string()))
+    }
+
+    /// Release the switchover buffer after a failure, answering every
+    /// buffered write with `SwitchoverFailed` instead of leaving it
+    /// waiting.
+    fn abort_buffer(&self, reason: &str) {
+        self.switchover.stop_buffering();
+        self.switchover.fail_all(reason);
     }
 
     /// Build a BackendConfig pointing at `addr` ("host:port") using
@@ -585,18 +692,62 @@ impl UpgradeOrchestrator {
             )));
         }
         // Release the safety-critical side effect synchronously so client
-        // traffic can never stall after a cancel. Dropping the replication
+        // traffic can never stall after a cancel, answering each buffered
+        // write with `SwitchoverFailed`. Dropping the replication
         // publication/subscription artefacts is best-effort and left to the
         // operator (or a follow-up retire tick) since this entry point is
         // sync; a Failed job's artefacts are harmless and idempotently
         // re-creatable on a fresh run.
-        self.switchover.stop_buffering();
+        self.abort_buffer(&format!("upgrade cancelled: {}", reason));
         job.fail(format!("cancelled: {}", reason));
         Ok(job.clone())
     }
 }
 
 // --- module-level helpers -----------------------------------------
+
+/// Bytes of WAL between the source's current position and the slot's
+/// confirmed flush position (0 once confirmed). A missing (NULL) or
+/// malformed position is an error: catch-up cannot be confirmed.
+fn replication_lag(slot: &str, current: Option<&str>, confirmed: Option<&str>) -> Result<u64> {
+    let current = current.and_then(pg_lsn_to_u64).ok_or_else(|| {
+        ProxyError::FailoverFailed(format!(
+            "source reported no usable WAL position ({:?})",
+            current
+        ))
+    })?;
+    let confirmed = confirmed.and_then(pg_lsn_to_u64).ok_or_else(|| {
+        ProxyError::FailoverFailed(format!(
+            "replication slot {} has no confirmed flush position ({:?})",
+            slot, confirmed
+        ))
+    })?;
+    Ok(current.saturating_sub(confirmed))
+}
+
+/// Replay one write buffered during the cutover onto the new primary.
+/// Buffered bound parameters carry no type or format information, so a
+/// parameterised write is refused rather than guessed at.
+async fn replay_buffered(
+    target: &tokio::sync::Mutex<BackendClient>,
+    sql: &str,
+    params: &[Vec<u8>],
+) -> Result<()> {
+    if !params.is_empty() {
+        return Err(ProxyError::FailoverFailed(format!(
+            "buffered write has {} bound parameters; the upgrade orchestrator replays only \
+             parameterless statements",
+            params.len()
+        )));
+    }
+    target
+        .lock()
+        .await
+        .execute(sql)
+        .await
+        .map(|_| ())
+        .map_err(|e| ProxyError::FailoverFailed(format!("replay buffered write: {}", e)))
+}
 
 /// Quote a PostgreSQL identifier (publication / subscription name).
 /// Doubles embedded `"` and wraps in `"`.
@@ -653,16 +804,21 @@ fn parse_addr(addr: &str) -> Result<(String, u16)> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_backend;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::tls::default_client_config;
     use crate::backend::TlsMode;
-    use crate::switchover_buffer::BufferConfig;
+    use crate::switchover_buffer::{BufferConfig, BufferResult};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use test_backend::{Reply, ScriptedPg};
 
     fn template() -> BackendConfig {
         BackendConfig {
-            host: "placeholder".into(),
+            host: "template-host".into(),
             port: 0,
             user: "postgres".into(),
             password: None,
@@ -776,6 +932,152 @@ mod tests {
         assert_eq!(r2.state, UpgradeState::Failed);
     }
 
+    /// A job forced into `state`, as if earlier ticks had got it there.
+    fn job_in(orch: &UpgradeOrchestrator, state: UpgradeState, from: &str, to: &str) -> Uuid {
+        let id = orch
+            .start(PlanRequest {
+                from_version: 14,
+                to_version: 17,
+                from_address: from.into(),
+                to_address: to.into(),
+            })
+            .unwrap();
+        orch.jobs.write().get_mut(&id).unwrap().state = state;
+        id
+    }
+
+    #[test]
+    fn replication_lag_compares_wal_positions() {
+        assert_eq!(replication_lag("s", Some("0/20"), Some("0/20")).unwrap(), 0);
+        assert_eq!(
+            replication_lag("s", Some("1/0"), Some("0/FFFFFFF0")).unwrap(),
+            0x10
+        );
+        // A slot ahead of the sampled position has caught up.
+        assert_eq!(replication_lag("s", Some("0/10"), Some("0/20")).unwrap(), 0);
+        let err = replication_lag("slot_x", Some("0/10"), None).unwrap_err();
+        assert!(err.to_string().contains("slot_x"), "{err}");
+        assert!(replication_lag("s", Some("garbage"), Some("0/10")).is_err());
+        assert!(replication_lag("s", None, Some("0/10")).is_err());
+    }
+
+    /// Stage 5 stays in `Cutover` while the slot lags and advances once
+    /// it has confirmed the source's WAL position.
+    #[tokio::test]
+    async fn drain_waits_for_the_slot_to_confirm_the_source_wal() {
+        let caught_up = Arc::new(AtomicBool::new(false));
+        let flag = caught_up.clone();
+        let pg = ScriptedPg::spawn(move |q| {
+            if q.contains("pg_current_wal_lsn") {
+                Reply::Rows(vec![Some("0/20".into())])
+            } else if q.contains("confirmed_flush_lsn") {
+                let lsn = if flag.load(Ordering::SeqCst) {
+                    "0/20"
+                } else {
+                    "0/10"
+                };
+                Reply::Rows(vec![Some(lsn.into())])
+            } else {
+                Reply::Error(format!("unexpected: {q}"))
+            }
+        })
+        .await;
+        let orch = UpgradeOrchestrator::new(switchover(), template());
+        let id = job_in(&orch, UpgradeState::Cutover, &pg.address(), &pg.address());
+
+        let job = orch.tick(id).await.unwrap();
+        assert_eq!(job.state, UpgradeState::Cutover, "{:?}", job.error);
+        caught_up.store(true, Ordering::SeqCst);
+        let job = orch.tick(id).await.unwrap();
+        assert_eq!(job.state, UpgradeState::Draining, "{:?}", job.error);
+        let slot = publication_name(id);
+        assert!(pg.seen().iter().any(|q| q.contains(&slot)));
+    }
+
+    /// Stage 5 no longer advances on a timer: without a reachable source
+    /// it fails the job, releases the buffer and fails the buffered write.
+    #[tokio::test]
+    async fn drain_without_reachable_source_fails_closed() {
+        let buffer = switchover();
+        let orch = UpgradeOrchestrator::new(buffer.clone(), template());
+        let id = job_in(&orch, UpgradeState::Cutover, "127.0.0.1:1", "127.0.0.1:2");
+        buffer.start_buffering();
+        let rx = buffer
+            .buffer_query("INSERT INTO t VALUES (1)".into(), vec![], 1)
+            .unwrap();
+
+        let job = orch.tick(id).await.unwrap();
+        assert_eq!(job.state, UpgradeState::Failed);
+        assert!(job.error.unwrap().contains("connect source for drain"));
+        assert!(!buffer.is_buffering());
+        assert!(matches!(rx.await.unwrap(), BufferResult::SwitchoverFailed));
+    }
+
+    /// Stage 6 replays the buffered writes onto the new primary (refusing
+    /// a parameterised one explicitly) and drops the artefacts.
+    #[tokio::test]
+    async fn retire_replays_buffered_writes_on_the_new_primary() {
+        let pg = ScriptedPg::spawn(|_| Reply::Command("OK")).await;
+        let buffer = switchover();
+        let orch = UpgradeOrchestrator::new(buffer.clone(), template());
+        let id = job_in(&orch, UpgradeState::Draining, &pg.address(), &pg.address());
+        buffer.start_buffering();
+        let plain = buffer
+            .buffer_query("INSERT INTO t VALUES (1)".into(), vec![], 1)
+            .unwrap();
+        let bound = buffer
+            .buffer_query("INSERT INTO t VALUES ($1)".into(), vec![b"2".to_vec()], 2)
+            .unwrap();
+
+        let job = orch.tick(id).await.unwrap();
+        assert_eq!(job.state, UpgradeState::Complete, "{:?}", job.error);
+        assert!(!buffer.is_buffering());
+        assert!(matches!(plain.await.unwrap(), BufferResult::Success));
+        match bound.await.unwrap() {
+            BufferResult::Error(e) => assert!(e.contains("bound parameters"), "{e}"),
+            other => panic!("expected an explicit error, got {other:?}"),
+        }
+        let name = publication_name(id);
+        assert_eq!(
+            pg.seen(),
+            vec![
+                "INSERT INTO t VALUES (1)".to_string(),
+                format!("DROP SUBSCRIPTION IF EXISTS \"{name}\""),
+                format!("DROP PUBLICATION IF EXISTS \"{name}\""),
+            ]
+        );
+    }
+
+    /// Stage 6 with the new primary unreachable fails every buffered
+    /// write and the job instead of reporting completion.
+    #[tokio::test]
+    async fn retire_without_reachable_target_fails_closed() {
+        let buffer = switchover();
+        let orch = UpgradeOrchestrator::new(buffer.clone(), template());
+        let id = job_in(&orch, UpgradeState::Draining, "127.0.0.1:1", "127.0.0.1:2");
+        buffer.start_buffering();
+        let rx = buffer
+            .buffer_query("INSERT INTO t VALUES (1)".into(), vec![], 1)
+            .unwrap();
+
+        let job = orch.tick(id).await.unwrap();
+        assert_eq!(job.state, UpgradeState::Failed);
+        assert!(job.error.unwrap().contains("connect new primary"));
+        assert!(matches!(rx.await.unwrap(), BufferResult::SwitchoverFailed));
+    }
+
+    #[tokio::test]
+    async fn cancel_fails_buffered_writes() {
+        let buffer = switchover();
+        let orch = UpgradeOrchestrator::new(buffer.clone(), template());
+        let id = job_in(&orch, UpgradeState::Cutover, "a:1", "b:2");
+        buffer.start_buffering();
+        let rx = buffer.buffer_query("INSERT 1".into(), vec![], 1).unwrap();
+        orch.cancel(id, "operator request").unwrap();
+        assert!(!buffer.is_buffering());
+        assert!(matches!(rx.await.unwrap(), BufferResult::SwitchoverFailed));
+    }
+
     #[tokio::test]
     async fn cancel_marks_failed_with_reason() {
         let orch = UpgradeOrchestrator::new(switchover(), template());
@@ -868,7 +1170,7 @@ mod tests {
     fn source_conninfo_includes_credentials() {
         let cfg = template();
         let s = source_conninfo(&cfg);
-        assert!(s.contains("host=placeholder"));
+        assert!(s.contains("host=template-host"));
         assert!(s.contains("port=0"));
         assert!(s.contains("user=postgres"));
         // No password / database in the test template.

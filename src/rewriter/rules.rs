@@ -219,9 +219,6 @@ pub enum AstPattern {
     /// DDL statement (CREATE, ALTER, DROP)
     Ddl,
 
-    /// N+1 query pattern
-    NPlusOne { table: String },
-
     /// Full table scan
     FullTableScan,
 
@@ -341,6 +338,10 @@ impl Transformation {
 }
 
 /// Condition for rule application
+///
+/// Every condition is evaluated against the query text alone. Conditions on
+/// session variables, client type or schema contents are not offered: the
+/// rewriter has no session, client or schema context to evaluate them with.
 #[derive(Debug, Clone)]
 pub enum Condition {
     /// Query has no LIMIT clause
@@ -351,15 +352,6 @@ pub enum Condition {
 
     /// Query has SELECT *
     HasSelectStar,
-
-    /// Session variable check
-    SessionVar { name: String, exists: bool },
-
-    /// Client type check
-    ClientType { client_type: String },
-
-    /// Table exists in schema
-    TableExists { table: String },
 
     /// All conditions must match
     And(Vec<Condition>),
@@ -385,21 +377,6 @@ impl Condition {
     /// Has SELECT *
     pub fn has_select_star() -> Self {
         Self::HasSelectStar
-    }
-
-    /// Session variable exists
-    pub fn session_var(name: impl Into<String>) -> Self {
-        Self::SessionVar {
-            name: name.into(),
-            exists: true,
-        }
-    }
-
-    /// Client type matches
-    pub fn client_type(client_type: impl Into<String>) -> Self {
-        Self::ClientType {
-            client_type: client_type.into(),
-        }
     }
 
     /// AND conditions

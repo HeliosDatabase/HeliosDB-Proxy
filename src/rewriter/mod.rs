@@ -131,9 +131,6 @@ impl QueryRewriter {
         let parsed = self.parser.parse(query)?;
         let fingerprint = parsed.fingerprint();
 
-        // Check cache for previously rewritten query
-        // (In production, add caching by fingerprint)
-
         // Match rules
         let rules = self.rules.read();
         let matcher = self.matcher.read();
@@ -306,19 +303,6 @@ impl QueryRewriter {
                 let upper = query.to_uppercase();
                 upper.contains("SELECT *") || upper.contains("SELECT  *")
             }
-            Condition::SessionVar { name: _, exists } => {
-                // In production, check session variables
-                // For now, always return true if exists is expected
-                *exists
-            }
-            Condition::ClientType { client_type: _ } => {
-                // In production, check client metadata
-                true
-            }
-            Condition::TableExists { table: _ } => {
-                // In production, check schema cache
-                true
-            }
             Condition::And(conditions) => {
                 conditions.iter().all(|c| self.evaluate_condition(c, query))
             }
@@ -370,24 +354,6 @@ impl QueryRewriterBuilder {
     /// Add multiple rules
     pub fn rules(mut self, rules: Vec<RewriteRule>) -> Self {
         self.config.rules.extend(rules);
-        self
-    }
-
-    /// Enable SELECT * expansion
-    pub fn expand_select_star(mut self, enabled: bool) -> Self {
-        self.config.expand_select_star = enabled;
-        self
-    }
-
-    /// Add default LIMIT to queries
-    pub fn add_default_limit(mut self, enabled: bool) -> Self {
-        self.config.add_default_limit = enabled;
-        self
-    }
-
-    /// Set default LIMIT value
-    pub fn default_limit(mut self, limit: u32) -> Self {
-        self.config.default_limit = limit;
         self
     }
 

@@ -98,20 +98,34 @@ tr_mode    = "session"
 # List your own provably pure functions to make reads calling them eligible.
 # tr_read_functions = ["my_pure_udf", "tenant_scope"]
 
+# Legacy FunctionCall (fastpath) messages: libpq lo_*, JDBC LargeObject, pg_dump
+# of large objects. They carry a function OID and no SQL, so plugins, rewrite
+# rules, tenant row filters and anomaly detection never see them.
+#   "large-objects" (default) — forward PostgreSQL's built-in large-object
+#       functions as admitted requests on the primary; refuse the rest (0A000).
+#   "any"    — forward every function OID; each call retires all cached results
+#       and pins the session's reads to the primary.
+#   "refuse" — refuse every FunctionCall (0A000).
+function_call = "large-objects"
+
 # Seconds to wait for a new primary during failover before returning an error.
 write_timeout_secs = 30
+
+# Bound of the SIGTERM / SIGINT shutdown drain and the SIGUSR2 binary-handoff
+# drain (env override HELIOS_DRAIN_TIMEOUT_SECS). Listeners close, /health/ready
+# answers 503, and each session ends with FATAL 57P01 once nothing of it is in
+# flight; at the timeout what is still open is cut. Keep the supervisor's stop
+# grace period (docker stop -t, terminationGracePeriodSeconds, TimeoutStopSec)
+# longer than this.
+# shutdown_drain_timeout_secs = 60
 
 # =============================================================================
 # LIMITS — Operational safety bounds & timeouts (PG-wire data path)
 # =============================================================================
-# Every key below was previously a hardcoded constant in the proxy. The values
-# shown are the built-in defaults, so leaving the whole [limits] block out (or
-# omitting any single key) is byte-for-byte identical to the historical
-# behaviour. Every value MUST be > 0 — a 0 disables a safety bound rather than
-# meaning "unbounded", so the proxy refuses to start with any 0 here. Timeouts
-# are whole seconds; counts/bytes are plain integers. The two OPT-IN keys at the
-# end of the block (max_client_connections, client_idle_timeout_secs) are the
-# exception: there 0 is the default and means "off".
+# Values shown are the built-in defaults; omitted keys keep their defaults.
+# Timeouts are whole seconds unless the key ends in _ms; counts/bytes are plain
+# integers. Required safety bounds must be positive. Optional ceilings and
+# deadlines documented below use 0 to mean disabled or unlimited.
 #
 # [limits]
 # # Capacity of the query-cancellation key map (BackendKeyData -> backend addr).
@@ -191,6 +205,10 @@ write_timeout_secs = 30
 # # left idle inside an open transaction is terminated by this timeout too. Read
 # # once at startup.
 # client_idle_timeout_secs = 0
+# # Longest pause in COPY input, including a partial frame and the final
+# # extended Sync after backend completion. Backend COPY processing time is
+# # excluded. 0 = off; read once at startup.
+# copy_idle_timeout_secs = 0
 # # Bounded fair-admission queue (H-05): when max_client_connections is reached,
 # # a new connection waits up to this many seconds for a permit (FIFO) before
 # # being refused with 53300. 0 (default) refuses immediately. Read once at
@@ -403,9 +421,13 @@ enabled = true
 # =============================================================================
 
 [cache]
+# Cache arbitrary backend reads only under an explicit effects/dependency contract.
+trust_backend_read_effects = false
 # Unquoted so `${VAR:-default}` expands to a bare TOML boolean (a quoted
 # "${...}" would deserialize as a string and fail the bool field).
 enabled = ${HELIOS_PROXY_CACHE_ENABLED:-true}
+# Bound inferred plus declared cache dependencies; larger sets bypass caching.
+max_dependency_tables = 64
 
 # Hard ceiling, in bytes, on the backend response the proxy will buffer in
 # memory while streaming a cacheable read to the client. The capture is a
@@ -427,12 +449,17 @@ enabled = ${HELIOS_PROXY_CACHE_ENABLED:-true}
 # on /metrics/prometheus (and `oversize_rejected` in the edge cache stats) to
 # see how often reads bypass the caches on size grounds.
 max_cacheable_response_bytes = 4194304
+# backend_context_immutable = false  # true requires immutable effective backend settings
+# proof_ttl_ms = 1000                # reuse a connection's settings proof this long; 0 = every read
+# extended_protocol = "hint"         # extended-protocol reads: "hint" = statements carrying /*helios:cache=on*/, "on" = all, "off" = none
+# max_backend_context_bytes = 524288 # complete SHOW ALL proof, also bounded by limits
 
 # Tier sizes (the defaults shown) and opt-in L2 payload compression. See
 # docs/configuration.md, "Query Cache".
 # l1_max_entries = 500                 # per client connection, LRU
 # l1_max_bytes = 33554432              # per client connection (32 MiB)
 # l2_max_bytes = 268435456             # shared L2 (256 MiB), counted at the stored size
+# l2_evict_headroom_pct = 5           # a full L2 frees this % of l2_max_bytes more per eviction pass
 # "lz4" or "zstd" store L2 payloads of at least l2_compression_min_bytes
 # compressed: more entries fit l2_max_bytes, and every L2 hit pays a
 # decompression (L1 keeps raw bytes). Only worth it when the hot set does not
@@ -537,72 +564,31 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # RATE LIMIT — Query rate and concurrency limiting
 # =============================================================================
 
+# Only these keys exist (`RateLimitToml` in src/config.rs). Needs the
+# rate-limiting feature. Every request costs 1; there are no tenant, cost or
+# priority keys.
 # [rate_limit]
-# enabled             = true
-# default_qps         = 1000          # Default queries per second per key
-# default_burst       = 2000          # Token bucket burst capacity
-# default_concurrency = 100           # Max concurrent queries per key
-#
-# # Action when limit exceeded: reject | warn | queue(5s) | throttle(100ms)
-# exceeded_action     = "reject"
-# retry_after         = true          # Include Retry-After header in errors
-#
-# # Limit scopes
-# user_limits_enabled      = true
-# database_limits_enabled  = true
-# client_ip_limits_enabled = true
-# pattern_limits_enabled   = false    # Per-query-pattern limiting
-#
-# # Overflow queue settings
-# queue_max_wait_secs = 5
-# queue_size          = 1000
-#
-# # Throttle writes when replication lag exceeds this threshold.
-# replication_throttle_threshold_secs = 5
-#
-# # Cost-based estimation (weight expensive queries higher).
-# cost_estimation_enabled = true
-#
-# # Priority multipliers — higher-priority callers get proportionally more QPS.
-# [rate_limit.priority]
-# low      = 0.5
-# normal   = 1.0
-# high     = 2.0
-# critical = 10.0
+# enabled               = true
+# default_qps           = 1000     # token-bucket rate per bucket, enforced as configured
+# default_burst         = 2000     # bucket depth
+# max_concurrent        = 0        # >0: requests in flight per bucket; above it 53400
+# key_by                = "user"   # user | client_ip | database | global
+# window_max_requests   = 0        # >0: optional sliding window: at most this many
+# window_secs           = 60       #     requests per bucket within window_secs
+# cleanup_interval_secs = 60       # idle buckets dropped this often (bounds memory)
 
 # =============================================================================
 # CIRCUIT BREAKER — Per-node failure detection and recovery
 # =============================================================================
 
+# Only these keys exist (`CircuitBreakerToml`). Needs the circuit-breaker
+# feature. Faults are counted in a 30 s window; the adaptive threshold is not
+# configurable.
 # [circuit_breaker]
-# failure_threshold          = 5     # Failures in window to trip breaker
-# failure_window_secs        = 30    # Sliding failure window
-# cooldown_secs              = 10    # Time in open state before half-open probe
-# half_open_success_threshold = 3    # Successes in half-open to close breaker
-# half_open_max_probes       = 2     # Concurrent probes in half-open
-# adaptive_enabled           = false # Adaptive thresholds based on history
-#
-# # Failure conditions
-# [circuit_breaker.failure_conditions]
-# timeout_secs           = 5
-# slow_threshold_secs    = 2        # Slow responses count as failures
-# ignore_transient       = true     # Ignore retryable errors
-# count_connection_errors = true
-# count_timeouts         = true
-# error_codes            = [
-#     "08001", "08004", "08006",    # Connection failures
-#     "57P01", "57P02", "57P03",    # Server shutdown / crash
-#     "XX000", "XX001", "XX002",    # Internal / corruption
-# ]
-#
-# # Sync mode-specific thresholds (tighter for sync standbys).
-# [circuit_breaker.sync_modes]
-# sync_threshold     = 3
-# sync_cooldown_secs = 5
-# semisync_threshold     = 5
-# semisync_cooldown_secs = 10
-# async_threshold        = 10
-# async_cooldown_secs    = 30
+# enabled           = true
+# failure_threshold = 5    # faults in the window that open a node's circuit
+# open_secs         = 10   # then requests are admitted as half-open probes (<= 2 at once)
+# success_threshold = 3    # successful probes that close it; a failed probe reopens it
 
 # =============================================================================
 # ANALYTICS — Query analytics, slow query log, and pattern detection
@@ -689,42 +675,39 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # event_buffer_size      = 1024      # Max events kept in the in-memory ring buffer (>= 1)
 # emit_novel_queries     = true      # Emit first-seen query fingerprints as info events
 # max_seen_fingerprints  = 100000    # Cap on the novel-query fingerprint set before reset (>= 1)
+# max_auth_windows       = 10000     # Cap on (user, address) failed-auth counts kept at once (>= 1)
 
 # =============================================================================
 # MULTI-TENANCY — Tenant isolation and per-tenant resource limits
 # =============================================================================
 
+# Build with multi-tenancy. Identity is an exact startup parameter, not a
+# username prefix or JWT claim. Authenticate it at a trusted application boundary;
+# use backend privileges/RLS as the security boundary. Applied at startup; a
+# SIGHUP can only resize caps and byte budgets that tenants already have.
 # [multi_tenancy]
-# enabled               = false
-# allow_unknown_tenants = false
-# auto_create_tenants   = false
-# max_tenants           = 1000
-# cross_tenant_analytics = false
-# # admin_user_pattern   = "admin@*"
+# enabled = true
+# identify_by = "application_name"  # Or "database", "user", another startup key
+# tenants = ["acme", "widgetco"]
+# tenant_column = "tenant_id"
+# tenant_tables = ["orders", "products"]
+# unknown_tenant = "refuse"         # "passthrough" keeps 2.2 behaviour
+# refused_functions = ["dblink", "dblink_exec", "lo_import", "lo_export", "pg_read_file"]
+#                                   # default: the XML exports, dblink*, lo_import/lo_export,
+#                                   # pg_read_file, pg_read_binary_file (see docs)
+# max_clients_per_tenant = 20
+# max_active_queries_per_tenant = 4
+# active_query_wait_ms = 5000
+# idle_permit_timeout_ms = 60000
+# max_replay_bytes_per_tenant = 8388608
+# max_journal_bytes_per_tenant = 67108864
 #
-# # How to identify which tenant a request belongs to:
-# #   header        — read from HTTP header (X-Tenant-Id)
-# #   username_prefix — parse "tenant.user" usernames (separator = '.')
-# #   jwt_claim     — extract from JWT token claim
-# #   database_name — map database name to tenant
-# #   sql_context   — SET helios.tenant_id = '...'
-# [multi_tenancy.identification]
-# method      = "header"
-# header_name = "X-Tenant-Id"
-# # separator = "."            # For username_prefix method
-# # claim_name = "tenant_id"   # For jwt_claim method
-#
-# # Example tenant definition:
-# # [[multi_tenancy.tenants]]
-# # id         = "acme"
-# # name       = "Acme Corp"
-# # isolation  = "schema"       # database | schema | row | branch
-# # database   = "shared_db"
-# # schema     = "acme"
-# # max_connections = 50
-# # qps_limit  = 1000
-# # read_only  = false
-# # allow_ddl  = false
+# [multi_tenancy.tenant_max_clients]
+# acme = 50
+# [multi_tenancy.tenant_max_active_queries]
+# acme = 8
+# [multi_tenancy.tenant_max_journal_bytes]
+# acme = 134217728
 
 # =============================================================================
 # AUTH — Client authentication
@@ -748,14 +731,18 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 
 # [plugins]
 # enabled       = false
-# plugin_dir    = "/etc/heliosproxy/plugins"   # scanned for *.wasm at startup
-# hot_reload    = false                        # watch plugin_dir and reload changed plugins
-# memory_limit_mb = 64                         # memory per plugin instance, MB
+# plugin_dir    = "/etc/heliosproxy/plugins"   # *.wasm (+ .sig/.yaml/.json sidecars) and *.tar.gz, loaded at startup, SIGHUP, POST /plugins/reload
+# hot_reload    = false                        # also rescan plugin_dir (and trust_root) every hot_reload_interval_ms
+# hot_reload_interval_ms = 1000                # >= 100
+# hot_reload_debounce_ms = 500                 # a change must be stable this long before hot reload applies it
+# max_artefact_bytes = 67108864                # largest plugin file / decompressed .tar.gz content
+# memory_limit_mb = 64                         # linear-memory limit of each hook call, MB
 # timeout_ms    = 100                          # execution timeout per hook call
-# max_plugins   = 20
+# max_plugins   = 20                           # plugins loaded at once
 # fuel_metering = true                         # bound CPU per call
 # fuel_limit    = 1000000
-# # trust_root  = "/etc/heliosproxy/trust"     # Ed25519 *.pub dir: every .wasm then needs a verifying .sig
+# # trust_root  = "/etc/heliosproxy/trust"     # Ed25519 trust root: *.pub dir, one key file, or 64 hex digits; every plugin must then be signed
+# # require_signed_manifest = false            # with trust_root: only .tar.gz artefacts whose manifest.sig verifies
 # kv_max_value_bytes     = 65536       # Max bytes per plugin-KV key OR value (kv_set / PUT /admin/kv); 0 = unlimited
 # kv_max_keys_per_plugin = 1024        # Max distinct keys per plugin KV namespace; 0 = unlimited
 # kv_max_plugins         = 256         # Max distinct plugin KV namespaces (bounds PUT /admin/kv namespace growth); 0 = unlimited
@@ -795,6 +782,8 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # max_result_bytes = 16777216
 
 # [mcp]
+# Vouch separately for hidden read effects and equivalent pooled backend contexts.
+# trust_backend_read_effects = false
 # # Result caps for the MCP gateway's query / list_tables / explain tools (defaults shown).
 # # Rows past max_result_rows, or cell bytes past max_result_bytes, are cut and the
 # # tool result is marked truncated (structuredContent.truncated = true).
@@ -837,3 +826,19 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # [[mcp.principals]]
 # id    = "etl-agent"            # [A-Za-z0-9_.-]{1,64}, unique; "default" is reserved
 # token = "${MCP_ETL_TOKEN}"     # unique, non-empty; never logged
+
+# =============================================================================
+# BRANCH — branch databases: provisioning (/api/branch) and branch routing
+# =============================================================================
+
+# [branch]
+# enabled          = false               # /api/branch provisions CREATE DATABASE <branch> TEMPLATE <base>
+# backend_host     = "127.0.0.1"
+# backend_port     = 5432
+# admin_user       = "postgres"          # a role with CREATEDB
+# # admin_password = "${PGPASSWORD}"
+# admin_database   = "postgres"          # maintenance database for CREATE/DROP DATABASE
+# base_database    = "postgres"          # template when a request omits `base`
+# route_enabled    = false               # a branch= hint / route plugin answer moves the session (else 42000)
+# route_mode       = "database"          # "database" (PostgreSQL) or "nano" (<base>@<name>)
+# route_allow      = []                  # branch names sessions may move to; empty = any valid name

@@ -316,7 +316,7 @@ impl WorkloadClassifier {
         workload
     }
 
-    /// Simplified classify method for string queries
+    /// Classify a query string; same as [`Self::classify`].
     pub fn classify_query(&self, query: &str, context: &QueryContext) -> WorkloadType {
         self.classify(query, context)
     }

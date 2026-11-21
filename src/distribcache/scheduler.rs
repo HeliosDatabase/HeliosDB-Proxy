@@ -29,7 +29,9 @@ pub struct ScheduledQuery {
 pub enum ScheduleResult {
     /// Execute immediately
     Execute { priority: QueryPriority },
-    /// Queue for later execution
+    /// Queued behind the workload's concurrency limit. The query is handed
+    /// back, ready to run, by [`WorkloadScheduler::mark_complete`] for the
+    /// same workload once it reaches the front of the queue.
     Queued { position: usize },
     /// Reject due to resource constraints
     Rejected { reason: String },
@@ -349,14 +351,22 @@ impl WorkloadScheduler {
         self.stats.current_active.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Mark a query as complete
-    pub fn mark_complete(&self, workload: WorkloadType) {
-        if let Some(queue) = self.queues.get(&workload) {
-            let q = queue.read().unwrap();
-            q.active.fetch_sub(1, Ordering::Relaxed);
+    /// Mark a query as complete. When a query of the same workload is
+    /// queued, it takes the freed slot: it is dequeued, counted as active and
+    /// returned for the caller to execute now.
+    #[must_use = "a returned query was dequeued and must be executed"]
+    pub fn mark_complete(&self, workload: WorkloadType) -> Option<ScheduledQuery> {
+        let next = self.queues.get(&workload).and_then(|queue| {
+            let mut q = queue.write().unwrap();
+            saturating_dec(&q.active);
             q.total_processed.fetch_add(1, Ordering::Relaxed);
+            q.pending.pop_front()
+        });
+        saturating_dec(&self.stats.current_active);
+        if let Some(query) = &next {
+            self.mark_active(&query.workload_type);
         }
-        self.stats.current_active.fetch_sub(1, Ordering::Relaxed);
+        next
     }
 
     /// Get workload distribution
@@ -398,6 +408,22 @@ impl WorkloadScheduler {
             total_rejected: self.stats.total_rejected.load(Ordering::Relaxed),
             current_active: self.stats.current_active.load(Ordering::Relaxed),
             policy: self.policy,
+        }
+    }
+}
+
+/// Decrement a gauge without wrapping below zero.
+fn saturating_dec(gauge: &AtomicU32) {
+    let mut current = gauge.load(Ordering::Relaxed);
+    while current > 0 {
+        match gauge.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
         }
     }
 }
@@ -473,7 +499,50 @@ mod tests {
         scheduler.schedule(query);
         assert_eq!(scheduler.stats().current_active, 1);
 
-        scheduler.mark_complete(WorkloadType::OLTP);
+        assert!(scheduler.mark_complete(WorkloadType::OLTP).is_none());
+        assert_eq!(scheduler.stats().current_active, 0);
+        // An extra completion must not wrap the gauge.
+        assert!(scheduler.mark_complete(WorkloadType::OLTP).is_none());
+        assert_eq!(scheduler.stats().current_active, 0);
+    }
+
+    /// A queued query is released, in order, when a slot frees up.
+    #[test]
+    fn test_queued_query_is_released_on_complete() {
+        let config = DistribCacheConfig {
+            max_concurrent_oltp: 1,
+            ..Default::default()
+        };
+        let scheduler = WorkloadScheduler::new(config);
+        let query = |id| ScheduledQuery {
+            id,
+            workload_type: WorkloadType::OLTP,
+            timestamp: std::time::Instant::now(),
+        };
+
+        assert!(matches!(
+            scheduler.schedule(query(1)),
+            ScheduleResult::Execute { .. }
+        ));
+        assert!(matches!(
+            scheduler.schedule(query(2)),
+            ScheduleResult::Queued { .. }
+        ));
+        assert!(matches!(
+            scheduler.schedule(query(3)),
+            ScheduleResult::Queued { .. }
+        ));
+
+        let next = scheduler
+            .mark_complete(WorkloadType::OLTP)
+            .expect("query 2");
+        assert_eq!(next.id, 2);
+        assert_eq!(scheduler.stats().current_active, 1);
+        let next = scheduler
+            .mark_complete(WorkloadType::OLTP)
+            .expect("query 3");
+        assert_eq!(next.id, 3);
+        assert!(scheduler.mark_complete(WorkloadType::OLTP).is_none());
         assert_eq!(scheduler.stats().current_active, 0);
     }
 

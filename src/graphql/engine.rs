@@ -504,7 +504,7 @@ impl GraphQLEngine {
             }
         };
 
-        // 6. Execute SQL (mock for now - would use actual database connection)
+        // 6. Execute SQL against the attached backend (an error without one)
         let results = match self.execute_queries(&sql_queries, &context).await {
             Ok(r) => r,
             Err(e) => {
@@ -535,8 +535,8 @@ impl GraphQLEngine {
 
     /// Parse a GraphQL query string
     fn parse(&self, query: &str) -> Result<ParsedDocument, GraphQLError> {
-        // Simple parser for basic queries
-        // In production, would use a proper GraphQL parser
+        // Hand-written parser for the GraphQL subset this engine supports
+        // (operation type and name, nested selections, aliases, arguments).
         let query = query.trim();
 
         // Detect operation type
@@ -796,14 +796,19 @@ impl GraphQLEngine {
         self.validator.validate(document, &self.schema)
     }
 
-    /// Check authorization
+    /// Per-operation authorization hook of the engine.
+    ///
+    /// The engine itself performs no per-field or per-operation access
+    /// control and admits every document. Access control is the embedding
+    /// gateway's job: the proxy's GraphQL gateway (`graphql_gateway`)
+    /// checks the bearer token and applies the `gateway_policy` request,
+    /// tenant and statement policies before and during execution; an
+    /// embedder using the engine directly must do the same.
     fn authorize(
         &self,
         _document: &ParsedDocument,
         _context: &ExecutionContext,
     ) -> Result<(), GraphQLError> {
-        // Authorization checks would go here
-        // For now, allow all queries
         Ok(())
     }
 
@@ -923,24 +928,32 @@ impl GraphQLEngine {
 
     /// Execute the generated SQL against the configured backend, returning one
     /// vector of row-objects (`{column: value}`) per query. With no backend
-    /// attached the engine returns empty result sets.
+    /// attached ([`GraphQLEngine::with_backend`]) any query is refused with an
+    /// error rather than answered with fabricated empty results.
     async fn execute_queries(
         &self,
         queries: &[super::SqlQuery],
         context: &ExecutionContext,
     ) -> Result<Vec<Vec<serde_json::Value>>, GraphQLError> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
         let Some(bcfg) = self.backend.clone() else {
-            return Ok(queries.iter().map(|_| Vec::new()).collect());
+            return Err(GraphQLError::internal(NO_BACKEND_ERROR));
         };
         use crate::backend::BackendClient;
 
         let node = format!("{}:{}", bcfg.host, bcfg.port);
         let mut out = Vec::with_capacity(queries.len());
         for q in queries {
-            if let Some(p) = &self.policy {
-                p.check_node(&node)
-                    .map_err(|denied| GraphQLError::internal(denied.to_string()))?;
-            }
+            // Held for this statement: a half-open circuit's probe slot.
+            let _node_admission = match &self.policy {
+                Some(p) => Some(
+                    p.check_node(&node)
+                        .map_err(|denied| GraphQLError::internal(denied.to_string()))?,
+                ),
+                None => None,
+            };
             let sql = match &self.policy {
                 Some(p) => {
                     // H-06: the request's tenant (set by the gateway) gets its
@@ -1096,6 +1109,10 @@ impl Clone for GraphQLEngine {
     }
 }
 
+/// The error a GraphQL engine without a backend answers every query with.
+const NO_BACKEND_ERROR: &str =
+    "no backend attached to the GraphQL engine: attach one with GraphQLEngine::with_backend";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,7 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_execute_shapes_field_key() {
+    async fn execute_without_backend_is_refused() {
         use crate::graphql::introspector::{ColumnDefinition, SchemaIntrospector, TableDefinition};
         let tabledef = TableDefinition {
             name: "gqlitem".to_string(),
@@ -1135,25 +1152,21 @@ mod tests {
             foreign_keys: Vec::new(),
         };
         let schema = SchemaIntrospector::new().build_schema(&[tabledef]);
-        // No backend attached -> offline mode -> empty result sets, but the
-        // pipeline (parse -> plan -> generate -> shape) must still key each
-        // top-level selection under its response key (an array).
+        // No backend attached: the generated SQL cannot run, so the request
+        // fails with a descriptive error instead of fabricated empty results.
         let engine = GraphQLEngine::new(GraphQLConfig::default(), schema);
         let resp = engine
             .execute(GraphQLRequest::new("{ gqlitems { id } }"))
             .await;
+        assert!(resp.data.is_none(), "no data without a backend");
+        let errors = resp.errors.expect("an error without a backend");
+        assert_eq!(errors.len(), 1);
         assert!(
-            resp.errors.is_none(),
-            "unexpected errors: {:?}",
-            resp.errors
+            errors[0].to_string().contains("no backend attached"),
+            "{:?}",
+            errors
         );
-        let data = resp.data.expect("data present");
-        assert!(
-            data.get("gqlitems").is_some(),
-            "missing field key: {}",
-            data
-        );
-        assert!(data["gqlitems"].is_array(), "field should be an array");
+        assert!(engine.execute_sql_for_test("SELECT 1").await.is_err());
     }
 
     #[test]
@@ -1235,18 +1248,6 @@ mod tests {
         assert_eq!(json["message"], "Field not found");
         assert!(json["locations"].is_array());
         assert!(json["path"].is_array());
-    }
-
-    #[tokio::test]
-    async fn test_execute_simple_query() {
-        let engine = create_test_engine();
-        let request = GraphQLRequest::new("{ users { id name } }");
-
-        let response = engine.execute(request).await;
-
-        // Should succeed even with mock results
-        assert!(!response.has_errors());
-        assert!(response.data.is_some());
     }
 
     #[test]

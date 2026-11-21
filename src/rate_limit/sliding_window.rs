@@ -44,7 +44,9 @@ impl SlidingWindow {
         Self {
             window_size,
             max_events,
-            events: Mutex::new(VecDeque::with_capacity(max_events as usize)),
+            // Grown on use: a window per key preallocated for its full
+            // capacity made every idle key cost `max_events` timestamps.
+            events: Mutex::new(VecDeque::new()),
             epoch: Instant::now(),
             total_events: AtomicU64::new(0),
             rejected_events: AtomicU64::new(0),
@@ -64,6 +66,18 @@ impl SlidingWindow {
     /// Create a sliding window for events per hour
     pub fn per_hour(max_events: u32) -> Self {
         Self::new(Duration::from_secs(3600), max_events)
+    }
+
+    /// Whether no event is inside the window any more (expired ones are
+    /// dropped first): such a window is the same as a fresh one.
+    pub fn is_idle(&self) -> bool {
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        let cutoff = now.saturating_sub(self.window_size.as_nanos() as u64);
+        let mut events = self.events.lock();
+        while events.front().is_some_and(|&front| front < cutoff) {
+            events.pop_front();
+        }
+        events.is_empty()
     }
 
     /// Try to record an event

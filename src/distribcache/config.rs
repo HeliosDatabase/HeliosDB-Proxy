@@ -3,7 +3,6 @@
 //! Configuration for multi-tier distributed caching with workload-specific settings.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use super::tiers::{CompressionType, EvictionPolicy};
@@ -11,7 +10,8 @@ use super::tiers::{CompressionType, EvictionPolicy};
 /// Main configuration for Helios-DistribCache
 #[derive(Debug, Clone)]
 pub struct DistribCacheConfig {
-    /// Whether caching is enabled
+    /// Whether caching is enabled. When `false`, lookups and inserts on
+    /// `HeliosDistribCache` fail with `CacheError::TierUnavailable`.
     pub enabled: bool,
 
     // L1 (Hot Cache) configuration
@@ -25,10 +25,9 @@ pub struct DistribCacheConfig {
     // L2 (Warm Cache) configuration
     /// Whether L2 is enabled
     pub l2_enabled: bool,
-    /// L2 cache size in gigabytes
+    /// L2 capacity in gigabytes of compressed entries. L2 lives in process
+    /// memory, so this is a memory budget.
     pub l2_size_gb: u64,
-    /// L2 storage path
-    pub l2_path: PathBuf,
     /// L2 compression type
     pub l2_compression: CompressionType,
 
@@ -67,10 +66,9 @@ pub struct DistribCacheConfig {
     // Invalidation
     /// Invalidation mode
     pub invalidation_mode: InvalidationMode,
-    /// WAL endpoint for streaming invalidation
+    /// WAL endpoint for streaming invalidation (required by
+    /// `InvalidationMode::Hybrid`, rejected by `InvalidationMode::TTL`)
     pub wal_endpoint: Option<String>,
-    /// WAL lag tolerance
-    pub wal_lag_tolerance: Duration,
 
     // Scheduling
     /// Workload scheduling policy
@@ -97,6 +95,11 @@ pub struct DistribCacheConfig {
     /// Heatmap data retention
     pub heatmap_retention: Duration,
 
+    /// Backend query latency assumed when estimating the time a cache hit
+    /// saved (`estimated_time_saved_seconds`): each hit is credited with this
+    /// value minus the measured lookup time. An estimate, not a measurement.
+    pub estimated_backend_latency: Duration,
+
     // AI-specific settings
     /// Maximum conversation turns to cache
     pub max_conversation_turns: usize,
@@ -117,7 +120,6 @@ impl Default for DistribCacheConfig {
             // L2 defaults
             l2_enabled: true,
             l2_size_gb: 5,
-            l2_path: PathBuf::from("/var/lib/heliosproxy/cache"),
             l2_compression: CompressionType::Lz4,
 
             // L3 defaults
@@ -140,9 +142,8 @@ impl Default for DistribCacheConfig {
             max_prefetch_queue: 100,
 
             // Invalidation defaults
-            invalidation_mode: InvalidationMode::Hybrid,
+            invalidation_mode: InvalidationMode::TTL,
             wal_endpoint: None,
-            wal_lag_tolerance: Duration::from_millis(100),
 
             // Scheduling defaults
             scheduling_policy: SchedulingPolicy::WeightedFair,
@@ -160,6 +161,8 @@ impl Default for DistribCacheConfig {
             heatmap_bucket_size: Duration::from_secs(5 * 60),
             heatmap_retention: Duration::from_secs(7 * 24 * 60 * 60),
 
+            estimated_backend_latency: Duration::from_millis(10),
+
             // AI defaults
             max_conversation_turns: 50,
             semantic_similarity_threshold: 0.85,
@@ -174,14 +177,14 @@ impl DistribCacheConfig {
     }
 }
 
-/// Invalidation mode
+/// Invalidation mode. Entry TTLs always apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidationMode {
-    /// TTL-based expiration only
+    /// TTL-based expiration only; no WAL stream (a configured
+    /// `wal_endpoint` is a start error)
     TTL,
-    /// WAL-based invalidation only
-    WAL,
-    /// Both TTL and WAL
+    /// TTL expiration plus WAL-streamed invalidation (`wal_endpoint` is
+    /// required; start fails without it)
     Hybrid,
 }
 
@@ -238,12 +241,6 @@ impl DistribCacheConfigBuilder {
     /// Set L2 cache size in GB
     pub fn l2_size_gb(mut self, size: u64) -> Self {
         self.config.l2_size_gb = size;
-        self
-    }
-
-    /// Set L2 storage path
-    pub fn l2_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.config.l2_path = path.into();
         self
     }
 
@@ -325,9 +322,22 @@ impl DistribCacheConfigBuilder {
         self
     }
 
-    /// Set WAL endpoint
+    /// Set the WAL endpoint and switch to `InvalidationMode::Hybrid`
     pub fn wal_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.config.wal_endpoint = Some(endpoint.into());
+        self.config.invalidation_mode = InvalidationMode::Hybrid;
+        self
+    }
+
+    /// Set the maximum number of queued prefetch requests
+    pub fn max_prefetch_queue(mut self, max: usize) -> Self {
+        self.config.max_prefetch_queue = max;
+        self
+    }
+
+    /// Set the backend latency assumed for time-saved estimates
+    pub fn estimated_backend_latency(mut self, latency: Duration) -> Self {
+        self.config.estimated_backend_latency = latency;
         self
     }
 
@@ -398,6 +408,17 @@ mod tests {
         assert!(!config.l3_enabled);
         assert!(config.prefetch_enabled);
         assert!(config.heatmap_enabled);
+        assert_eq!(config.invalidation_mode, InvalidationMode::TTL);
+        assert!(config.wal_endpoint.is_none());
+    }
+
+    #[test]
+    fn test_wal_endpoint_selects_hybrid_mode() {
+        let config = DistribCacheConfig::builder()
+            .wal_endpoint("127.0.0.1:7000")
+            .build();
+        assert_eq!(config.invalidation_mode, InvalidationMode::Hybrid);
+        assert_eq!(config.wal_endpoint.as_deref(), Some("127.0.0.1:7000"));
     }
 
     #[test]

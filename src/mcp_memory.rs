@@ -891,7 +891,8 @@ impl McpMemory {
             .await
             .map_err(policy_refusal)?;
         let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
-        policy.check_node(&node).map_err(policy_refusal)?;
+        // Held for the call: a half-open circuit's probe slot.
+        let _node_admission = policy.check_node(&node).map_err(policy_refusal)?;
         let _query_permit = policy
             .admit_tenant_query(ctx.tenant)
             .await

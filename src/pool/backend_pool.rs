@@ -46,15 +46,52 @@ pub fn pool_key(node: &str, user: &str, database: &str) -> String {
 /// running on that connection names. `None` when the backend sent none.
 pub type BackendKey = Option<(u32, u32)>;
 
-/// One parked connection.
-struct Parked {
-    stream: TcpStream,
-    parked_at: Instant,
+/// A settings proof taken on a backend connection: the result cache's
+/// namespace for it (`[cache]`), computed from the connection's `SHOW ALL`
+/// and the startup parameters of the session that proved it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsProof {
+    /// The proven namespace.
+    pub namespace: [u8; 32],
+    /// The startup-parameter digest the namespace was computed with. A
+    /// borrower with a different digest proves the connection again.
+    pub startup: [u8; 32],
+    /// When the proof was taken (the borrower applies its own age limit).
+    pub proven_at: Instant,
+}
+
+/// What a borrower may take as known about a parked connection's session
+/// settings without asking the backend again. The default knows nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParkedSettings {
+    /// The connection holds its reset settings (those it started with):
+    /// nothing changed them since it was opened, or a reset that restores
+    /// them (`DISCARD ALL`, `RESET ALL`) ran before it was parked.
+    pub baseline: bool,
+    /// A proof that still describes the connection's settings.
+    pub proof: Option<SettingsProof>,
+    /// The proof kept under `[cache] backend_context_immutable`, which holds
+    /// for the physical connection's life.
+    pub immutable_proof: Option<SettingsProof>,
+}
+
+/// A connection handed to or taken from the pool with what goes with it.
+pub struct PooledConn {
+    /// The authenticated backend socket.
+    pub stream: TcpStream,
     /// The connection's node slot (H-05), kept while it is parked.
-    slot: crate::node_slots::Slot,
+    pub slot: crate::node_slots::Slot,
     /// Handed back with the connection, so the borrower can cancel a
     /// statement it abandons on it.
-    key: BackendKey,
+    pub backend_key: BackendKey,
+    /// What is known about its settings ([`ParkedSettings`]).
+    pub settings: ParkedSettings,
+}
+
+/// One parked connection.
+struct Parked {
+    conn: PooledConn,
+    parked_at: Instant,
 }
 
 /// A bounded set of idle, authenticated backend connections, partitioned by
@@ -84,7 +121,8 @@ pub struct BackendIdlePool {
     /// Parked connections dropped by the idle reaper for exceeding the TTL.
     reaped: AtomicU64,
     /// Connections parked WITHOUT running the reset query because they were
-    /// provably clean (the `skip_clean_reset` conditional-reset optimisation).
+    /// provably clean: the `skip_clean_reset` conditional-reset optimisation,
+    /// or a lease that served only a cache hit.
     resets_skipped: AtomicU64,
     /// Idle connections closed to make room on a backend that refused a new
     /// connection with 53300 (`too_many_connections`).
@@ -142,18 +180,19 @@ impl BackendIdlePool {
         &self,
         key: &str,
     ) -> Option<(TcpStream, crate::node_slots::Slot, BackendKey)> {
+        self.checkout_conn(key)
+            .map(|conn| (conn.stream, conn.slot, conn.backend_key))
+    }
+
+    /// [`Self::checkout_keyed`], also handing back what is known about the
+    /// connection's settings ([`Self::checkin_conn`]).
+    pub fn checkout_conn(&self, key: &str) -> Option<PooledConn> {
         let mut guard = self.idle.get_mut(key)?;
-        while let Some(Parked {
-            stream,
-            slot,
-            key: backend_key,
-            ..
-        }) = guard.pop()
-        {
+        while let Some(Parked { conn, .. }) = guard.pop() {
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
-            if Self::probe_alive(&stream) {
+            if Self::probe_alive(&conn.stream) {
                 self.reuses.fetch_add(1, Ordering::Relaxed);
-                return Some((stream, slot, backend_key));
+                return Some(conn);
             }
             // Peer closed (or desynced) while idle — drop it and try the next.
             self.stale_evicted.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +228,20 @@ impl BackendIdlePool {
         slot: crate::node_slots::Slot,
         backend_key: BackendKey,
     ) -> bool {
+        self.checkin_conn(
+            key,
+            PooledConn {
+                stream,
+                slot,
+                backend_key,
+                settings: ParkedSettings::default(),
+            },
+        )
+    }
+
+    /// [`Self::checkin_keyed`] with what is known about the connection's
+    /// settings, for [`Self::checkout_conn`] to hand back.
+    pub fn checkin_conn(&self, key: &str, conn: PooledConn) -> bool {
         // Global ceiling first — bounds total FDs across all identities. Reserve
         // the slot atomically (fetch_add, inspect the prior value) rather than
         // load-then-act: a plain load outside the lock lets N concurrent
@@ -198,20 +251,18 @@ impl BackendIdlePool {
         if self.total_idle.fetch_add(1, Ordering::Relaxed) >= self.max_total_idle {
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
             self.over_capacity.fetch_add(1, Ordering::Relaxed);
-            return false; // `stream` dropped here → socket closed.
+            return false; // `conn` dropped here → socket closed.
         }
         let mut entry = self.idle.entry(key.to_string()).or_default();
         if entry.len() >= self.max_idle_per_key {
             // Per-key cap reached — release the global slot we reserved.
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
             self.over_capacity.fetch_add(1, Ordering::Relaxed);
-            return false; // `stream` dropped here → socket closed.
+            return false; // `conn` dropped here → socket closed.
         }
         entry.push(Parked {
-            stream,
+            conn,
             parked_at: Instant::now(),
-            slot,
-            key: backend_key,
         });
         self.parked.fetch_add(1, Ordering::Relaxed);
         true
@@ -470,6 +521,44 @@ mod tests {
         assert_eq!(stream.local_addr().unwrap(), keyed_addr);
         assert_eq!(backend_key, Some((7, 1007)));
         assert!(pool.checkout_keyed(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn parked_connections_keep_what_is_known_about_their_settings() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = BackendIdlePool::new(4, 1000);
+        let key = pool_key("db:5432", "u", "d");
+        let (c1, _s1) = live_pair(&listener).await;
+        let (c2, _s2) = live_pair(&listener).await;
+        let proof = SettingsProof {
+            namespace: [1; 32],
+            startup: [2; 32],
+            proven_at: Instant::now(),
+        };
+        let settings = ParkedSettings {
+            baseline: true,
+            proof: Some(proof),
+            immutable_proof: None,
+        };
+        assert!(pool.checkin_conn(
+            &key,
+            PooledConn {
+                stream: c1,
+                slot: None,
+                backend_key: Some((3, 4)),
+                settings,
+            }
+        ));
+        // The keyed API parks with nothing known.
+        assert!(pool.checkin_keyed(&key, c2, None, None));
+
+        let plain = pool.checkout_conn(&key).expect("parked");
+        assert_eq!(plain.settings, ParkedSettings::default());
+        assert!(!plain.settings.baseline);
+        let proven = pool.checkout_conn(&key).expect("parked");
+        assert_eq!(proven.settings, settings);
+        assert_eq!(proven.backend_key, Some((3, 4)));
+        assert_eq!(pool.idle_count(), 0);
     }
 
     #[test]

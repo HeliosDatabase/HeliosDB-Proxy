@@ -1,5 +1,22 @@
 use super::*;
 
+/// The refusal message for a statement naming a tenant table from a session
+/// with no identified tenant (`[multi_tenancy] unknown_tenant = "refuse"`).
+#[cfg(feature = "multi-tenancy")]
+const UNIDENTIFIED_TENANT_REFUSAL: &str =
+    "statement refused: this session has no identified tenant and the statement references a tenant table";
+
+/// The outcome of [`ProxyServer::tenant_statement`].
+#[cfg(feature = "multi-tenancy")]
+pub(super) enum TenantStatement {
+    /// Forwarded as it is.
+    Unchanged,
+    /// Forwarded with the tenant's row filter: this SQL.
+    Filtered(String),
+    /// Never forwarded: answered SQLSTATE 42501 with this reason.
+    Refused(std::borrow::Cow<'static, str>),
+}
+
 /// The longest a rate-limit backpressure sleep lasts (a `Throttled` or
 /// `Queued` verdict, or the pacing of a message that continues an open cycle),
 /// so a misconfiguration can't pin a connection task indefinitely.
@@ -259,16 +276,16 @@ impl ProxyServer {
         }
     }
 
-    /// True when `node`'s circuit is open (avoid it / fast-fail). A half-open
-    /// circuit returns false so a probe query is admitted.
+    /// True when `node`'s circuit would turn a request away now, so reads
+    /// prefer other nodes: open and still in its cooldown, or half-open with
+    /// every probe slot taken. An open circuit whose cooldown has passed
+    /// admits a probe ([`Self::circuit_admit`]).
     #[cfg(feature = "circuit-breaker")]
     pub(super) fn circuit_is_open(state: &Arc<ServerState>, node: &str) -> bool {
         state
             .circuit_breaker
             .as_ref()
-            .map(|cb| {
-                cb.get_breaker(node).get_state() == crate::circuit_breaker::CircuitState::Open
-            })
+            .map(|cb| !cb.get_breaker(node).admits_now())
             .unwrap_or(false)
     }
 
@@ -285,19 +302,34 @@ impl ProxyServer {
         }
     }
 
-    /// If `node`'s circuit is open, build the fast-fail `ErrorResponse` (without
-    /// a trailing `ReadyForQuery` — the caller appends one). `None` when the
-    /// circuit is closed or half-open and the request may proceed.
+    /// Admit a request to `node` through its circuit breaker. `Ok(None)`:
+    /// closed. `Ok(Some(permit))`: the circuit is half-open (its cooldown
+    /// passed) and this request is one of its probes; hold the permit until
+    /// the request is done, its outcome recorded as usual
+    /// ([`Self::circuit_record`]). `Err`: the fast-fail `ErrorResponse`
+    /// (without a trailing `ReadyForQuery`, which the caller appends): open,
+    /// or every probe slot taken.
     #[cfg(feature = "circuit-breaker")]
-    pub(super) fn circuit_fast_fail(state: &Arc<ServerState>, node: &str) -> Option<Vec<u8>> {
-        if Self::circuit_is_open(state, node) {
-            tracing::info!(node = %node, "circuit open — fast-failing");
-            Some(Self::create_error_response(
-                "08006",
-                &format!("circuit open for node {node}: backend temporarily unavailable"),
-            ))
-        } else {
-            None
+    pub(super) fn circuit_admit(
+        state: &Arc<ServerState>,
+        node: &str,
+    ) -> std::result::Result<Option<crate::circuit_breaker::ProbePermit>, Vec<u8>> {
+        let Some(cb) = state.circuit_breaker.as_ref() else {
+            return Ok(None);
+        };
+        match cb.get_breaker(node).admit() {
+            crate::circuit_breaker::Admission::Allowed => Ok(None),
+            crate::circuit_breaker::Admission::Probe(permit) => {
+                tracing::info!(node = %node, "circuit half-open — probing the node");
+                Ok(Some(permit))
+            }
+            crate::circuit_breaker::Admission::Rejected { .. } => {
+                tracing::info!(node = %node, "circuit open — fast-failing");
+                Err(Self::create_error_response(
+                    "08006",
+                    &format!("circuit open for node {node}: backend temporarily unavailable"),
+                ))
+            }
         }
     }
 
@@ -413,6 +445,40 @@ impl ProxyServer {
         query_cache || edge
     }
 
+    /// Whether a result cache may use a backend execution-scope proof for `session`
+    /// outside an explicit transaction: the query cache runs, or the edge
+    /// cache is on and the session is still eligible for it. The relay's
+    /// refusal scans ([`Self::cache_refuses`]) and their counters run only
+    /// then.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn cache_scope_eligible(
+        session: &ClientSession,
+        state: &ServerState,
+        config: &ProxyConfig,
+    ) -> bool {
+        #[cfg(feature = "query-cache")]
+        let query_cache = state.query_cache.is_some()
+            && !session
+                .cache_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "query-cache"))]
+        let query_cache = {
+            let _ = state;
+            false
+        };
+        #[cfg(feature = "edge-proxy")]
+        let edge = config.edge.enabled
+            && !session
+                .edge_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "edge-proxy"))]
+        let edge = {
+            let _ = (session, config);
+            false
+        };
+        query_cache || edge
+    }
+
     /// Whether neither result cache may look up, capture or store the
     /// cacheable read `sql` (the forwarded text), in any tier (L1, L2, L3,
     /// `[edge]`), counting why: it names a system catalog relation
@@ -426,25 +492,85 @@ impl ProxyServer {
     /// a cache would look up.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) fn cache_refuses(state: &ServerState, sql: &str) -> bool {
-        use crate::sql_text::UncacheableText;
-        let counter = if crate::sql_text::names_system_catalog(sql.as_bytes()) {
-            &state.metrics.cache_catalog_skipped
-        } else if let Some(why) = crate::sql_text::uncacheable_text(sql) {
-            match why {
-                UncacheableText::TimeTravelComment => &state.metrics.cache_time_travel_skipped,
-                UncacheableText::AmbiguousText => &state.metrics.cache_ambiguous_skipped,
+        match crate::sql_text::cache_refusal(sql, state.table_exclusions.as_deref()) {
+            None => false,
+            Some(refusal) => {
+                Self::count_cache_refusal(state, refusal);
+                true
             }
-        } else if state
-            .table_exclusions
-            .as_deref()
-            .is_some_and(|exclusions| exclusions.matches(sql))
-        {
-            &state.metrics.cache_excluded
-        } else {
-            return false;
+        }
+    }
+
+    /// Count one read the result cache refused for `refusal`.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn count_cache_refusal(state: &ServerState, refusal: crate::sql_text::CacheRefusal) {
+        use crate::sql_text::CacheRefusal;
+        let counter = match refusal {
+            CacheRefusal::SystemCatalog => &state.metrics.cache_catalog_skipped,
+            CacheRefusal::TimeTravelComment => &state.metrics.cache_time_travel_skipped,
+            CacheRefusal::AmbiguousText => &state.metrics.cache_ambiguous_skipped,
+            CacheRefusal::ExcludedTable => &state.metrics.cache_excluded,
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        true
+    }
+
+    /// Unknown functions, writes (including triggers), and context-control
+    /// statements cannot preserve a shared result cache's execution identity.
+    /// Do not trust the separate operator-extended replay allowlist here.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn cache_context_may_change(sql: &str) -> bool {
+        // A name such as abs/count does not prove which catalog function or
+        // overload the backend resolved. Until that identity is verified,
+        // function-call-shaped reads (and EXPLAIN) must execute natively and
+        // make the session ineligible for later cached results too.
+        static POLICY: std::sync::LazyLock<TrReadPolicy> =
+            std::sync::LazyLock::new(TrReadPolicy::default);
+        let core = crate::protocol::skip_leading_comments(sql);
+        Self::tr_routing_classify(core, &POLICY) != StmtKind::Read
+            || !Self::tr_read_eligible(core, &POLICY)
+    }
+
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) async fn cache_startup_namespace(session: &ClientSession) -> &[u8; 32] {
+        if let Some(namespace) = session.cache_startup_namespace.get() {
+            return namespace;
+        }
+        use sha2::{Digest, Sha256};
+        let vars = session.variables.read().await;
+        if vars.is_empty() {
+            return session.cache_startup_namespace.get_or_init(|| [0; 32]);
+        }
+        let mut sorted: Vec<_> = vars.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut hash = Sha256::new();
+        hash.update(b"helios-query-cache-startup-v1");
+        for (key, value) in sorted {
+            for part in [key, value] {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part.as_bytes());
+            }
+        }
+        session
+            .cache_startup_namespace
+            .get_or_init(|| hash.finalize().into())
+    }
+
+    /// L1 uses raw SQL within a client connection; retire it before changing
+    /// the effective backend namespace (a route, lease or settings change).
+    #[cfg(feature = "query-cache")]
+    pub(super) fn cache_use_namespace(
+        session: &ClientSession,
+        cache: &crate::cache::QueryCache,
+        namespace: [u8; 32],
+    ) {
+        let mut previous = session
+            .cache_effective_namespace
+            .lock()
+            .expect("cache namespace mutex poisoned");
+        if previous.is_some_and(|old| old != namespace) {
+            cache.remove_l1_cache(session.id.as_u64_pair().0);
+        }
+        *previous = Some(namespace);
     }
 
     /// Decide whether a read query is safe to serve from / store in the cache,
@@ -458,7 +584,11 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         is_cacheable_read: bool,
     ) -> Option<crate::cache::CacheContext> {
-        if !is_cacheable_read {
+        if !is_cacheable_read
+            || session
+                .cache_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return None;
         }
         // Never cache mid-transaction (visibility would be wrong).
@@ -483,6 +613,40 @@ impl ProxyServer {
             branch: None,
             connection_id: Some(session.id.as_u64_pair().0),
         })
+    }
+
+    /// What `[multi_tenancy]` row isolation does to one statement of
+    /// `session`, on either protocol: the session's tenant is resolved and
+    /// its row filter injected, or the statement is refused (a shape the
+    /// filter cannot cover; a tenant table named by a session with no
+    /// identified tenant under `unknown_tenant = "refuse"`).
+    #[cfg(feature = "multi-tenancy")]
+    pub(super) async fn tenant_statement(
+        tm: &crate::multi_tenancy::TenantManager,
+        sql: &str,
+        session: &Arc<ClientSession>,
+    ) -> TenantStatement {
+        let ctx = Self::tenant_request_ctx(session).await;
+        match tm.identify_tenant(&ctx) {
+            Some(tenant) => {
+                let res = tm.transform_query(sql, &tenant);
+                if let Some(reason) = res.refusal {
+                    // Never forwarded: a shape the rewrite cannot filter.
+                    TenantStatement::Refused(reason.into())
+                } else if res.transformed {
+                    tracing::debug!(target: "helios::tenant", tenant = %tenant.0, "tenant filter injected");
+                    TenantStatement::Filtered(res.query)
+                } else {
+                    TenantStatement::Unchanged
+                }
+            }
+            // No tenant to filter by: `unknown_tenant = "refuse"` stops a
+            // statement on a tenant table here.
+            None if tm.refuses_unknown_tenant_query(sql) => {
+                TenantStatement::Refused(UNIDENTIFIED_TENANT_REFUSAL.into())
+            }
+            None => TenantStatement::Unchanged,
+        }
     }
 
     /// Build a multi-tenancy `RequestContext` from the session's startup

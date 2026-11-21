@@ -51,7 +51,7 @@ If your binary is elsewhere, edit `~/HDB/Proxy-Demogrounds/.env`:
 NANO_BIN=/absolute/path/to/heliosdb-nano
 ```
 
-The demo scripts do not build Nano automatically because `/home/gpc/HDB/Nano`
+The demo scripts do not build Nano automatically because `the sibling `HDB/Nano` checkout`
 is treated as a canonical checkout. Build or download Nano separately before
 the talk.
 

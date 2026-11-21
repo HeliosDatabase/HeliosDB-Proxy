@@ -30,7 +30,10 @@
 #             as -S:
 #               \set aid random(1, 100000 * :scale)
 #               SELECT abalance FROM pgbench_accounts WHERE aid = :aid /*helios:cache=semantic*/;
-#             (pgbench's default simple protocol is the one the query cache serves.)
+#             (The query cache serves the simple protocol. Prepared and unnamed
+#             extended reads it serves when the statement carries
+#             /*helios:cache=on*/, or all of them with
+#             `[cache] extended_protocol = "on"`.)
 #
 # Each proxy mode's GET /metrics JSON is saved, at the end of its cells, as
 # $OUT/$LABEL-<mode>-metrics.json (e.g. to check `tenant_budgets`).
@@ -62,9 +65,6 @@ OUT="${OUT:-/tmp/bench-usertp}"; mkdir -p "$OUT"
 # warm-up pgbench and the psql probes stay simple.
 case "${PGBENCH_PROTOCOL:-}" in ""|simple|extended|prepared) ;; *) echo "FATAL: PGBENCH_PROTOCOL must be simple, extended or prepared" >&2; exit 2;; esac
 [ -n "${PGBENCH_PROTOCOL:-}" ] && echo "PGBENCH_PROTOCOL=$PGBENCH_PROTOCOL"
-case "${PGBENCH_PROTOCOL:-simple}" in simple) ;; *)
-  [ -n "${READ_SCRIPT:-}" ] && echo "WARN: READ_SCRIPT with PGBENCH_PROTOCOL=$PGBENCH_PROTOCOL measures the extended read path, which the query cache does not serve" >&2;;
-esac
 RUNS_JSON="$OUT/$LABEL-results.json"
 PROXYPID=""
 

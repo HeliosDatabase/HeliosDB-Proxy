@@ -16,24 +16,25 @@
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                     MULTI-TIER CACHE                             │
 //! │  ┌───────────────────────────────────────────────────────────┐  │
-//! │  │ L1: Hot Cache (In-Memory, <100μs)                         │  │
+//! │  │ L1: Hot Cache (in-memory, uncompressed)                   │  │
 //! │  └───────────────────────────────────────────────────────────┘  │
 //! │                          │ miss                                  │
 //! │  ┌───────────────────────────────────────────────────────────┐  │
-//! │  │ L2: Warm Cache (Local SSD, <1ms)                          │  │
+//! │  │ L2: Warm Cache (in-memory, compressed; no disk)           │  │
 //! │  └───────────────────────────────────────────────────────────┘  │
 //! │                          │ miss                                  │
 //! │  ┌───────────────────────────────────────────────────────────┐  │
-//! │  │ L3: Distributed Cache (Mesh, <10ms)                       │  │
+//! │  │ L3: Distributed Cache (peer mesh over TCP)                │  │
 //! │  └───────────────────────────────────────────────────────────┘  │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Features
 //!
-//! - **Multi-Tier Caching**: L1 hot (memory), L2 warm (SSD), L3 distributed (mesh)
+//! - **Multi-Tier Caching**: L1 hot (memory), L2 warm (compressed memory), L3 distributed (mesh)
 //! - **Workload Classification**: OLTP, OLAP, Vector, AI Agent, RAG pipelines
-//! - **Intelligent Prefetching**: Pattern-based and temporal prediction
+//! - **Prefetch Prediction**: Pattern-based and temporal prediction into a
+//!   bounded queue the caller executes ([`HeliosDistribCache::prefetch_queue`])
 //! - **WAL-Based Invalidation**: Real-time cache coherency via WAL streaming
 //! - **Heatmap Analytics**: Visual cache utilization and recommendations
 //! - **AI/Agent Caches**: Conversation context, RAG chunks, tool results, semantic queries
@@ -73,7 +74,6 @@ pub use ai::{
     SemanticCacheStatsSnapshot,
     SemanticEntry,
     SemanticIndex,
-    SemanticIndexConfig,
     SemanticQueryCache,
     SessionTrackingInfo,
     SimilarityResult,
@@ -93,7 +93,7 @@ pub use prefetcher::*;
 pub use scheduler::*;
 pub use tiers::{
     CacheEntry, CacheKey, CacheTier, CompressionType, DistributedCache, EvictionPolicy, HotCache,
-    TierStats, WarmCache,
+    PeerOpReport, ReplicationReport, TierStats, WarmCache,
 };
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -307,7 +307,7 @@ pub struct HeliosDistribCache {
     /// L1 hot cache (in-memory)
     l1_hot: Arc<HotCache>,
 
-    /// L2 warm cache (SSD)
+    /// L2 warm cache (compressed, in memory)
     l2_warm: Arc<WarmCache>,
 
     /// L3 distributed cache (mesh)
@@ -318,6 +318,9 @@ pub struct HeliosDistribCache {
 
     /// WAL-based invalidator
     invalidator: Arc<WalInvalidator>,
+
+    /// WAL processing task started by `start`
+    wal_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 
     /// Cache heatmap analytics
     heatmap: Arc<CacheHeatmap>,
@@ -361,7 +364,6 @@ impl HeliosDistribCache {
 
         let l2_warm = Arc::new(WarmCache::new(
             config.l2_size_gb * 1024 * 1024 * 1024,
-            config.l2_path.clone(),
             config.l2_compression,
         ));
 
@@ -373,14 +375,44 @@ impl HeliosDistribCache {
         let classifier = WorkloadClassifier::new(config.clone());
         let prefetcher = Arc::new(PredictivePrefetcher::new(config.clone()));
         let invalidator = Arc::new(WalInvalidator::new(config.clone()));
-        let heatmap = Arc::new(CacheHeatmap::new());
+        let heatmap = Arc::new(CacheHeatmap::with_window(
+            config.heatmap_bucket_size,
+            config.heatmap_retention,
+        ));
         let scheduler = Arc::new(WorkloadScheduler::new(config.clone()));
 
+        // WAL-streamed changes invalidate every enabled tier.
+        {
+            let l1 = l1_hot.clone();
+            let l2 = config.l2_enabled.then(|| l2_warm.clone());
+            let l3 = config.l3_enabled.then(|| l3_distributed.clone());
+            invalidator.add_callback_sync(Arc::new(move |target: &InvalidationTarget| {
+                l1.invalidate_by_table(&target.table);
+                if let Some(l2) = &l2 {
+                    l2.invalidate_by_table(&target.table);
+                }
+                if let Some(l3) = &l3 {
+                    // Peer acknowledgements are awaited off the WAL loop;
+                    // failures are counted in `l3_invalidation_failures`.
+                    let l3 = l3.clone();
+                    let table = target.table.clone();
+                    tokio::spawn(async move {
+                        let _report = l3.invalidate_table(&table).await;
+                    });
+                }
+            }));
+        }
+
         // AI caches
-        let conversation_cache = Arc::new(ConversationContextCache::new(1000, 50));
+        let conversation_cache = Arc::new(ConversationContextCache::new(
+            1000,
+            config.max_conversation_turns,
+        ));
         let rag_cache = Arc::new(RagChunkCache::new(config.l1_size_mb / 4));
         let tool_cache = Arc::new(ToolResultCache::new());
-        let semantic_cache = Arc::new(SemanticQueryCache::new(0.85));
+        let semantic_cache = Arc::new(SemanticQueryCache::new(
+            config.semantic_similarity_threshold,
+        ));
 
         Self {
             classifier,
@@ -389,6 +421,7 @@ impl HeliosDistribCache {
             l3_distributed,
             prefetcher,
             invalidator,
+            wal_task: parking_lot::Mutex::new(None),
             heatmap,
             scheduler,
             conversation_cache,
@@ -406,6 +439,7 @@ impl HeliosDistribCache {
         fingerprint: &QueryFingerprint,
         context: &QueryContext,
     ) -> CacheResult<CacheEntry> {
+        self.ensure_enabled()?;
         self.stats.total_lookups.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
 
@@ -415,7 +449,7 @@ impl HeliosDistribCache {
             .classify_query(&fingerprint.template, context);
 
         // Check L1 hot cache first
-        if let Some(entry) = self.l1_hot.get(fingerprint, context.session_id.clone()) {
+        if let Some(entry) = self.l1_hot.get(fingerprint) {
             self.stats.l1_hits.fetch_add(1, Ordering::Relaxed);
             self.record_hit(fingerprint, CacheTier::L1, start.elapsed());
             return Ok(entry);
@@ -425,12 +459,8 @@ impl HeliosDistribCache {
         if self.config.l2_enabled {
             if let Some(entry) = self.l2_warm.get(fingerprint) {
                 self.stats.l2_hits.fetch_add(1, Ordering::Relaxed);
-                // Promote to L1
-                self.l1_hot.insert(
-                    fingerprint.clone(),
-                    entry.clone(),
-                    Some(context.session_id.clone()),
-                );
+                // Promote to L1 (an entry too large for L1 stays in L2 only)
+                Self::promote(self.l1_hot.insert(fingerprint.clone(), entry.clone()), "L1");
                 self.record_hit(fingerprint, CacheTier::L2, start.elapsed());
                 return Ok(entry);
             }
@@ -441,13 +471,12 @@ impl HeliosDistribCache {
             if let Some(entry) = self.l3_distributed.get(fingerprint).await {
                 self.stats.l3_hits.fetch_add(1, Ordering::Relaxed);
                 // Promote to L1 and L2
-                self.l1_hot.insert(
-                    fingerprint.clone(),
-                    entry.clone(),
-                    Some(context.session_id.clone()),
-                );
+                Self::promote(self.l1_hot.insert(fingerprint.clone(), entry.clone()), "L1");
                 if self.config.l2_enabled {
-                    self.l2_warm.insert(fingerprint.clone(), entry.clone());
+                    Self::promote(
+                        self.l2_warm.insert(fingerprint.clone(), entry.clone()),
+                        "L2",
+                    );
                 }
                 self.record_hit(fingerprint, CacheTier::L3, start.elapsed());
                 return Ok(entry);
@@ -456,8 +485,10 @@ impl HeliosDistribCache {
 
         // Cache miss
         self.stats.total_misses.fetch_add(1, Ordering::Relaxed);
-        self.heatmap
-            .record_access(fingerprint, false, Duration::ZERO);
+        if self.config.heatmap_enabled {
+            self.heatmap
+                .record_access(fingerprint, false, Duration::ZERO);
+        }
 
         // Trigger prefetching for related queries
         if self.config.prefetch_enabled {
@@ -468,13 +499,21 @@ impl HeliosDistribCache {
         Err(CacheError::Miss)
     }
 
-    /// Insert an entry into the cache
+    /// Insert an entry into the cache.
+    ///
+    /// Stores it in L1, in L2 when it is larger than 1 KiB with a TTL above
+    /// 60 s, and in L3 for non-OLTP workloads. Fails when no tier accepted it
+    /// (e.g. [`CacheError::TooLarge`] for L1 with L2 not applicable). L3
+    /// replication is awaited per owner; owners that did not acknowledge are
+    /// logged and counted in [`DistribCacheStats::l3_replication_failures`]
+    /// (the local copy is still stored).
     pub async fn insert(
         &self,
         fingerprint: QueryFingerprint,
         entry: CacheEntry,
         context: &QueryContext,
     ) -> CacheResult<()> {
+        self.ensure_enabled()?;
         let workload = self
             .classifier
             .classify_query(&fingerprint.template, context);
@@ -483,22 +522,28 @@ impl HeliosDistribCache {
         let entry = entry.with_ttl(ttl);
 
         // Insert into L1
-        self.l1_hot.insert(
-            fingerprint.clone(),
-            entry.clone(),
-            Some(context.session_id.clone()),
-        );
+        let l1_result = self.l1_hot.insert(fingerprint.clone(), entry.clone());
+        let mut stored = l1_result.is_ok();
 
         // Insert into L2 if entry is large enough and TTL warrants it
         if self.config.l2_enabled && entry.size() > 1024 && ttl > Duration::from_secs(60) {
-            self.l2_warm.insert(fingerprint.clone(), entry.clone());
+            match self.l2_warm.insert(fingerprint.clone(), entry.clone()) {
+                Ok(()) => stored = true,
+                Err(e) => tracing::debug!(error = %e, "entry not stored in L2"),
+            }
         }
 
         // Insert into L3 for shared caching
         if self.config.l3_enabled && !matches!(workload, WorkloadType::OLTP) {
-            self.l3_distributed
+            let report = self
+                .l3_distributed
                 .insert(fingerprint.clone(), entry.clone())
                 .await;
+            stored |= report.stored_anywhere();
+        }
+
+        if !stored {
+            return l1_result;
         }
 
         // Record for prefetcher learning
@@ -509,20 +554,65 @@ impl HeliosDistribCache {
         Ok(())
     }
 
-    /// Invalidate entries for a table
-    pub fn invalidate_table(&self, table: &str) {
+    /// Invalidate entries for a table in every enabled tier.
+    ///
+    /// L1 and L2 are invalidated locally; with L3 enabled the invalidation is
+    /// also sent to every mesh peer and each acknowledgement awaited. Fails
+    /// with [`CacheError::Invalidation`] naming the peers that did not
+    /// acknowledge (they may serve stale entries until their TTL expires).
+    pub async fn invalidate_table(&self, table: &str) -> CacheResult<()> {
         self.l1_hot.invalidate_by_table(table);
         if self.config.l2_enabled {
             self.l2_warm.invalidate_by_table(table);
         }
-        // L3 invalidation is handled by gossip protocol
+        if self.config.l3_enabled {
+            Self::invalidation_result(self.l3_distributed.invalidate_table(table).await)?;
+        }
+        Ok(())
     }
 
-    /// Invalidate a specific entry
-    pub fn invalidate(&self, fingerprint: &QueryFingerprint) {
+    /// Invalidate a specific entry in every enabled tier. L3 behaves as in
+    /// [`Self::invalidate_table`].
+    pub async fn invalidate(&self, fingerprint: &QueryFingerprint) -> CacheResult<()> {
         self.l1_hot.invalidate(fingerprint);
         if self.config.l2_enabled {
             self.l2_warm.invalidate(fingerprint);
+        }
+        if self.config.l3_enabled {
+            Self::invalidation_result(self.l3_distributed.invalidate(fingerprint).await)?;
+        }
+        Ok(())
+    }
+
+    fn invalidation_result(report: PeerOpReport) -> CacheResult<()> {
+        if report.is_complete() {
+            return Ok(());
+        }
+        let failed: Vec<String> = report
+            .failed
+            .iter()
+            .map(|(addr, reason)| format!("{}: {}", addr, reason))
+            .collect();
+        Err(CacheError::Invalidation(format!(
+            "L3 peers did not acknowledge the invalidation ({})",
+            failed.join("; ")
+        )))
+    }
+
+    fn ensure_enabled(&self) -> CacheResult<()> {
+        if self.config.enabled {
+            Ok(())
+        } else {
+            Err(CacheError::TierUnavailable(
+                "distribcache is disabled (DistribCacheConfig::enabled = false)".to_string(),
+            ))
+        }
+    }
+
+    /// Log a tier promotion that did not happen (e.g. entry too large).
+    fn promote(result: CacheResult<()>, tier: &str) {
+        if let Err(e) = result {
+            tracing::debug!(tier, error = %e, "cache promotion skipped");
         }
     }
 
@@ -538,19 +628,27 @@ impl HeliosDistribCache {
         }
     }
 
-    /// Record cache hit for metrics and heatmap
-    fn record_hit(&self, fingerprint: &QueryFingerprint, tier: CacheTier, _latency: Duration) {
-        let time_saved = match tier {
-            CacheTier::L1 => Duration::from_millis(10), // Assume 10ms DB query
-            CacheTier::L2 => Duration::from_millis(9),
-            CacheTier::L3 => Duration::from_millis(5),
-        };
+    /// Record cache hit for metrics and heatmap. The time saved is an
+    /// estimate: `estimated_backend_latency` minus the measured lookup time.
+    fn record_hit(&self, fingerprint: &QueryFingerprint, _tier: CacheTier, latency: Duration) {
+        let time_saved = self
+            .config
+            .estimated_backend_latency
+            .saturating_sub(latency);
 
         self.stats
             .time_saved_us
             .fetch_add(time_saved.as_micros() as u64, Ordering::Relaxed);
         self.stats.queries_avoided.fetch_add(1, Ordering::Relaxed);
-        self.heatmap.record_access(fingerprint, true, time_saved);
+        if self.config.heatmap_enabled {
+            self.heatmap.record_access(fingerprint, true, time_saved);
+        }
+    }
+
+    /// The prefetch queue: predicted queries for the caller to execute and
+    /// insert. Nothing in the cache runs them.
+    pub fn prefetch_queue(&self) -> Arc<PrefetchQueue> {
+        self.prefetcher.queue()
     }
 
     /// Get conversation context cache
@@ -590,9 +688,11 @@ impl HeliosDistribCache {
             } else {
                 0.0
             },
-            time_saved_seconds: self.stats.time_saved_us.load(Ordering::Relaxed) as f64
+            estimated_time_saved_seconds: self.stats.time_saved_us.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
             queries_avoided: self.stats.queries_avoided.load(Ordering::Relaxed),
+            l3_replication_failures: self.l3_distributed.replication_failures(),
+            l3_invalidation_failures: self.l3_distributed.invalidation_failures(),
         }
     }
 
@@ -606,26 +706,45 @@ impl HeliosDistribCache {
         self.scheduler.get_distribution()
     }
 
-    /// Start background services (prefetcher, invalidator)
+    /// Start background services: in `InvalidationMode::Hybrid`, connect the
+    /// WAL invalidator and spawn its processing task. Fails when Hybrid has
+    /// no `wal_endpoint`, when TTL mode has one (it would be ignored), or
+    /// when the WAL endpoint cannot be subscribed to.
     pub async fn start(&self) -> CacheResult<()> {
-        // Start WAL invalidator if configured
-        if let Some(wal_endpoint) = &self.config.wal_endpoint {
-            self.invalidator.start(wal_endpoint).await?;
+        match (self.config.invalidation_mode, &self.config.wal_endpoint) {
+            (InvalidationMode::TTL, None) => Ok(()),
+            (InvalidationMode::TTL, Some(endpoint)) => Err(CacheError::Configuration(format!(
+                "wal_endpoint {} is set but invalidation_mode is TTL; use \
+                 InvalidationMode::Hybrid to stream WAL invalidations",
+                endpoint
+            ))),
+            (InvalidationMode::Hybrid, None) => Err(CacheError::Configuration(
+                "invalidation_mode Hybrid requires a wal_endpoint".to_string(),
+            )),
+            (InvalidationMode::Hybrid, Some(endpoint)) => {
+                self.invalidator.start(endpoint).await?;
+                let mut task = self.wal_task.lock();
+                if task.as_ref().is_none_or(|t| t.is_finished()) {
+                    *task = Some(self.invalidator.start_processing());
+                }
+                Ok(())
+            }
         }
-
-        // Start prefetcher background worker
-        if self.config.prefetch_enabled {
-            self.prefetcher.start().await;
-        }
-
-        Ok(())
     }
 
     /// Stop background services
     pub async fn stop(&self) -> CacheResult<()> {
         self.invalidator.stop().await;
-        self.prefetcher.stop().await;
+        if let Some(task) = self.wal_task.lock().take() {
+            task.abort();
+        }
         Ok(())
+    }
+
+    /// Whether WAL-streamed invalidation is running (`false` in TTL mode and
+    /// after the WAL stream broke).
+    pub fn wal_invalidation_running(&self) -> bool {
+        self.invalidator.is_running()
     }
 }
 
@@ -640,10 +759,16 @@ pub struct DistribCacheStats {
     pub l3: TierStats,
     /// Overall hit ratio
     pub overall_hit_ratio: f64,
-    /// Total time saved in seconds
-    pub time_saved_seconds: f64,
+    /// Estimated time saved in seconds: per hit,
+    /// `DistribCacheConfig::estimated_backend_latency` minus the measured
+    /// lookup time. An estimate, not a measurement of backend time.
+    pub estimated_time_saved_seconds: f64,
     /// Total queries avoided
     pub queries_avoided: u64,
+    /// L3 owner replications that were not acknowledged
+    pub l3_replication_failures: u64,
+    /// L3 peer invalidations that were not acknowledged
+    pub l3_invalidation_failures: u64,
 }
 
 #[cfg(test)]
@@ -681,5 +806,175 @@ mod tests {
         assert_eq!(ctx.session_id.0, "session-1");
         assert_eq!(ctx.workload_hint, Some(WorkloadType::OLTP));
         assert_eq!(ctx.branch, Some("feature-x".to_string()));
+    }
+
+    fn entry(table: &str) -> CacheEntry {
+        CacheEntry::new(vec![1, 2, 3], vec![table.to_string()], 1)
+    }
+
+    /// A disabled cache refuses lookups and inserts explicitly.
+    #[tokio::test]
+    async fn test_disabled_cache_fails_closed() {
+        let cache = HeliosDistribCache::new(DistribCacheConfig::builder().enabled(false).build());
+        let ctx = QueryContext::new("s");
+        let fp = QueryFingerprint::from_query("SELECT * FROM users");
+        assert!(matches!(
+            cache.insert(fp.clone(), entry("users"), &ctx).await,
+            Err(CacheError::TierUnavailable(_))
+        ));
+        assert!(matches!(
+            cache.get(&fp, &ctx).await,
+            Err(CacheError::TierUnavailable(_))
+        ));
+    }
+
+    /// `start` rejects invalidation settings it cannot honour instead of
+    /// silently running without WAL invalidation.
+    #[tokio::test]
+    async fn test_start_rejects_inconsistent_invalidation_config() {
+        let hybrid_without_endpoint = HeliosDistribCache::new(DistribCacheConfig {
+            invalidation_mode: InvalidationMode::Hybrid,
+            ..Default::default()
+        });
+        assert!(matches!(
+            hybrid_without_endpoint.start().await,
+            Err(CacheError::Configuration(_))
+        ));
+
+        let ttl_with_endpoint = HeliosDistribCache::new(DistribCacheConfig {
+            invalidation_mode: InvalidationMode::TTL,
+            wal_endpoint: Some("127.0.0.1:1".to_string()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            ttl_with_endpoint.start().await,
+            Err(CacheError::Configuration(_))
+        ));
+
+        // TTL mode without an endpoint has nothing to start.
+        let ttl = HeliosDistribCache::new(DistribCacheConfig::default());
+        ttl.start().await.unwrap();
+        assert!(!ttl.wal_invalidation_running());
+    }
+
+    /// An unreachable WAL endpoint is a start error, not a "degraded" run.
+    #[tokio::test]
+    async fn test_start_with_unreachable_wal_endpoint_fails() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = dead.local_addr().unwrap();
+        drop(dead);
+        let cache = HeliosDistribCache::new(
+            DistribCacheConfig::builder()
+                .wal_endpoint(addr.to_string())
+                .build(),
+        );
+        assert!(matches!(
+            cache.start().await,
+            Err(CacheError::ConnectionError(_))
+        ));
+        assert!(!cache.wal_invalidation_running());
+    }
+
+    /// Table invalidation reaches L3 and reports a peer that missed it.
+    #[tokio::test]
+    async fn test_invalidate_table_reports_unacknowledged_l3_peer() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = dead.local_addr().unwrap();
+        drop(dead);
+        let cache = HeliosDistribCache::new(
+            DistribCacheConfig::builder()
+                .l3_enabled(true)
+                .l3_replication_factor(1)
+                .l3_peers(vec![addr])
+                .build(),
+        );
+        let ctx = QueryContext::new("s");
+        let fp = QueryFingerprint::from_query("SELECT * FROM users");
+        cache
+            .insert(fp.clone(), entry("users"), &ctx)
+            .await
+            .unwrap();
+
+        let err = cache.invalidate_table("users").await.unwrap_err();
+        assert!(matches!(err, CacheError::Invalidation(_)), "got {err:?}");
+        // Local tiers were still invalidated.
+        assert!(matches!(cache.get(&fp, &ctx).await, Err(CacheError::Miss)));
+        assert_eq!(cache.stats().l3_invalidation_failures, 1);
+    }
+
+    /// The time-saved figure is the configured backend latency minus the
+    /// measured lookup time, never more than the configured latency.
+    #[tokio::test]
+    async fn test_estimated_time_saved_uses_configured_latency() {
+        let cache = HeliosDistribCache::new(
+            DistribCacheConfig::builder()
+                .estimated_backend_latency(Duration::from_millis(2))
+                .build(),
+        );
+        let ctx = QueryContext::new("s");
+        let fp = QueryFingerprint::from_query("SELECT * FROM users");
+        cache
+            .insert(fp.clone(), entry("users"), &ctx)
+            .await
+            .unwrap();
+        cache.get(&fp, &ctx).await.unwrap();
+
+        let stats = cache.stats();
+        assert_eq!(stats.queries_avoided, 1);
+        assert!(stats.estimated_time_saved_seconds <= 0.002);
+    }
+
+    /// WAL-streamed changes reach the tiers through the processing task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_wal_stream_invalidates_tiers() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 13];
+            sock.read_exact(&mut req).unwrap();
+            sock.write_all(&[0x04, 0, 0, 0, 0]).unwrap(); // SubscribeAck
+            go_rx.recv().unwrap();
+            // Schema change for "users": [len: u16]["users"]
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u64.to_be_bytes());
+            payload.extend_from_slice(&0u64.to_be_bytes());
+            payload.push(0x04);
+            payload.extend_from_slice(&5u16.to_be_bytes());
+            payload.extend_from_slice(b"users");
+            let mut frame = vec![0x01];
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&payload);
+            sock.write_all(&frame).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let cache = HeliosDistribCache::new(
+            DistribCacheConfig::builder()
+                .wal_endpoint(addr.to_string())
+                .build(),
+        );
+        let ctx = QueryContext::new("s");
+        let fp = QueryFingerprint::from_query("SELECT * FROM users");
+        cache
+            .insert(fp.clone(), entry("users"), &ctx)
+            .await
+            .unwrap();
+        cache.start().await.unwrap();
+        assert!(cache.wal_invalidation_running());
+        go_tx.send(()).unwrap();
+
+        let mut invalidated = false;
+        for _ in 0..200 {
+            if !cache.l1_hot.contains(&fp) {
+                invalidated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(invalidated, "WAL schema change did not invalidate L1");
+        cache.stop().await.unwrap();
     }
 }

@@ -511,35 +511,36 @@ mod tests {
         }
     }
 
+    /// The query cache keeps no key in the index (its entries are retired by
+    /// their tables' generations); a key a caller registers itself is still
+    /// released by the cache's purge of its table.
     #[tokio::test]
-    async fn query_cache_fill_and_purge_releases_key_tracking() {
+    async fn query_cache_registers_no_key_and_its_purge_releases_a_callers() {
         use crate::cache::{CacheConfig, CacheContext, QueryCache};
 
         let cache = QueryCache::new(CacheConfig::default());
         let context = CacheContext::default();
-        for cycle in 0..4 {
-            for column in 0..8 {
-                let sql = format!("SELECT value_{}_{} FROM users", cycle, column);
-                cache
-                    .put(
-                        &sql,
-                        &context,
-                        bytes::Bytes::from_static(b"row"),
-                        1,
-                        Duration::from_millis(1),
-                    )
-                    .await;
-            }
-            let keys = cache.invalidator.get_keys_for_table("users");
-            assert_eq!(keys.len(), 8, "fills must register distinct query keys");
-            // Exercises the real generation update, take_table and deferred
-            // key-set reclamation path, which never calls forget_keys.
-            cache.invalidate_tables(&["users".to_string()]).await;
-            assert_eq!(cache.invalidator.stats().tracked_keys, 0);
-            for key in keys {
-                assert!(cache.invalidator.get_tables_for_key(&key).is_empty());
-            }
+        for column in 0..8 {
+            let sql = format!("SELECT value_{column} FROM users");
+            cache
+                .put(
+                    &sql,
+                    &context,
+                    bytes::Bytes::from_static(b"row"),
+                    1,
+                    Duration::from_millis(1),
+                )
+                .await;
         }
+        assert_eq!(cache.entry_counts().l2, 8);
+        assert_eq!(cache.invalidator.stats().tracked_keys, 0);
+
+        let own = create_key(1);
+        cache.invalidator.register(&own, "users");
+        assert_eq!(cache.invalidator.stats().tracked_keys, 1);
+        cache.invalidate_tables(&["users".to_string()]).await;
+        assert_eq!(cache.invalidator.stats().tracked_keys, 0);
+        assert!(cache.invalidator.get_tables_for_key(&own).is_empty());
     }
 
     #[test]

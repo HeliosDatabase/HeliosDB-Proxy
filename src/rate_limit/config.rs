@@ -244,8 +244,15 @@ pub struct RateLimitConfig {
     /// Replication throttle threshold (lag duration)
     pub replication_throttle_threshold: Option<Duration>,
 
-    /// Cleanup interval for expired entries
+    /// Cleanup interval for expired entries, and for evicting the state of
+    /// idle keys ([`super::RateLimiter::evict_idle`]).
     pub cleanup_interval: Duration,
+
+    /// An optional second limit beside the token bucket: at most
+    /// `window_max_requests` requests per key within any `window_size`.
+    /// `0` = no window (the token bucket alone enforces `default_qps`).
+    pub window_size: Duration,
+    pub window_max_requests: u32,
 
     /// Priority multipliers (higher priority = higher effective limit)
     pub priority_multipliers: HashMap<PriorityLevel, f32>,
@@ -279,6 +286,8 @@ impl Default for RateLimitConfig {
             queue_size: 1000,
             replication_throttle_threshold: Some(Duration::from_secs(5)),
             cleanup_interval: Duration::from_secs(60),
+            window_size: Duration::from_secs(60),
+            window_max_requests: 0,
             priority_multipliers,
             cost_estimation_enabled: true,
         }

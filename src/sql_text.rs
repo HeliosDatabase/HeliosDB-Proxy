@@ -48,6 +48,7 @@
 //! [`TableExclusions`] is the relay's fail-closed check for `[cache]
 //! exclude_tables`: it looks at the raw text, comments and literals included.
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 use std::hash::{Hash, Hasher};
 
 #[cfg(feature = "query-cache")]
@@ -55,9 +56,13 @@ use crate::replay_sql::ident_cont;
 use crate::replay_sql::ident_start;
 #[cfg(feature = "query-cache")]
 use crate::sql_lex::MAX_IDENTIFIER_BYTES;
-use crate::sql_lex::{
-    has_comment_marker, is_space, lead, run, statement_start, Lead, Piece, Pieces, Stripped,
-};
+use crate::sql_lex::{has_comment_marker, is_space, run, Piece, Pieces};
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+use crate::sql_lex::{lead, statement_start, Lead, Stripped};
+pub(crate) use crate::sql_relations::char_before;
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+pub(crate) use crate::sql_relations::{table_matches, table_names};
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 use std::borrow::Cow;
 
 /// Kind byte of a `'…'` string literal in [`Fingerprint::kinds`].
@@ -157,7 +162,7 @@ fn may_hold_rest(b: &[u8]) -> bool {
 /// `standard_conforming_strings` settings, may read different statements.
 /// The relay takes one holding a `;` for a statement the journal capture
 /// may not see (`cache_unseen_write`).
-#[cfg(any(feature = "query-cache", test))]
+#[cfg(any(feature = "query-cache", all(test, feature = "edge-proxy")))]
 pub(crate) fn ambiguous_rest(sql: &str) -> Option<&str> {
     if !may_hold_rest(sql.as_bytes()) {
         return None;
@@ -168,6 +173,7 @@ pub(crate) fn ambiguous_rest(sql: &str) -> Option<&str> {
     })
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// The statement `sql` as the write invalidation reads it, in one pass of
 /// the lexer: `sql` from its first word past whitespace and comments
 /// ([`statement_start`]), and its comment-free text ([`strip_comments`]).
@@ -216,6 +222,7 @@ pub(crate) fn single_statement(sql: &str) -> Option<(&str, Cow<'_, str>)> {
     Some((body, Cow::Borrowed(sql)))
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// The lexer's answer for `single_statement`: the path for text the fast
 /// path does not take.
 fn single_statement_lexed(sql: &str) -> Option<(&str, Cow<'_, str>)> {
@@ -321,12 +328,14 @@ impl TableSpot {
         matches!(self, Self::Name(_) | Self::Part(_))
     }
 
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     /// Whether a write may name a table here: a name is read here, and not
     /// after the `FROM` of `IS [NOT] DISTINCT FROM` ([`Role::Predicate`]).
     fn names_table(self) -> bool {
         matches!(self, Self::Name(role) | Self::Part(role) if role != Role::Predicate)
     }
 
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     /// Whether a write may name a table it changes here: after a
     /// [`Role::Target`] keyword, or after a `FROM` ([`Role::Source`]) when
     /// `delete_before` finds a `DELETE` before it (asked only then).
@@ -353,6 +362,7 @@ impl TableSpot {
         }
     }
 
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     /// The spot after the [`Piece::Text`] `text` of a write, as
     /// [`Self::after`] reads it, or `None` when one of its words is a name
     /// the table extraction cannot read whole where a write may name a table
@@ -423,6 +433,7 @@ fn number_runs_into_word(word: &str) -> bool {
         || (b.first() == Some(&b'.') && b.get(1).is_some_and(u8::is_ascii_digit))
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether a statement holds the word `DELETE` (ASCII case-insensitive, a
 /// run of identifier characters in a [`Piece::Text`]: a Unicode space ends
 /// one) before a point [`single_statement`] asks about, searched only when
@@ -436,6 +447,7 @@ struct DeleteBefore {
     found: bool,
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 impl DeleteBefore {
     /// Whether `sql` holds `DELETE` before byte `at`, the start of a piece
     /// at or after the last one asked about.
@@ -453,6 +465,7 @@ impl DeleteBefore {
     }
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether the word `text` (a [`Piece::Text`]) may be, or hold, a name the
 /// table extraction cannot read whole: its pattern reads ASCII letters,
 /// digits and `_`, and whitespace, so a name with a `$` or another non-ASCII
@@ -467,6 +480,7 @@ fn unreadable_name(text: &str) -> bool {
             || (!text.is_ascii() && text.chars().any(|c| !c.is_ascii() && !c.is_whitespace())))
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether the word `word` (no whitespace in it) holds a run of identifier
 /// characters ([`continues_identifier_everywhere`], sqlparser's word
 /// characters) that is not ASCII but upper-cases, the Unicode way, to one of
@@ -496,6 +510,7 @@ fn may_read_as_keyword(word: &str) -> bool {
             })
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// sqlparser 0.53.0's `ALL_KEYWORDS` (the version HeliosDB-Nano and
 /// HeliosDB-Lite pin), in its byte order: its tokenizer takes a word for a
 /// keyword when the word's upper case (`str::to_uppercase`) is one of these
@@ -656,6 +671,7 @@ pub fn uncacheable_text(sql: &str) -> Option<UncacheableText> {
     None
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether `sql` is plain ASCII SQL the lexer reads as text with no piece
 /// it could split differently from a plain scan: no `'` or `"` (literals and
 /// quoted names), no `$` (dollar quotes, `$n`), no `\`, `-` or `/` (comments and
@@ -680,6 +696,7 @@ pub(crate) fn plain_ascii(sql: &str) -> bool {
         && b.is_ascii()
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether the fast path answers for `sql`: [`plain_ascii`], unless a test
 /// has switched the lexer on for its comparison ([`with_lexer_only`]).
 fn fast_path(sql: &str) -> bool {
@@ -688,17 +705,17 @@ fn fast_path(sql: &str) -> bool {
 
 /// Test-only: whether the lexer answers for every statement
 /// ([`with_lexer_only`]).
-#[cfg(test)]
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
 fn lexer_only() -> bool {
     LEXER_ONLY.with(std::cell::Cell::get)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), any(feature = "query-cache", feature = "edge-proxy")))]
 fn lexer_only() -> bool {
     false
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
 thread_local! {
     /// Set by [`with_lexer_only`] for the duration of its closure.
     static LEXER_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -706,7 +723,7 @@ thread_local! {
 
 /// Runs `f` with the fast path off: every call in it takes the lexer, so a
 /// test can compare the two answers on the same text.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
 pub(crate) fn with_lexer_only<R>(f: impl FnOnce() -> R) -> R {
     LEXER_ONLY.with(|on| {
         let before = on.replace(true);
@@ -716,6 +733,7 @@ pub(crate) fn with_lexer_only<R>(f: impl FnOnce() -> R) -> R {
     })
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether the lexer reaches a backend-ambiguous rest ([`Piece::Rest`])
 /// before the first word of `sql` (past its leading whitespace and
 /// comments): what the statement is (a read, a write, DDL, transaction
@@ -737,7 +755,7 @@ pub(crate) fn leading_rest(sql: &str) -> bool {
 /// nothing else is left out. `None` when the lexer reaches a
 /// backend-ambiguous rest ([`Piece::Rest`]): where the backends end the
 /// statements is unknown.
-#[cfg(any(feature = "edge-proxy", test))]
+#[cfg(any(feature = "edge-proxy", all(test, feature = "query-cache")))]
 pub(crate) fn statements(sql: &str) -> Option<Vec<&str>> {
     let mut statements = Vec::new();
     let mut first = None;
@@ -765,7 +783,7 @@ pub(crate) fn statements(sql: &str) -> Option<Vec<&str>> {
 /// rest ([`Piece::Rest`]), where what is a word is unknown. No literal's,
 /// identifier's or comment's text is read as SQL: `WITH r AS (SELECT … WHERE
 /// op = 'delete') …` holds no `DELETE`.
-#[cfg(any(feature = "edge-proxy", test))]
+#[cfg(any(feature = "edge-proxy", all(test, feature = "query-cache")))]
 pub(crate) fn may_hold_keyword(sql: &str, words: &[&str]) -> bool {
     Pieces::new(sql).any(|(_, piece)| match piece {
         Piece::Rest(_) => true,
@@ -783,6 +801,7 @@ pub(crate) fn may_hold_keyword(sql: &str, words: &[&str]) -> bool {
     })
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether `text` starts with the keyword `word` (ASCII case-insensitive),
 /// not followed by a character that continues an identifier on every
 /// backend ([`continues_identifier_everywhere`]): after a Unicode space the
@@ -794,6 +813,7 @@ pub(crate) fn starts_with_keyword(text: &str, word: &str) -> bool {
         && !char_after(b, word.len()).is_some_and(continues_identifier_everywhere)
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether the statement `sql` (from its first word: [`statement_start`])
 /// is a `MERGE` that is not PostgreSQL's `MERGE INTO target USING …`:
 /// HeliosDB-Nano's `MERGE [DATABASE] BRANCH src INTO dst` changes every
@@ -806,6 +826,7 @@ pub(crate) fn merge_without_into(sql: &str) -> bool {
             .is_some_and(|rest| starts_with_keyword(rest, "INTO"))
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// `text` past its leading whitespace and comments ([`statement_start`])
 /// and the keyword `word`, when it starts with that keyword.
 fn after_keyword<'a>(text: &'a str, word: &str) -> Option<&'a str> {
@@ -813,10 +834,12 @@ fn after_keyword<'a>(text: &'a str, word: &str) -> Option<&'a str> {
     starts_with_keyword(start, word).then(|| &start[word.len()..])
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// The conflict words sqlparser's PostgreSQL dialect accepts after
 /// `INSERT OR`: HeliosDB-Nano and HeliosDB-Lite parse with it.
 const INSERT_CONFLICT_WORDS: &[&str] = &["REPLACE", "ROLLBACK", "ABORT", "FAIL", "IGNORE"];
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether the statement `sql` (from its first word: [`statement_start`])
 /// is an `INSERT` whose target does not follow an `INTO`. PostgreSQL
 /// requires `INTO`; HeliosDB-Nano and HeliosDB-Lite (sqlparser's
@@ -847,19 +870,6 @@ pub(crate) fn insert_without_into(sql: &str) -> bool {
     after_keyword(rest, "INTO").is_none()
 }
 
-/// The character that ends right before byte `at` of `text`: `None` at its
-/// start, or when the bytes there are not a whole UTF-8 character.
-fn char_before(text: &[u8], at: usize) -> Option<char> {
-    let last = *text.get(at.checked_sub(1)?)?;
-    if last.is_ascii() {
-        return Some(char::from(last));
-    }
-    let start = (at.saturating_sub(4)..at)
-        .rev()
-        .find(|&i| text[i] & 0xC0 != 0x80)?;
-    std::str::from_utf8(&text[start..at]).ok()?.chars().next()
-}
-
 /// The character that starts at byte `at` of `text`: `None` at its end, or
 /// when no whole UTF-8 character starts there.
 fn char_after(text: &[u8], at: usize) -> Option<char> {
@@ -885,83 +895,19 @@ fn continues_identifier_everywhere(c: char) -> bool {
     c.is_alphabetic() || c.is_ascii_digit() || c == '_' || c == '$'
 }
 
-/// The table names `pattern` captures in `text` (a statement's
-/// [`strip_comments`] text): the query cache's and the edge cache's table
-/// extraction. `pattern` matches a keyword (`FROM`, `JOIN`, …) as
-/// group 1 and captures the table after it as group 2.
-///
-/// A keyword right after a letter (a non-ASCII one included) or `_` is the
-/// end of an identifier on every backend (`valid_from`, `last_update`,
-/// `data_table`, `ñfrom`), never a keyword: skipped. After any other
-/// character it counts: a non-ASCII one that is not a letter (a Unicode
-/// space, U+00A0 or U+3000, pasted before `FROM`) is part of the identifier
-/// for PostgreSQL but whitespace for HeliosDB-Nano and HeliosDB-Lite, which
-/// read the table after it. After a skipped one the search goes on from
-/// inside it, so a keyword of several words (`INSERT INTO`) cannot hide the
-/// one it holds. Every other match counts, and the search goes on
-/// right after its keyword, not after the table it captured, since that
-/// "table" may be the real keyword: `SELECT t.from FROM prices`,
-/// `SELECT 1 AS from FROM prices`, `SELECT x$from FROM prices`. A keyword
-/// after a digit or `$` is kept: it may follow a number (`1from`, which a
-/// PostgreSQL before 15 reads as `1` and `FROM`) or a dollar-quoted literal
-/// (`$$a$$FROM t`). A name only such a misreading finds widens invalidation,
-/// which is safe; a table a keyword names is never lost.
-///
-/// `pattern` may let parentheses come before the table (`FROM (orders JOIN
-/// items ON …)`, a parenthesized join): a word there that starts a subquery
-/// or a `VALUES` list ([`SUBQUERY_WORDS`]) is skipped, never a table, so a
-/// read like `FROM (SELECT f(1)) x` keeps an empty table set (which the edge
-/// cache never stores) instead of a table `select`.
-pub(crate) fn table_names<'a>(
-    pattern: &'a regex::Regex,
-    text: &'a str,
-) -> impl Iterator<Item = &'a str> + 'a {
-    table_matches(pattern, text).map(|(_, table)| table)
-}
-
-/// [`table_names`], each with the keyword (group 1) that named it: the
-/// write invalidation's reading ([`skipped_target`]).
-pub(crate) fn table_matches<'a>(
-    pattern: &'a regex::Regex,
-    text: &'a str,
-) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
-    let mut at = 0;
-    std::iter::from_fn(move || loop {
-        let caps = pattern.captures_at(text, at)?;
-        let keyword = caps.get(1)?;
-        let ends_identifier = char_before(text.as_bytes(), keyword.start())
-            .is_some_and(|c| c.is_alphabetic() || c == '_');
-        if ends_identifier {
-            // Not a keyword: search on from inside it, so a keyword of
-            // several words (`INSERT INTO`) cannot hide the one it holds
-            // (`last_insert INTO t`). It starts with an ASCII letter.
-            at = keyword.start() + 1;
-            continue;
-        }
-        at = keyword.end();
-        if let Some(table) = caps.get(2) {
-            let parenthesized = text[keyword.end()..table.start()].contains('(');
-            let subquery = parenthesized
-                && SUBQUERY_WORDS
-                    .iter()
-                    .any(|w| table.as_str().eq_ignore_ascii_case(w));
-            if !subquery {
-                return Some((keyword.as_str(), table.as_str()));
-            }
-        }
-    })
-}
-
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// The conflict words sqlparser's PostgreSQL dialect reads after `UPDATE`
 /// (`UPDATE OR IGNORE t`, `UPDATE REPLACE t`): the first word of its
 /// conflict clause.
 const UPDATE_CONFLICT_WORDS: &[&str] = &["OR", "REPLACE"];
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// The optional words of the write table pattern's `INSERT` keyword, and
 /// `ONLY` (the query cache's and the edge cache's `TABLE_PATTERN`): never a
 /// table there, unless the pattern stepped back over one.
 const PATTERN_WORDS: &[&str] = &["INTO", "TABLE", "OVERWRITE", "OR", "REPLACE", "ONLY"];
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Whether a [`table_matches`] match takes for the table a word that
 /// sqlparser's PostgreSQL dialect, which HeliosDB-Nano and HeliosDB-Lite
 /// parse with, reads before the target: an `UPDATE`'s conflict clause
@@ -992,11 +938,6 @@ pub(crate) fn skipped_target(keyword: &str, table: &str) -> bool {
             .iter()
             .any(|word| table.eq_ignore_ascii_case(word))
 }
-
-/// Words that start a parenthesized subquery or `VALUES` list after `FROM (`
-/// or `JOIN (` (all reserved or, for `VALUES`, unusable there as a table
-/// name): [`table_names`] never takes one for a table.
-const SUBQUERY_WORDS: &[&str] = &["select", "values", "with", "table"];
 
 /// A statement's cache fingerprint: its text with comments removed,
 /// whitespace collapsed and literals replaced by `?`, every other word kept
@@ -1040,6 +981,7 @@ impl Fingerprint {
         self.kinds.push(kind);
     }
 
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     /// Feed the literals (kind, value and position, in order) to `hasher`.
     pub(crate) fn hash_literals<H: Hasher>(&self, hasher: &mut H) {
         for ((kind, param), mark) in self.kinds.iter().zip(&self.params).zip(&self.marks) {
@@ -1532,6 +1474,38 @@ fn piece_len(piece: Piece<'_>) -> usize {
     }
 }
 
+/// Why the shared result cache must not look up or store a statement,
+/// whatever caching contract applies: the checks the PG-wire relay and the
+/// HTTP SQL gateway share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheRefusal {
+    /// It names a system catalog (its rows change outside any table write).
+    SystemCatalog,
+    /// A time-travel comment (`AS OF`): not a current read.
+    TimeTravelComment,
+    /// Text the proxy cannot read unambiguously.
+    AmbiguousText,
+    /// It names a table `[cache]` excludes.
+    ExcludedTable,
+}
+
+/// Whether, and why, the shared result cache refuses `sql`
+/// ([`CacheRefusal`]), with `exclusions` the configured table exclusions.
+pub fn cache_refusal(sql: &str, exclusions: Option<&TableExclusions>) -> Option<CacheRefusal> {
+    if names_system_catalog(sql.as_bytes()) {
+        return Some(CacheRefusal::SystemCatalog);
+    }
+    if let Some(why) = uncacheable_text(sql) {
+        return Some(match why {
+            UncacheableText::TimeTravelComment => CacheRefusal::TimeTravelComment,
+            UncacheableText::AmbiguousText => CacheRefusal::AmbiguousText,
+        });
+    }
+    exclusions
+        .is_some_and(|exclusions| exclusions.matches(sql))
+        .then_some(CacheRefusal::ExcludedTable)
+}
+
 /// Tables whose reads neither result cache may serve or store
 /// (`[cache] exclude_tables` and `[[cache.tables]] exclude = true`).
 ///
@@ -1715,6 +1689,7 @@ impl IdentifierScan {
     }
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 /// Per-table TTLs shorter than a cache's own TTL, applied fail-closed from a
 /// statement's text: a configured name anywhere in it, as a whole identifier
 /// ([`IdentifierScan`]: comments and literals included, a name of 60 bytes or
@@ -1732,6 +1707,7 @@ pub(crate) struct ShorterTtls {
     ttls: Vec<std::time::Duration>,
 }
 
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 impl ShorterTtls {
     /// The `(name, TTL)` entries with a TTL shorter than `below` (empty
     /// names dropped); `None` when there is none.
@@ -1764,11 +1740,16 @@ impl ShorterTtls {
 /// (`U&"…"`), which can spell any name without its bytes
 /// (`U&"s\0065crets"`): a fail-closed name scan must treat it as a match.
 pub(crate) fn unicode_escaped_identifier(sql: &[u8]) -> bool {
-    memchr::memmem::find_iter(sql, b"&\"")
+    /// `&"`, built once (a searcher per call costs more than the search:
+    /// see `sql_lex::LINE_COMMENT_START`).
+    static AMPERSAND_QUOTE: once_cell::sync::Lazy<memchr::memmem::Finder<'static>> =
+        once_cell::sync::Lazy::new(|| memchr::memmem::Finder::new(b"&\""));
+    AMPERSAND_QUOTE
+        .find_iter(sql)
         .any(|at| at > 0 && sql[at - 1].eq_ignore_ascii_case(&b'u'))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
 mod tests {
     use super::*;
     use crate::sql_lex::*;
@@ -3656,7 +3637,7 @@ impl VolatileScan {
 /// numbers, operators, punctuation and whitespace; the others add the bytes
 /// the fast path leaves to the lexer (quotes, `$`, backslash, `--`, `/*`,
 /// CR), a second statement, and non-ASCII words.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
 pub(crate) fn generated_statements(mut seed: u64, count: usize) -> Vec<String> {
     const WORDS: &[&str] = &[
         "SELECT",
@@ -3742,7 +3723,7 @@ pub(crate) fn generated_statements(mut seed: u64, count: usize) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
 mod fast_path_tests {
     use super::*;
 
@@ -3846,7 +3827,7 @@ mod fast_path_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
 mod exclusion_scan_tests {
     use super::*;
 

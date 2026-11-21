@@ -165,6 +165,12 @@ pub(super) struct ExtBatch<'a> {
     pub(super) defines: &'a [String],
     /// The held unnamed Parse and its signature.
     pub(super) unnamed: Option<&'a (bytes::Bytes, bytes::Bytes)>,
+    /// The unnamed statement the client holds and no backend does (a
+    /// plugin's cached result answered its Parse), when the batch binds the
+    /// unnamed statement without a Parse of its own: the backend is given
+    /// it out of band before the batch, and it counts as the batch's held
+    /// Parse for the journal and Transaction Replay.
+    pub(super) reparked: Option<&'a (bytes::Bytes, bytes::Bytes)>,
 }
 
 /// The request a fault interrupted, borrowed so it can be re-executed.
@@ -172,8 +178,9 @@ pub(super) enum InFlight<'a> {
     Simple(&'a Message),
     Extended {
         ext: ExtBatch<'a>,
-        /// Named statements to re-prepare on the replacement connection
-        /// (`forward_extended_batch`'s `reprepare`).
+        /// Referenced named statements, borrowed from the batch's set.
+        /// `forward_extended_batch` excludes the batch's own definitions before
+        /// re-preparing missing names on the replacement connection.
         reprepare: &'a [String],
     },
 }
@@ -321,6 +328,9 @@ pub(super) struct TrSession {
     /// open, so a request continuing it is part of an open cycle (the
     /// recovery never runs it alone on a replacement connection).
     pub(super) ext_copy_end: Option<bool>,
+    /// Completed statements before this COPY end; only a later completion
+    /// acknowledges its end and starts the client final-Sync deadline.
+    pub(super) ext_copy_end_completions: u32,
     /// TR-08: the session's acknowledged named statements. A later cycle that
     /// `Bind`s one is classified (and replayed) from here instead of being
     /// refused as opaque. A name an errored batch `Parse`d or `Close`d, or any
@@ -339,6 +349,10 @@ pub(super) struct TrSession {
     pub(super) skip_settings: bool,
     /// A simple query that yielded for COPY, to read at the drain.
     pub(super) copy_query: Option<bytes::Bytes>,
+    /// State only the session's backend has (temporary objects, held
+    /// cursors, SQL prepared statements, LISTEN, advisory locks): a re-home
+    /// that cannot recreate it is refused (see `session_bound`).
+    pub(super) bound: super::session_bound::Bound,
 }
 
 impl TrSession {
@@ -362,11 +376,13 @@ impl TrSession {
             ext_dispatched: false,
             fault_resent: false,
             ext_copy_end: None,
+            ext_copy_end_completions: 0,
             acked: HashMap::new(),
             tx_portals: HashMap::new(),
             simple_cycle: ExtSetCycle::default(),
             skip_settings: false,
             copy_query: None,
+            bound: super::session_bound::Bound::default(),
         }
     }
 }
@@ -560,8 +576,8 @@ impl ProxyServer {
     }
 
     /// TR-03: can this read-shaped statement be re-executed on an unknown
-    /// outcome? Only if every syntactic function call is a PostgreSQL built-in
-    /// known to be side-effect-free (or operator-listed), no quoted identifier
+    /// outcome? Only if every call-shaped token is explicitly operator-listed
+    /// as side-effect-free, no quoted identifier
     /// is called (its case is opaque to the policy), and the statement does not
     /// select INTO or consume a sequence. Anything else is `Other`: it may have
     /// run once already, so the proxy will not run it again.
@@ -569,21 +585,19 @@ impl ProxyServer {
         if Self::contains_word_ci(core, "into") {
             return false;
         }
-        let mut ok = true;
-        let scanned = crate::replay_sql::words(core, |w| {
-            if w.call && (w.quoted || !policy.allows_call(w.text)) {
-                ok = false;
-                return false;
-            }
-            true
-        });
-        scanned.is_ok() && ok
+        crate::replay_sql::all_calls_satisfy(core, |w| !w.quoted && policy.allows_call(w.text))
+            .unwrap_or(false)
     }
 
     /// Classify one client statement for in-session TR (see `StmtKind`).
     /// Conservative by construction: anything not positively recognised as a
     /// read or as idempotent control is treated as a possible write.
     pub(super) fn tr_classify(sql: &str, policy: &TrReadPolicy) -> StmtKind {
+        Self::tr_routing_classify(sql, policy)
+    }
+
+    /// Read-shape/direct-call classifier kept independent of replay admission.
+    pub(super) fn tr_routing_classify(sql: &str, policy: &TrReadPolicy) -> StmtKind {
         let Ok(boundaries) = crate::replay_sql::boundaries(sql) else {
             // The session's lexical rules or malformed input make commit
             // boundaries uncertain. Never replay a possibly durable outcome.
@@ -654,13 +668,16 @@ impl ProxyServer {
         if kw("COPY") {
             return if Self::contains_word_ci(core, "from") {
                 StmtKind::Write
-            } else {
+            } else if Self::tr_read_eligible(core, policy) {
                 StmtKind::Read
+            } else {
+                StmtKind::Other
             };
         }
         if kw("EXPLAIN") {
             return if Self::contains_word_ci(core, "analyze")
                 || Self::contains_word_ci(core, "analyse")
+                || !Self::tr_read_eligible(core, policy)
             {
                 StmtKind::Other
             } else {
@@ -1799,7 +1816,18 @@ impl ProxyServer {
     /// Before re-homing: an incomplete restore set is not something to hand
     /// the client silently. Refuse the failover instead (surfaces as `08006`
     /// "session state could not be restored").
-    pub(super) fn tr_restore_preflight(tr: &TrSession) -> Result<()> {
+    pub(super) fn tr_restore_preflight(tr: &TrSession, replays_transaction: bool) -> Result<()> {
+        // Tracked settings are restored here; everything else must not be
+        // left behind.
+        let bound = tr.bound.blocking(replays_transaction, true);
+        if bound != 0 {
+            return Err(ProxyError::Protocol(format!(
+                "the session held {} on the failed backend, which a replacement backend \
+                 cannot be given; reconnect and recreate them (DISCARD ALL clears what \
+                 the proxy counts)",
+                super::session_bound::describe(bound)
+            )));
+        }
         if tr.gucs_unknown {
             return Err(ProxyError::Protocol(
                 "the session changed settings in a way the proxy cannot follow (see \
@@ -2067,10 +2095,14 @@ impl ProxyServer {
             // replay a transaction from this incomplete history.
             session.tr_replay_tainted.store(true, Ordering::Relaxed);
         }
-        let sql = crate::protocol::query_text(&msg.payload);
+        let sql = Self::simple_request_sql(msg);
         // Not UTF-8 (a client_encoding such as LATIN1): `tr_after_response`
         // cannot read its settings; they are read below from the raw bytes.
-        let raw = sql.is_none() && tr.track_gucs && !tr.skip_settings;
+        // A FunctionCall's payload is not SQL at all.
+        let raw = sql.is_none()
+            && msg.msg_type == MessageType::Query
+            && tr.track_gucs
+            && !tr.skip_settings;
         let before = tr.prev_status;
         if !tr.acked.is_empty() && sql.is_none_or(Self::tr_touches_statements) {
             // PREPARE / DEALLOCATE / DISCARD ALL act on named statements
@@ -2136,7 +2168,9 @@ impl ProxyServer {
             wait_ready,
             defines,
             unnamed,
+            reparked,
         } = ext;
+        let unnamed = unnamed.or(reparked);
         if !tr.record_tx {
             return;
         }
@@ -2719,6 +2753,7 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
         deadline: tokio::time::Instant,
+        replays_transaction: bool,
     ) -> Result<String> {
         let expired = || ProxyError::Network("recovery deadline exceeded".to_string());
         // The request's responses now come from two backends (and a replay
@@ -2771,7 +2806,7 @@ impl ProxyServer {
                 }
                 Ok(()) => {
                     let bc = conns.get_mut(&node).expect("just ensured");
-                    Self::tr_restore_preflight(tr)?;
+                    Self::tr_restore_preflight(tr, replays_transaction)?;
                     let (wt, rt, mf) = (
                         state.limits.backend_write_timeout,
                         state.limits.backend_read_timeout,
@@ -3154,8 +3189,10 @@ impl ProxyServer {
             .copy_in_progress
             .load(std::sync::atomic::Ordering::Relaxed);
         let (kind, wait_ready) = match &inflight {
+            // A FunctionCall has no text: like a Query that is not UTF-8,
+            // its outcome once delivered is never assumed.
             InFlight::Simple(msg) => (
-                crate::protocol::query_text(&msg.payload)
+                Self::simple_request_sql(msg)
                     .map(|sql| Self::tr_classify(sql, &state.tr_read_policy))
                     .unwrap_or(StmtKind::Commit),
                 true,
@@ -3166,6 +3203,7 @@ impl ProxyServer {
                         batch,
                         wait_ready,
                         unnamed,
+                        reparked,
                         ..
                     },
                 ..
@@ -3175,7 +3213,7 @@ impl ProxyServer {
                 // registry (which re-execution re-prepares from) agrees.
                 Self::tr_extended_kind_prior(
                     batch,
-                    unnamed.map(|(p, _)| p.as_ref()),
+                    unnamed.or(*reparked).map(|(p, _)| p.as_ref()),
                     state.limits.max_prepared_statements,
                     &state.tr_read_policy,
                     PriorCycles {
@@ -3274,6 +3312,9 @@ impl ProxyServer {
             FaultPhase::OutcomeUnknown => "while the statement was in flight (outcome unknown)",
         };
 
+        // A replay recreates what the open transaction made on the
+        // replacement; any other re-home does not.
+        let replays_transaction = action == TrAction::ReplayThenReexecute;
         match action {
             TrAction::CloseIncompleteResponse => {
                 state.latency.record_refusal(not_replayable);
@@ -3303,18 +3344,25 @@ impl ProxyServer {
                 } else {
                     not_replayable
                 });
-                let node =
-                    match Self::tr_acquire_replacement(conns, tr, session, state, config, deadline)
-                        .await
-                    {
-                        Ok(n) => n,
-                        Err(e) => {
-                            return Self::tr_fail_no_replacement(
-                                client, &fault, &e, in_tx, wait_ready, session,
-                            )
-                            .await;
-                        }
-                    };
+                let node = match Self::tr_acquire_replacement(
+                    conns,
+                    tr,
+                    session,
+                    state,
+                    config,
+                    deadline,
+                    replays_transaction,
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Self::tr_fail_no_replacement(
+                            client, &fault, &e, in_tx, wait_ready, session,
+                        )
+                        .await;
+                    }
+                };
                 state
                     .latency
                     .failover_reconnect
@@ -3345,25 +3393,32 @@ impl ProxyServer {
                 Ok(Some((Some(node), sent)))
             }
             TrAction::Reexecute | TrAction::ReplayThenReexecute => {
-                let node =
-                    match Self::tr_acquire_replacement(conns, tr, session, state, config, deadline)
-                        .await
-                    {
-                        Ok(n) => n,
-                        Err(e) => {
-                            state.latency.record_refusal(
-                                if tokio::time::Instant::now() >= deadline {
-                                    ReplayRefusal::Deadline
-                                } else {
-                                    ReplayRefusal::BackendUnavailable
-                                },
-                            );
-                            return Self::tr_fail_no_replacement(
-                                client, &fault, &e, in_tx, wait_ready, session,
-                            )
-                            .await;
-                        }
-                    };
+                let node = match Self::tr_acquire_replacement(
+                    conns,
+                    tr,
+                    session,
+                    state,
+                    config,
+                    deadline,
+                    replays_transaction,
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        state
+                            .latency
+                            .record_refusal(if tokio::time::Instant::now() >= deadline {
+                                ReplayRefusal::Deadline
+                            } else {
+                                ReplayRefusal::BackendUnavailable
+                            });
+                        return Self::tr_fail_no_replacement(
+                            client, &fault, &e, in_tx, wait_ready, session,
+                        )
+                        .await;
+                    }
+                };
                 state
                     .latency
                     .failover_reconnect
@@ -3480,6 +3535,9 @@ impl ProxyServer {
                     continues_cycle: None,
                 };
                 let r = match inflight {
+                    InFlight::Simple(msg) if msg.msg_type == MessageType::FunctionCall => {
+                        Self::forward_function_call(fwd, msg).await
+                    }
                     InFlight::Simple(msg) => Self::forward_simple_query(fwd, msg).await,
                     InFlight::Extended { ext, reprepare } => {
                         Self::forward_extended_batch(
@@ -3488,6 +3546,10 @@ impl ProxyServer {
                             reprepare,
                             registry,
                             Self::tr_hold_bytes(session, state, || kind),
+                            // Re-executed on the replacement the recovery
+                            // chose; the batch holds the statements as the
+                            // hooks left them.
+                            &RouteOverride::None,
                         )
                         .await
                     }
@@ -3600,6 +3662,9 @@ impl ProxyServer {
         tr.pending_tx_gucs.clear();
         tr.tx_savepoints.clear();
         tr.tx_gucs_unknown = false;
+        // What the lost transaction made vanished with it (what survives a
+        // rollback refused this re-home).
+        tr.bound.transaction_lost();
         // The response the client just saw ended with ErrorResponse + RFQ.
         Self::note_ready_for_query(session, if in_tx { b'E' } else { b'I' }, true);
         Self::journal_discard(session, if in_tx { b'E' } else { b'I' });

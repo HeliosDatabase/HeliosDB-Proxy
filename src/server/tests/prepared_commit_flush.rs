@@ -12,6 +12,7 @@ fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
 fn cached_server() -> ProxyServer {
     let mut config = test_config();
     config.cache.enabled = true;
+    config.cache.extended_protocol = crate::config::ExtendedProtocolCache::On;
     config.tr_enabled = false;
     ProxyServer::new(config).unwrap()
 }
@@ -483,6 +484,7 @@ async fn recovery_waits_for_a_promotion_in_progress() {
         &server.state,
         &config,
         tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
     )
     .await
     .unwrap();
@@ -553,6 +555,7 @@ async fn recovery_redials_cached_socket_with_unpublished_tail() {
         &server.state,
         &config,
         tokio::time::Instant::now() + Duration::from_secs(2),
+        false,
     )
     .await
     .unwrap();
@@ -609,6 +612,7 @@ async fn a_restore_on_a_reused_socket_forgets_its_unnamed_statement() {
         &server.state,
         &config,
         tokio::time::Instant::now() + Duration::from_secs(2),
+        false,
     )
     .await
     .unwrap();

@@ -43,7 +43,9 @@ def normalize(insn):
     return insn.strip()
 
 
-def functions(path):
+def bodies(path):
+    """([(start, end, sha256 of the normalized body)], instruction count) of `path`,
+    one entry per `.eh_frame` FDE, sorted by start address."""
     fdes = subprocess.run(["readelf", "-wF", path], capture_output=True, text=True, check=True).stdout
     ranges = sorted((int(a, 16), int(b, 16))
                     for a, b in re.findall(r"FDE cie=[0-9a-f]+ pc=([0-9a-f]+)\.\.([0-9a-f]+)", fdes))
@@ -59,8 +61,13 @@ def functions(path):
     for start, end in ranges:
         i, j = bisect.bisect_left(addrs, start), bisect.bisect_left(addrs, end)
         body = "\n".join(t for _, t in insns[i:j])
-        out.append((start, hashlib.sha256(body.encode()).hexdigest()))
+        out.append((start, end, hashlib.sha256(body.encode()).hexdigest()))
     return out, len(insns)
+
+
+def functions(path):
+    out, count = bodies(path)
+    return [(start, digest) for start, _end, digest in out], count
 
 
 def compare(base, cand):

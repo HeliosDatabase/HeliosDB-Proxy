@@ -7,9 +7,11 @@
 //!
 //! A registry is a JSON index listing `{name, version, artifact, sha256,
 //! signature?}`. `install` resolves an entry, fetches the artefact, checks its
-//! SHA-256 against the index, optionally verifies an Ed25519 signature against a
-//! trust root (reusing [`SignatureVerifier`]), and drops `<name>.wasm` (plus a
-//! `<name>.sig` sidecar when signed) into the destination plugins directory.
+//! SHA-256 against the index, optionally verifies an Ed25519 signature over it
+//! against a trust root ([`crate::plugin_artefact::TrustRoot`]), and drops it
+//! into the destination plugins directory: a packed artefact (gzip) as
+//! `<name>.tar.gz`, a bare module as `<name>.wasm` (plus a `<name>.sig`
+//! sidecar when the index signs it).
 //!
 //! Artefacts are resolved from **local / `file://` paths** (a private registry
 //! on a shared filesystem or an air-gapped mirror) or fetched over **`http://`**
@@ -19,6 +21,8 @@
 //! at those options (a direct TLS client is the remaining follow-on).
 
 use std::path::{Path, PathBuf};
+
+use crate::plugin_artefact::{self, TrustRoot};
 
 /// A registry index file: a flat list of installable plugin artefacts.
 #[derive(Debug, serde::Deserialize)]
@@ -52,7 +56,10 @@ pub struct RegistryEntry {
 pub struct InstallReport {
     pub name: String,
     pub version: String,
+    /// The installed plugin file: `<name>.tar.gz` for a packed artefact,
+    /// `<name>.wasm` for a bare module.
     pub wasm_path: PathBuf,
+    /// The `<name>.sig` sidecar written for a signed bare module.
     pub sig_path: Option<PathBuf>,
     pub sha256: String,
     /// Trust-root key label that verified the signature, when verified.
@@ -60,73 +67,32 @@ pub struct InstallReport {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut s = String::with_capacity(64);
-    for b in digest.iter() {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
+    plugin_artefact::sha256_hex(bytes)
 }
 
 /// Verify an Ed25519 signature (base64 of the raw 64-byte signature) over
-/// `bytes` against any `*.pub` key in `trust_root` (each a base64 of a raw
-/// 32-byte Ed25519 public key — the same trust-root format the plugin loader
-/// uses). Returns the matching key's label. Self-contained so `install` needs
-/// no WASM runtime / `wasm-plugins` feature.
+/// `bytes` against a trust root (a directory of `*.pub` keys, a key file,
+/// or an inline hex key — the format the plugin loader reads). Returns the
+/// matching key's label. Needs no WASM runtime / `wasm-plugins` feature.
 fn verify_against_trust_root(
     bytes: &[u8],
     sig_b64: &str,
     trust_root: &Path,
 ) -> Result<String, String> {
-    use base64::Engine as _;
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let trust = TrustRoot::load(&trust_root.to_string_lossy()).map_err(|e| e.to_string())?;
+    trust
+        .verify(bytes, sig_b64)
+        .map(str::to_string)
+        .map_err(|e| e.to_string())
+}
 
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let sig_bytes = b64
-        .decode(sig_b64.trim())
-        .map_err(|e| format!("decode signature: {e}"))?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("signature must be 64 bytes, got {}", sig_bytes.len()))?;
-    let sig = Signature::from_bytes(&sig_arr);
-
-    let mut any = false;
-    let entries = std::fs::read_dir(trust_root)
-        .map_err(|e| format!("read trust root {}: {e}", trust_root.display()))?;
-    for ent in entries.flatten() {
-        let p = ent.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("pub") {
-            continue;
-        }
-        let raw = std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-        let kb = b64
-            .decode(raw.trim())
-            .map_err(|e| format!("decode {}: {e}", p.display()))?;
-        let karr: [u8; 32] = kb
-            .as_slice()
-            .try_into()
-            .map_err(|_| format!("{} must hold a 32-byte pubkey", p.display()))?;
-        let vk = VerifyingKey::from_bytes(&karr)
-            .map_err(|e| format!("{} invalid pubkey: {e}", p.display()))?;
-        any = true;
-        if vk.verify(bytes, &sig).is_ok() {
-            let label = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_string();
-            return Ok(label);
-        }
+/// Remove `path` if it exists.
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {}: {e}", path.display())),
     }
-    if !any {
-        return Err(format!(
-            "trust root {} has no *.pub keys",
-            trust_root.display()
-        ));
-    }
-    Err("signature does not match any trusted key".to_string())
 }
 
 /// Parse a registry index from disk.
@@ -222,8 +188,14 @@ pub fn find_entry<'a>(
 /// Install a plugin from the registry into `dest_dir`.
 ///
 /// Verifies the SHA-256 against the index; when `trust_root` is given the entry
-/// MUST carry a signature and it is verified against the trust root. On success
-/// writes `<name>.wasm` (+ `<name>.sig` when signed) into `dest_dir`.
+/// MUST carry a signature and it is verified against the trust root. A packed
+/// artefact (gzip) must unpack cleanly and declare the entry's name, and with a
+/// trust root its own `plugin.sig` must verify too (the proxy requires it). On
+/// success writes `<name>.tar.gz`, or `<name>.wasm` (+ `<name>.sig` when the
+/// index signs it), through a temporary file and a rename, the signature
+/// before the module, so a watching proxy never sees a half-written plugin.
+/// The other format's files for the same name are removed, so the directory
+/// holds one version of the plugin.
 pub fn install(
     index_path: &Path,
     name: &str,
@@ -275,18 +247,53 @@ pub fn install(
         signed_by = Some(label);
     }
 
+    plugin_artefact::validate_name(name).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| format!("create dest dir {}: {}", dest_dir.display(), e))?;
-    let wasm_path = dest_dir.join(format!("{name}.wasm"));
-    std::fs::write(&wasm_path, &bytes)
-        .map_err(|e| format!("write {}: {}", wasm_path.display(), e))?;
-
-    let sig_path = if let Some(sig) = entry.signature.as_deref() {
-        let p = dest_dir.join(format!("{name}.sig"));
-        std::fs::write(&p, sig).map_err(|e| format!("write {}: {}", p.display(), e))?;
-        Some(p)
+    let write = |path: &Path, bytes: &[u8]| {
+        plugin_artefact::write_atomic(path, bytes, 0o644).map_err(|e| e.to_string())
+    };
+    let (wasm_path, sig_path) = if plugin_artefact::is_gzip(&bytes) {
+        let artefact = plugin_artefact::unpack(&bytes, plugin_artefact::DEFAULT_MAX_ARTEFACT_BYTES)
+            .map_err(|e| format!("'{name}' is not a valid plugin artefact: {e}"))?;
+        if artefact.manifest.name != name {
+            return Err(format!(
+                "'{name}' artefact declares the plugin name '{}'",
+                artefact.manifest.name
+            ));
+        }
+        if let Some(root) = trust_root {
+            let trust = TrustRoot::load(&root.to_string_lossy()).map_err(|e| e.to_string())?;
+            plugin_artefact::verify_artefact(&artefact, &trust, false)
+                .map_err(|e| format!("'{name}' artefact: {e}"))?;
+        }
+        let path = dest_dir.join(format!("{name}.tar.gz"));
+        write(&path, &bytes)?;
+        for ext in ["wasm", "sig", "yaml", "json"] {
+            remove_if_present(&dest_dir.join(format!("{name}.{ext}")))?;
+        }
+        (path, None)
+    } else if plugin_artefact::is_wasm(&bytes) {
+        let path = dest_dir.join(format!("{name}.wasm"));
+        let sig_path = match entry.signature.as_deref() {
+            Some(sig) => {
+                let p = dest_dir.join(format!("{name}.sig"));
+                write(&p, sig.trim().as_bytes())?;
+                Some(p)
+            }
+            None => {
+                // A stale sidecar would no longer match the new module.
+                remove_if_present(&dest_dir.join(format!("{name}.sig")))?;
+                None
+            }
+        };
+        write(&path, &bytes)?;
+        remove_if_present(&dest_dir.join(format!("{name}.tar.gz")))?;
+        (path, sig_path)
     } else {
-        None
+        return Err(format!(
+            "'{name}' artefact is neither a WebAssembly module nor a .tar.gz plugin artefact"
+        ));
     };
 
     Ok(InstallReport {
@@ -302,45 +309,93 @@ pub fn install(
 /// What a [`verify`] produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
+    /// SHA-256 of the file (the module, or the whole `.tar.gz`).
     pub sha256: String,
-    /// Trust-root key label that verified the signature, when a trust root was
-    /// supplied (otherwise `None` — only the digest was computed).
+    /// Trust-root key label that verified the signature over the module,
+    /// when a trust root was supplied (otherwise `None` — only the digest
+    /// and, for an artefact, its integrity were checked).
     pub signed_by: Option<String>,
+    /// For an artefact with a `manifest.sig`: the key that signed its
+    /// manifest (with a trust root).
+    pub manifest_signed_by: Option<String>,
 }
 
-/// Verify a local plugin artefact already on disk (a pre-deploy / audit check,
-/// distinct from `install`): compute its SHA-256 and, when a trust root is
-/// given, check its Ed25519 signature. The signature is read from `sig_path`,
-/// or a `<name>.sig` sidecar next to the artefact (the convention the loader
-/// uses: `path.with_extension("sig")`).
+/// Verify a local plugin file already on disk (a pre-deploy / audit check,
+/// distinct from `install`).
+///
+/// - A `.tar.gz` artefact must unpack cleanly (entries, manifest, module
+///   SHA-256); with a trust root, its `plugin.sig` must verify, and so must
+///   its `manifest.sig` when present (and, with `require_manifest_signature`,
+///   it must be present).
+/// - A bare module: its SHA-256 and, with a trust root, its signature, read
+///   from `sig_path` or the `<name>.sig` sidecar (the loader's convention).
 pub fn verify(
-    wasm_path: &Path,
+    path: &Path,
     trust_root: Option<&Path>,
     sig_path: Option<&Path>,
 ) -> Result<VerifyReport, String> {
-    let bytes =
-        std::fs::read(wasm_path).map_err(|e| format!("read {}: {}", wasm_path.display(), e))?;
+    verify_with(path, trust_root, sig_path, false)
+}
+
+/// [`verify`], optionally requiring an artefact's signed manifest.
+pub fn verify_with(
+    path: &Path,
+    trust_root: Option<&Path>,
+    sig_path: Option<&Path>,
+    require_manifest_signature: bool,
+) -> Result<VerifyReport, String> {
+    let bytes = plugin_artefact::read_bounded(path, plugin_artefact::DEFAULT_MAX_ARTEFACT_BYTES)
+        .map_err(|e| e.to_string())?;
     let sha256 = sha256_hex(&bytes);
+    let trust = trust_root
+        .map(|root| TrustRoot::load(&root.to_string_lossy()).map_err(|e| e.to_string()))
+        .transpose()?;
+
+    if plugin_artefact::is_gzip(&bytes) {
+        let artefact = plugin_artefact::unpack(&bytes, plugin_artefact::DEFAULT_MAX_ARTEFACT_BYTES)
+            .map_err(|e| e.to_string())?;
+        let (signed_by, manifest_signed_by) = match &trust {
+            Some(trust) => {
+                let t =
+                    plugin_artefact::verify_artefact(&artefact, trust, require_manifest_signature)
+                        .map_err(|e| format!("signature verification failed: {e}"))?;
+                (Some(t.wasm_signed_by), t.manifest_signed_by)
+            }
+            None => (None, None),
+        };
+        return Ok(VerifyReport {
+            sha256,
+            signed_by,
+            manifest_signed_by,
+        });
+    }
 
     let mut signed_by = None;
-    if let Some(root) = trust_root {
+    if let Some(trust) = &trust {
         let sig_file = match sig_path {
             Some(p) => p.to_path_buf(),
-            None => wasm_path.with_extension("sig"),
+            None => path.with_extension("sig"),
         };
         let sig = std::fs::read_to_string(&sig_file)
             .map_err(|e| format!("read signature {}: {}", sig_file.display(), e))?;
-        let label = verify_against_trust_root(&bytes, sig.trim(), root)
+        let label = trust
+            .verify(&bytes, sig.trim())
             .map_err(|e| format!("signature verification failed: {e}"))?;
-        signed_by = Some(label);
+        signed_by = Some(label.to_string());
     }
-    Ok(VerifyReport { sha256, signed_by })
+    Ok(VerifyReport {
+        sha256,
+        signed_by,
+        manifest_signed_by: None,
+    })
 }
 
-/// Scaffold a new plugin source skeleton under `dir/<name>/`.
-///
-/// Writes a `plugin.yaml` manifest, a minimal Rust `src/lib.rs` hook stub, and a
-/// README so `helios-plugin new <name>` gives a buildable starting point.
+/// Scaffold a new plugin crate under `dir/<name>/`: a `Cargo.toml` for a
+/// `wasm32-unknown-unknown` cdylib, a `src/lib.rs` implementing the plugin ABI
+/// (`alloc`, `dealloc` and a `pre_query` hook answering `continue`), the
+/// `plugin.yaml` manifest `helios-plugin pack --manifest` reads, and a README
+/// with the build, pack and load steps. It builds as generated and depends on
+/// nothing but `std`.
 pub fn scaffold(name: &str, dir: &Path) -> Result<PathBuf, String> {
     if name.is_empty()
         || !name
@@ -355,24 +410,153 @@ pub fn scaffold(name: &str, dir: &Path) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(root.join("src"))
         .map_err(|e| format!("create {}: {}", root.display(), e))?;
+    let crate_name = name.replace('-', "_");
+    let write = |file: &str, text: String| {
+        std::fs::write(root.join(file), text).map_err(|e| format!("write {file}: {e}"))
+    };
 
-    let manifest = format!(
-        "name: {name}\nversion: 0.1.0\ndescription: A HeliosProxy plugin\nlicense: Apache-2.0\nhooks:\n  - pre_query\npermissions: []\n"
-    );
-    std::fs::write(root.join("plugin.yaml"), manifest)
-        .map_err(|e| format!("write plugin.yaml: {e}"))?;
+    write(
+        "Cargo.toml",
+        format!(
+            r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+publish = false
 
-    let lib_rs = "// Minimal HeliosProxy WASM plugin stub.\n// Build to wasm32-unknown-unknown, then `helios-plugin` pack + sign.\n//\n// Export the hooks named in plugin.yaml; the host calls pre_query(ptr,len)\n// before forwarding a query. Return 0 to allow, non-zero to block.\n#[no_mangle]\npub extern \"C\" fn pre_query(_ptr: i32, _len: i32) -> i32 {\n    0 // allow\n}\n";
-    std::fs::write(root.join("src/lib.rs"), lib_rs)
-        .map_err(|e| format!("write src/lib.rs: {e}"))?;
+[lib]
+crate-type = ["cdylib"]
 
-    let readme = format!(
-        "# {name}\n\nA HeliosProxy WASM plugin.\n\n## Build\n\n```\ncargo build --release --target wasm32-unknown-unknown\n```\n\nThen pack + sign the resulting `.wasm` and add it to your registry index so\n`helios-plugin install {name}` can deploy it.\n"
-    );
-    std::fs::write(root.join("README.md"), readme).map_err(|e| format!("write README.md: {e}"))?;
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+"#
+        ),
+    )?;
+
+    write(
+        "plugin.yaml",
+        format!(
+            "name: {name}\nversion: 0.1.0\ndescription: A HeliosProxy plugin\nlicense: Apache-2.0\nhooks:\n  - pre_query\n"
+        ),
+    )?;
+
+    write("src/lib.rs", SCAFFOLD_LIB_RS.to_string())?;
+
+    write(
+        "README.md",
+        format!(
+            r#"# {name}
+
+A HeliosProxy WASM plugin.
+
+## Build
+
+```
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown
+```
+
+## Pack and sign
+
+```
+helios-plugin keygen --out-dir keys --name publisher      # once
+helios-plugin pack --manifest plugin.yaml \
+  --wasm target/wasm32-unknown-unknown/release/{crate_name}.wasm \
+  --sign-with keys/publisher.key --output {name}.tar.gz
+helios-plugin inspect {name}.tar.gz
+```
+
+## Load
+
+Copy `{name}.tar.gz` into the proxy's `[plugins] plugin_dir` (with
+`trust_root` pointing at `keys/publisher.pub` or a directory holding it), then
+`POST /plugins/reload` on the admin API, send SIGHUP, or let `hot_reload` pick
+it up. `GET /plugins` lists it; `GET /plugins/files` shows why a file did not
+load.
+
+## The hook
+
+The proxy calls `pre_query` with the statement's context as JSON (`query`,
+`normalized`, `tables`, `is_read_only`, `hook_context`) and reads the JSON
+answer: `{{"kind": "continue"}}`, `{{"kind": "block", "reason": "..."}}`,
+`{{"kind": "rewrite", "sql": "..."}}`. Add `route`, `post_query` or
+`authenticate` the same way and list them under `hooks` in `plugin.yaml`.
+"#
+        ),
+    )?;
 
     Ok(root)
 }
+
+/// `src/lib.rs` of a scaffolded plugin.
+const SCAFFOLD_LIB_RS: &str = r##"//! A HeliosProxy WASM plugin.
+//!
+//! The plugin ABI: the host calls `alloc(len)` for a buffer, writes the
+//! hook's JSON input there, calls the hook with `(ptr, len)`, and frees the
+//! buffer with `dealloc(ptr, len)`. A hook that answers returns
+//! `(ptr << 32) | len` of a buffer it allocated with `alloc`; the host reads
+//! the JSON there and frees it with `dealloc`.
+
+use std::alloc::Layout;
+
+fn layout(size: i32) -> Option<Layout> {
+    if size <= 0 {
+        return None;
+    }
+    Layout::from_size_align(size as usize, 8).ok()
+}
+
+/// Allocate `size` bytes for the host. Returns 0 for an empty buffer.
+#[no_mangle]
+pub extern "C" fn alloc(size: i32) -> i32 {
+    match layout(size) {
+        // SAFETY: the layout has a non-zero size.
+        Some(layout) => unsafe { std::alloc::alloc(layout) as i32 },
+        None => 0,
+    }
+}
+
+/// Free a buffer `alloc` returned, with the size it was allocated with.
+#[no_mangle]
+pub extern "C" fn dealloc(ptr: i32, size: i32) {
+    if let (Some(layout), true) = (layout(size), ptr != 0) {
+        // SAFETY: `ptr` came from `alloc` with this size.
+        unsafe { std::alloc::dealloc(ptr as *mut u8, layout) }
+    }
+}
+
+/// Hand `bytes` to the host as a hook's answer.
+fn respond(bytes: &[u8]) -> i64 {
+    let ptr = alloc(bytes.len() as i32);
+    if ptr == 0 {
+        return 0;
+    }
+    // SAFETY: `alloc` returned `bytes.len()` writable bytes at `ptr`.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len()) };
+    ((ptr as u32 as i64) << 32) | (bytes.len() as i64)
+}
+
+/// The hook's JSON input.
+fn input<'a>(ptr: i32, len: i32) -> &'a [u8] {
+    if ptr == 0 || len <= 0 {
+        return &[];
+    }
+    // SAFETY: the host wrote `len` bytes at `ptr` and keeps them alive for
+    // the call.
+    unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }
+}
+
+/// Called before each statement runs. Parse the JSON input (for example
+/// with serde_json) to decide; this one lets every statement through.
+#[no_mangle]
+pub extern "C" fn pre_query(ptr: i32, len: i32) -> i64 {
+    let _context = input(ptr, len);
+    respond(br#"{"kind":"continue"}"#)
+}
+"##;
 
 #[cfg(test)]
 mod tests {
@@ -558,11 +742,126 @@ mod tests {
     fn scaffold_creates_skeleton() {
         let dir = tempfile::tempdir().unwrap();
         let root = scaffold("my-plugin", dir.path()).unwrap();
-        assert!(root.join("plugin.yaml").exists());
-        assert!(root.join("src/lib.rs").exists());
-        assert!(root.join("README.md").exists());
+        for file in ["Cargo.toml", "plugin.yaml", "src/lib.rs", "README.md"] {
+            assert!(root.join(file).exists(), "{file}");
+        }
+        let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        for export in [
+            "fn alloc(size: i32) -> i32",
+            "fn dealloc(ptr: i32, size: i32)",
+            "fn pre_query(ptr: i32, len: i32) -> i64",
+        ] {
+            assert!(lib.contains(export), "{export}");
+        }
+        let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("crate-type = [\"cdylib\"]"));
+        // The manifest it writes is the one `pack --manifest` reads.
+        let manifest = crate::plugin_artefact::parse_yaml_manifest(
+            &std::fs::read_to_string(root.join("plugin.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.name, "my-plugin");
+        assert_eq!(manifest.hooks, ["pre_query"]);
+        assert!(manifest.unknown_keys.is_empty());
         // Reject invalid names + double-create.
         assert!(scaffold("bad name", dir.path()).is_err());
         assert!(scaffold("my-plugin", dir.path()).is_err());
+    }
+
+    /// A packed artefact installs as `<name>.tar.gz`, replacing a bare
+    /// module of the same name, and must declare the entry's name.
+    #[test]
+    fn install_lands_an_artefact_as_tar_gz() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let input = crate::plugin_artefact::PackInput {
+            name: "colmask".into(),
+            version: "0.2.0".into(),
+            description: String::new(),
+            license: String::new(),
+            hooks: vec!["pre_query".into()],
+            wasm: WASM.to_vec(),
+            wasm_signature: None,
+        };
+        let (_, bytes) = crate::plugin_artefact::pack(&input, Some(&key)).unwrap();
+        std::fs::write(src.path().join("colmask.tar.gz"), &bytes).unwrap();
+        let index = |name: &str| {
+            let index = format!(
+                r#"{{"plugins":[{{"name":"{name}","artifact":"colmask.tar.gz","sha256":"{}","signature":"{}"}}]}}"#,
+                sha256_hex(&bytes),
+                b64(&key.sign(&bytes).to_bytes())
+            );
+            let path = src.path().join(format!("{name}.json"));
+            std::fs::write(&path, index).unwrap();
+            path
+        };
+        let trust = tempfile::tempdir().unwrap();
+        std::fs::write(
+            trust.path().join("official.pub"),
+            b64(&key.verifying_key().to_bytes()),
+        )
+        .unwrap();
+        std::fs::write(dst.path().join("colmask.wasm"), WASM).unwrap();
+        std::fs::write(dst.path().join("colmask.sig"), "old").unwrap();
+
+        let r = install(
+            &index("colmask"),
+            "colmask",
+            None,
+            dst.path(),
+            Some(trust.path()),
+        )
+        .unwrap();
+        assert_eq!(r.wasm_path, dst.path().join("colmask.tar.gz"));
+        assert_eq!(std::fs::read(&r.wasm_path).unwrap(), bytes);
+        assert!(r.sig_path.is_none());
+        assert!(
+            !dst.path().join("colmask.wasm").exists(),
+            "the bare module is replaced"
+        );
+        assert!(!dst.path().join("colmask.sig").exists());
+
+        let err = install(&index("other"), "other", None, dst.path(), None).unwrap_err();
+        assert!(err.contains("declares the plugin name 'colmask'"), "{err}");
+    }
+
+    #[test]
+    fn verify_checks_an_artefacts_signatures() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        std::fs::write(
+            trust.path().join("official.pub"),
+            b64(&key.verifying_key().to_bytes()),
+        )
+        .unwrap();
+        let input = crate::plugin_artefact::PackInput {
+            name: "p".into(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            license: String::new(),
+            hooks: vec!["route".into()],
+            wasm: WASM.to_vec(),
+            wasm_signature: None,
+        };
+        let signed = dir.path().join("signed.tar.gz");
+        std::fs::write(
+            &signed,
+            crate::plugin_artefact::pack(&input, Some(&key)).unwrap().1,
+        )
+        .unwrap();
+        let r = verify_with(&signed, Some(trust.path()), None, true).unwrap();
+        assert_eq!(r.signed_by.as_deref(), Some("official"));
+        assert_eq!(r.manifest_signed_by.as_deref(), Some("official"));
+
+        let unsigned = dir.path().join("unsigned.tar.gz");
+        std::fs::write(
+            &unsigned,
+            crate::plugin_artefact::pack(&input, None).unwrap().1,
+        )
+        .unwrap();
+        assert!(verify(&unsigned, None, None).is_ok(), "integrity only");
+        assert!(verify(&unsigned, Some(trust.path()), None).is_err());
     }
 }

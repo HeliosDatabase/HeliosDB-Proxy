@@ -156,6 +156,17 @@ impl RateLimitMetrics {
         self.key_stats.remove(key_str.as_str());
     }
 
+    /// Drop the statistics of the key rendered as `key` (its state was
+    /// evicted as idle).
+    pub fn forget_key(&self, key: &str) {
+        self.key_stats.remove(key);
+    }
+
+    /// Keys with statistics.
+    pub fn tracked_keys(&self) -> usize {
+        self.key_stats.len()
+    }
+
     /// Get current statistics snapshot
     pub fn get_stats(&self) -> RateLimitStats {
         let total = self.total_requests.load(Ordering::Relaxed);

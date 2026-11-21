@@ -14,45 +14,45 @@ impl ProxyServer {
         msg: Message,
         state: &Arc<ServerState>,
         session: &Arc<ClientSession>,
-    ) -> (Message, PreQueryAction) {
+    ) -> (Message, PreQueryAction, bool) {
         #[cfg(feature = "wasm-plugins")]
         {
             let pm = match state.plugin_manager.as_ref() {
                 Some(pm) => pm,
-                None => return (msg, PreQueryAction::Forward),
+                None => return (msg, PreQueryAction::Forward, false),
             };
 
             if msg.msg_type != MessageType::Query {
-                return (msg, PreQueryAction::Forward);
+                return (msg, PreQueryAction::Forward, false);
             }
 
             // Zero plugins registered for this hook — skip the payload
             // clone, SQL parse, and context construction entirely.
             if !pm.has_hook(HookType::PreQuery) {
-                return (msg, PreQueryAction::Forward);
+                return (msg, PreQueryAction::Forward, false);
             }
 
             let query_msg = match QueryMessage::parse(msg.payload.clone()) {
                 Ok(q) => q,
-                Err(_) => return (msg, PreQueryAction::Forward),
+                Err(_) => return (msg, PreQueryAction::Forward, false),
             };
 
             let ctx = Self::build_query_context(&query_msg.query, session);
 
             match pm.execute_pre_query(&ctx) {
-                PreQueryResult::Continue => (msg, PreQueryAction::Forward),
-                PreQueryResult::Block(reason) => (msg, PreQueryAction::Block(reason)),
+                PreQueryResult::Continue => (msg, PreQueryAction::Forward, false),
+                PreQueryResult::Block(reason) => (msg, PreQueryAction::Block(reason), false),
                 PreQueryResult::Rewrite(new_sql) => {
                     let rewritten = QueryMessage { query: new_sql }.encode();
-                    (rewritten, PreQueryAction::Forward)
+                    (rewritten, PreQueryAction::Forward, true)
                 }
-                PreQueryResult::Cached(bytes) => (msg, PreQueryAction::Cached(bytes)),
+                PreQueryResult::Cached(bytes) => (msg, PreQueryAction::Cached(bytes), false),
             }
         }
         #[cfg(not(feature = "wasm-plugins"))]
         {
             let _ = (state, session);
-            (msg, PreQueryAction::Forward)
+            (msg, PreQueryAction::Forward, false)
         }
     }
 
@@ -122,6 +122,56 @@ impl ProxyServer {
         }
     }
 
+    /// Answer a simple query from the pre-query plugin's decision: its Block
+    /// (an error, then ReadyForQuery) or its cached result (never for a query
+    /// that continues a cycle the backend holds open). `Ok(true)`: answered,
+    /// it must not reach a backend.
+    pub(super) async fn plugin_answered(
+        action: &PreQueryAction,
+        continues_cycle: bool,
+        stream: &mut ClientStream,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) -> Result<bool> {
+        let status = session
+            .last_rfq_status
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match action {
+            PreQueryAction::Forward => {
+                let _ = (continues_cycle, stream, state, status);
+                Ok(false)
+            }
+            #[cfg(feature = "wasm-plugins")]
+            PreQueryAction::Block(reason) => {
+                tracing::info!(reason = %reason, "pre-query plugin blocked query");
+                Self::send_block_response(stream, reason, status, state).await?;
+                Ok(true)
+            }
+            #[cfg(feature = "wasm-plugins")]
+            PreQueryAction::Cached(_) if continues_cycle => Ok(false),
+            #[cfg(feature = "wasm-plugins")]
+            PreQueryAction::Cached(bytes) => {
+                match Self::synthesise_cached_response(bytes, status) {
+                    Ok(reply) => {
+                        stream
+                            .write_all(&reply)
+                            .await
+                            .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
+                        state
+                            .metrics
+                            .bytes_sent
+                            .fetch_add(reply.len() as u64, Ordering::Relaxed);
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to synthesise cached response; falling back to backend");
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
+
     /// Send the client a `Block`-outcome response: an error frame plus
     /// `ReadyForQuery` so the client's state machine is ready for its next
     /// query. `status` is the backend's real transaction status (the last
@@ -152,25 +202,166 @@ impl ProxyServer {
         Ok(())
     }
 
-    /// Build a `QueryContext` for the plugin hook. Populated fields: `query`
-    /// (verbatim), `is_read_only` (derived from SQL verb), and `hook_context`
-    /// with the session id as `client_id`. `normalized` and `tables` are
-    /// left as cheap stand-ins until the analytics normaliser is wired in
-    /// (T0-d, unified context).
+    /// Build a `QueryContext` for a plugin hook call: `query` (verbatim),
+    /// `normalized` (its fingerprint: literals replaced by `?`), `tables`
+    /// (the relations it names, sorted, schema-qualified as written),
+    /// `is_read_only` (from the SQL verb), and the session's `hook_context`
+    /// ([`Self::plugin_session_context`]) with a request id of its own.
     #[cfg(feature = "wasm-plugins")]
     pub(super) fn build_query_context(query: &str, session: &Arc<ClientSession>) -> QueryContext {
         let is_read_only = !Self::is_write_query(query);
-        let hook_context = HookContext {
-            client_id: Some(session.id.to_string()),
-            ..HookContext::default()
-        };
+        // The session's context (identity, database, branch, attributes)
+        // with a request id of this call's own.
+        let mut hook_context =
+            session
+                .plugin_context
+                .get()
+                .cloned()
+                .unwrap_or_else(|| HookContext {
+                    client_id: Some(session.id.to_string()),
+                    ..HookContext::default()
+                });
+        hook_context.request_id = uuid::Uuid::new_v4().to_string();
+        let mut tables: Vec<String> =
+            crate::sql_relations::table_names(&crate::sql_relations::RELATION_PATTERN, query)
+                .map(|t| t.split_whitespace().collect::<String>())
+                .collect();
+        tables.sort();
+        tables.dedup();
         QueryContext {
             query: query.to_string(),
-            normalized: query.to_string(),
-            tables: Vec::new(),
+            normalized: crate::sql_text::fingerprint(query).text,
+            tables,
             is_read_only,
             hook_context,
         }
+    }
+
+    /// What a session's plugin hook calls carry in `hook_context`, from its
+    /// startup parameters (`params`), the identity an Authenticate plugin
+    /// gave it, and its tenant (`[multi_tenancy] identify_by`):
+    ///
+    /// - `client_id` (the session id) and `identity` (the plugin identity's
+    ///   username, else the startup `user`);
+    /// - `database` and `branch` (`<database>@<branch>` split);
+    /// - `attributes`: `client_ip`, `user`, `application_name`, `tenant_id`
+    ///   (the configured tenant, else the plugin identity's), the identity
+    ///   as `identity.user_id` / `identity.username` / `identity.roles`
+    ///   (comma-separated) / `identity.tenant_id`, and every `helios.*`
+    ///   setting of the session: a startup parameter, or `-c helios.x=y` /
+    ///   `--helios.x=y` in `options`. `helios.agent_id` and
+    ///   `helios.model_id` are also given as `agent_id` and `model_id`.
+    #[cfg(feature = "wasm-plugins")]
+    pub(super) fn plugin_session_context(
+        params: &HashMap<String, String>,
+        identity: Option<&crate::plugins::Identity>,
+        tenant: Option<&str>,
+        client_ip: &str,
+        session_id: &str,
+    ) -> HookContext {
+        let mut attributes = HashMap::new();
+        attributes.insert("client_ip".to_string(), client_ip.to_string());
+        for key in ["user", "application_name"] {
+            if let Some(value) = params.get(key) {
+                attributes.insert(key.to_string(), value.clone());
+            }
+        }
+        for (key, value) in params.iter().filter(|(k, _)| k.starts_with("helios.")) {
+            attributes.insert(key.clone(), value.clone());
+        }
+        if let Some(options) = params.get("options") {
+            for (key, value) in Self::options_settings(options) {
+                if key.starts_with("helios.") {
+                    attributes.insert(key, value);
+                }
+            }
+        }
+        for (prefixed, plain) in [
+            ("helios.agent_id", "agent_id"),
+            ("helios.model_id", "model_id"),
+        ] {
+            if let Some(value) = attributes.get(prefixed).cloned() {
+                attributes.insert(plain.to_string(), value);
+            }
+        }
+        if let Some(id) = identity {
+            attributes.insert("identity.user_id".to_string(), id.user_id.clone());
+            attributes.insert("identity.username".to_string(), id.username.clone());
+            attributes.insert("identity.roles".to_string(), id.roles.join(","));
+            if let Some(t) = &id.tenant_id {
+                attributes.insert("identity.tenant_id".to_string(), t.clone());
+            }
+        }
+        let tenant_id = tenant
+            .map(str::to_string)
+            .or_else(|| identity.and_then(|id| id.tenant_id.clone()));
+        if let Some(t) = tenant_id {
+            attributes.insert("tenant_id".to_string(), t);
+        }
+        let user = params.get("user").cloned();
+        let database = params.get("database").cloned().or_else(|| user.clone());
+        let (database, branch) = match database.as_deref() {
+            Some(db) => {
+                let (base, branch) = crate::database_name::split_branch(db);
+                (Some(base.to_string()), branch.map(str::to_string))
+            }
+            None => (None, None),
+        };
+        HookContext {
+            request_id: String::new(),
+            client_id: Some(session_id.to_string()),
+            identity: identity
+                .map(|id| id.username.clone())
+                .filter(|name| !name.is_empty())
+                .or(user),
+            database,
+            branch,
+            attributes,
+        }
+    }
+
+    /// The `name=value` settings of a startup `options` string, as
+    /// PostgreSQL reads it: words separated by unescaped whitespace (a
+    /// backslash escapes the next character), each `-c name=value`,
+    /// `-cname=value` or `--name=value`.
+    #[cfg(feature = "wasm-plugins")]
+    pub(super) fn options_settings(options: &str) -> Vec<(String, String)> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut chars = options.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !word.is_empty() {
+                        words.push(std::mem::take(&mut word));
+                    }
+                }
+                c => word.push(c),
+            }
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+        let mut settings = Vec::new();
+        let mut iter = words.into_iter();
+        while let Some(w) = iter.next() {
+            let setting = if w == "-c" {
+                iter.next()
+            } else if let Some(rest) = w.strip_prefix("--") {
+                Some(rest.to_string())
+            } else {
+                w.strip_prefix("-c").map(str::to_string)
+            };
+            if let Some((name, value)) = setting.as_deref().and_then(|s| s.split_once('=')) {
+                settings.push((name.to_string(), value.to_string()));
+            }
+        }
+        settings
     }
 
     /// Run the Authenticate plugin hook at startup. Called from
@@ -270,25 +461,29 @@ impl ProxyServer {
                 Err(_) => return RouteOverride::None,
             };
             let ctx = Self::build_query_context(&query_msg.query, session);
-            match pm.execute_route(&ctx) {
-                RouteResult::Default => RouteOverride::None,
-                RouteResult::Primary => RouteOverride::Primary,
-                RouteResult::Standby => RouteOverride::Standby,
-                RouteResult::Node(name) => RouteOverride::Node(name),
-                RouteResult::Block(reason) => RouteOverride::Block(reason),
-                RouteResult::Branch(name) => {
-                    tracing::warn!(
-                        branch = %name,
-                        "Route hook returned Branch but branch routing is not yet wired — using default"
-                    );
-                    RouteOverride::None
-                }
-            }
+            Self::route_result_override(pm.execute_route(&ctx))
         }
         #[cfg(not(feature = "wasm-plugins"))]
         {
             let _ = (msg, state, session);
             RouteOverride::None
+        }
+    }
+
+    /// A route plugin's answer as the override the relay applies, on either
+    /// protocol.
+    #[cfg(feature = "wasm-plugins")]
+    pub(super) fn route_result_override(result: RouteResult) -> RouteOverride {
+        match result {
+            RouteResult::Default => RouteOverride::None,
+            RouteResult::Primary => RouteOverride::Primary,
+            RouteResult::Standby => RouteOverride::Standby,
+            RouteResult::Node(name) => RouteOverride::Node(name),
+            RouteResult::Block(reason) => RouteOverride::Block(reason),
+            // The session moves to the branch before the statement runs
+            // (`switch_branch`), or the statement is refused: it never runs
+            // on the database the plugin did not mean.
+            RouteResult::Branch(name) => RouteOverride::Branch(name),
         }
     }
 
@@ -327,24 +522,25 @@ impl ProxyServer {
     /// rebuilt `Query` (hint removed) when stripping is on. An explicit
     /// positional hint wins over a plugin route override; a plugin `Block` is
     /// handled by the caller before this runs.
+    /// The fourth element is the hint's `branch=` request, if any.
     #[cfg(feature = "routing-hints")]
     pub(super) fn resolve_simple_route(
         msg: &Message,
         plugin_override: RouteOverride,
         default_is_write: bool,
         state: &Arc<ServerState>,
-    ) -> (RouteOverride, bool, Option<Message>) {
+    ) -> (RouteOverride, bool, Option<Message>, Option<String>) {
         let parser = match state.hint_parser.as_ref() {
             Some(p) => p,
-            None => return (plugin_override, default_is_write, None),
+            None => return (plugin_override, default_is_write, None, None),
         };
         let sql = match crate::protocol::query_text(&msg.payload) {
             Some(s) => s,
-            None => return (plugin_override, default_is_write, None),
+            None => return (plugin_override, default_is_write, None, None),
         };
         let hints = parser.parse(sql);
         if hints.is_empty() {
-            return (plugin_override, default_is_write, None);
+            return (plugin_override, default_is_write, None, None);
         }
         let stripped = parser.strip(sql);
         let is_write = Self::is_write_query(&stripped);
@@ -362,20 +558,25 @@ impl ProxyServer {
         } else {
             None
         };
-        (effective, is_write, forward)
+        (effective, is_write, forward, hints.branch)
     }
 
     /// Resolve hint-driven routing for an extended-protocol batch from the
-    /// first Parse's SQL. `Some((is_write, forced_node))` when hints are
-    /// present (write flag computed on the stripped SQL), else `None` so the
-    /// caller uses verb-based defaults. The hint comment is left in the
-    /// forwarded `Parse` (a no-op SQL comment); rewriting the batch buffer is
+    /// first Parse's SQL. `Some((is_write, forced_node, standby_hint))` when
+    /// hints are present (write flag computed on the stripped SQL), else
+    /// `None` so the caller uses the route plugin's override (`plugin`) or
+    /// the verb-based defaults. A hint that names no route leaves the
+    /// plugin's override in force, as on the simple path
+    /// (`resolve_simple_route`). The hint comment is left in the forwarded
+    /// `Parse` (a no-op SQL comment); rewriting the batch buffer is
     /// unnecessary for correctness.
+    /// The second element is the hint's `branch=` request, if any.
     #[cfg(feature = "routing-hints")]
     pub(super) fn extended_hint_route(
         state: &Arc<ServerState>,
         sql: &str,
-    ) -> Option<(bool, Option<String>, bool)> {
+        plugin: &RouteOverride,
+    ) -> Option<(super::ext_hooks::BatchRoute, Option<String>)> {
         let parser = state.hint_parser.as_ref()?;
         let hints = parser.parse(sql);
         if hints.is_empty() {
@@ -383,13 +584,11 @@ impl ProxyServer {
         }
         let stripped = parser.strip(sql);
         let is_write = Self::is_write_query(&stripped);
-        match Self::hint_to_override(&hints) {
-            RouteOverride::Primary => Some((true, None, false)),
-            // A standby hint never moves a write or transaction control.
-            RouteOverride::Standby => Some((false, None, !is_write)),
-            RouteOverride::Node(n) => Some((is_write, Some(n), false)),
-            _ => Some((is_write, None, false)),
-        }
+        let route = match Self::hint_to_override(&hints) {
+            RouteOverride::None => Self::route_by_override(plugin, is_write),
+            hinted => Self::route_by_override(&hinted, is_write),
+        };
+        Some((route, hints.branch))
     }
 
     /// Fire post-query hooks after a message has been forwarded (or failed
@@ -419,7 +618,20 @@ impl ProxyServer {
             Ok(q) => q,
             Err(_) => return,
         };
-        let ctx = Self::build_query_context(&query_msg.query, session);
+        Self::fire_post_query_sql(pm, &query_msg.query, session, result, elapsed);
+    }
+
+    /// Fire the post-query hooks for `sql`: a simple Query, or the first
+    /// statement of an extended-protocol cycle its Sync ended.
+    #[cfg(feature = "wasm-plugins")]
+    pub(super) fn fire_post_query_sql(
+        pm: &PluginManager,
+        sql: &str,
+        session: &Arc<ClientSession>,
+        result: &Result<(Option<String>, u64)>,
+        elapsed: Duration,
+    ) {
+        let ctx = Self::build_query_context(sql, session);
         let outcome = match result {
             Ok((node, bytes)) => PostQueryOutcome {
                 success: true,
