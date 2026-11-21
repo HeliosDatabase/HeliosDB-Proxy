@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.0.0] - 2026-11-18
+## [3.0.0] - 2026-11-21
 
 This is a major release because the Rust library API has breaking changes (see Library
 API below: configuration and metrics structs gain public fields, and several signatures
