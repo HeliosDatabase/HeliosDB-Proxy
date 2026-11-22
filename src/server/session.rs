@@ -194,6 +194,16 @@ pub struct ClientSession {
     /// (always, without `[rate_limit] max_concurrent`).
     #[cfg(feature = "rate-limiting")]
     pub(crate) rate_permit_held: std::sync::atomic::AtomicBool,
+    /// The journal's source identity of this session, resolved once and
+    /// reused by every journaled cycle. User, database, tenant and client
+    /// address are fixed after startup; only `backend` follows the session's
+    /// current node, and `ProxyServer::journal_source` refreshes it in place.
+    pub(super) journal_identity: parking_lot::Mutex<crate::transaction_journal::SourceIdentity>,
+    /// Bumped whenever an input of `journal_identity` other than the current
+    /// node changes ([`ClientSession::invalidate_journal_identity`]).
+    pub(super) journal_identity_generation: std::sync::atomic::AtomicU64,
+    /// The generation `journal_identity` was resolved at; 0 before the first.
+    pub(super) journal_identity_resolved: std::sync::atomic::AtomicU64,
     /// The node slot (H-05) of the backend connection opened during startup,
     /// handed to that connection's `BackendConn` once the session starts.
     pub(crate) startup_slot: parking_lot::Mutex<crate::node_slots::Slot>,
@@ -252,6 +262,13 @@ impl ClientSession {
     pub(crate) fn holds_rate_permit(&self) -> bool {
         self.rate_permit_held
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The session's startup variables or tenant changed: the next journaled
+    /// cycle resolves the journal source identity again.
+    pub(crate) fn invalidate_journal_identity(&self) {
+        self.journal_identity_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// The session's tenant request budgets, if its tenant has any.

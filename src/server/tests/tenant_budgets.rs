@@ -7942,6 +7942,57 @@ async fn journal_source_uses_startup_tenant_budget_identity() {
 
     let source = ProxyServer::journal_source(&session).await;
     assert_eq!(source.tenant.as_deref(), Some("benchdb"));
+    drop(source);
+}
+
+#[tokio::test]
+async fn journal_source_is_resolved_once_and_follows_the_current_node() {
+    let session = make_test_session();
+    {
+        let mut vars = session.variables.write().await;
+        vars.insert("user".into(), "alice".into());
+        vars.insert("database".into(), "shop".into());
+    }
+    *session.current_node.write().await = Some("a:5432".into());
+    let first = ProxyServer::journal_source(&session).await.clone();
+    assert_eq!(first.user, "alice");
+    assert_eq!(first.database, "shop");
+    assert_eq!(first.backend, "a:5432");
+    assert_eq!(first.client_addr, session.client_addr.to_string());
+    assert_eq!(first.tenant, None);
+
+    // The backend follows the session's node on every call.
+    *session.current_node.write().await = Some("b:5432".into());
+    assert_eq!(
+        ProxyServer::journal_source(&session).await.backend,
+        "b:5432"
+    );
+    *session.current_node.write().await = None;
+    assert_eq!(ProxyServer::journal_source(&session).await.backend, "");
+
+    // A resolved identity does not wait for the session variables.
+    let held = session.variables.write().await;
+    let source = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ProxyServer::journal_source(&session),
+    )
+    .await
+    .expect("resolved identity does not read the variables")
+    .clone();
+    drop(held);
+    assert_eq!(source.user, "alice");
+
+    // A change of the startup variables is picked up once it is announced.
+    session
+        .variables
+        .write()
+        .await
+        .insert("user".into(), "bob".into());
+    assert_eq!(ProxyServer::journal_source(&session).await.user, "alice");
+    session.invalidate_journal_identity();
+    let source = ProxyServer::journal_source(&session).await.clone();
+    assert_eq!(source.user, "bob");
+    assert_eq!(source.database, "shop");
 }
 
 mod branch_routing;

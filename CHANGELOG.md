@@ -13,9 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kept in a small list searched by node address instead of a hashed map (a session holds
   one to three connections and the relay looks one up several times per statement), and
   the per-request release of the `[rate_limit] max_concurrent` slot no longer takes a lock
-  when the session holds no slot. Measured on pgbench simple-update over the simple
-  protocol, session pooling, 16 clients (12 alternating rounds, sampled profile): 1.1 %
-  fewer proxy CPU samples per transaction than 3.0.0. No configuration or behaviour change.
+  when the session holds no slot. The transaction journal's source identity (client
+  address, user, database, tenant) is resolved once per session instead of being looked
+  up, formatted and allocated for every journaled statement; only the backend address is
+  checked each time. Measured on pgbench simple-update over the simple protocol, session
+  pooling, 16 clients (12 alternating rounds, sampled profile): 4.1 % fewer proxy CPU
+  samples per transaction than 3.0.0. No configuration or behaviour change.
 
 ## [3.0.0] - 2026-11-21
 

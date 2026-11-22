@@ -292,39 +292,53 @@ impl ProxyServer {
     }
 
     /// Source identity of the session's current transaction for the journal.
+    ///
+    /// Everything but the backend is fixed once the session has started, so
+    /// it is resolved once per session (and again after
+    /// [`ClientSession::invalidate_journal_identity`]) instead of being
+    /// looked up, formatted and allocated for every journaled cycle. The
+    /// backend is compared with the session's current node on every call.
+    /// The returned guard must not be held across an await.
     pub(super) async fn journal_source(
         session: &ClientSession,
-    ) -> crate::transaction_journal::SourceIdentity {
-        let (user, database, configured_tenant) = {
-            let vars = session.variables.read().await;
-            (
-                vars.get("user").cloned().unwrap_or_default(),
-                vars.get("database").cloned().unwrap_or_default(),
-                vars.get("tenant_id").cloned(),
-            )
-        };
-        // The startup-resolved tenant is attached once to the session's
-        // shared budget. Prefer that canonical identity: database/user-based
-        // tenant configurations do not necessarily populate a `tenant_id`
-        // session variable, but journal accounting must still use the same
-        // tenant key that admitted the session.
-        let tenant = session
-            .tenant_budget()
-            .map(|budget| budget.tenant().to_owned())
-            .or(configured_tenant);
-        let backend = session
-            .current_node
-            .read()
-            .await
-            .clone()
-            .unwrap_or_default();
-        crate::transaction_journal::SourceIdentity {
-            client_addr: session.client_addr.to_string(),
-            user,
-            database,
-            backend,
-            tenant,
+    ) -> parking_lot::MutexGuard<'_, crate::transaction_journal::SourceIdentity> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let generation = session.journal_identity_generation.load(Acquire);
+        if session.journal_identity_resolved.load(Acquire) != generation {
+            let (user, database, configured_tenant) = {
+                let vars = session.variables.read().await;
+                (
+                    vars.get("user").cloned().unwrap_or_default(),
+                    vars.get("database").cloned().unwrap_or_default(),
+                    vars.get("tenant_id").cloned(),
+                )
+            };
+            // The startup-resolved tenant is attached once to the session's
+            // shared budget. Prefer that canonical identity: database/user-based
+            // tenant configurations do not necessarily populate a `tenant_id`
+            // session variable, but journal accounting must still use the same
+            // tenant key that admitted the session.
+            let tenant = session
+                .tenant_budget()
+                .map(|budget| budget.tenant().to_owned())
+                .or(configured_tenant);
+            let mut identity = session.journal_identity.lock();
+            identity.client_addr = session.client_addr.to_string();
+            identity.user = user;
+            identity.database = database;
+            identity.tenant = tenant;
+            // The generation read before the variables: a change that raced
+            // this resolution leaves the identity stale for the next call.
+            session.journal_identity_resolved.store(generation, Release);
         }
+        let node = session.current_node.read().await;
+        let backend = node.as_deref().unwrap_or_default();
+        let mut identity = session.journal_identity.lock();
+        if identity.backend != backend {
+            identity.backend.clear();
+            identity.backend.push_str(backend);
+        }
+        identity
     }
 
     /// Apply capture operations and count them. Runs under the session's

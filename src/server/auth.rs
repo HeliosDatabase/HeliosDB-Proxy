@@ -475,6 +475,7 @@ impl ProxyServer {
                 vars.insert(k.clone(), v.clone());
             }
         }
+        session.invalidate_journal_identity();
         // What plugin hook calls of this session carry (the client's own
         // startup parameters, not a cutover's substitutes).
         #[cfg(feature = "wasm-plugins")]

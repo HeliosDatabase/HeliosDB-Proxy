@@ -350,6 +350,7 @@ impl ProxyServer {
             let _ = session
                 .tenant_charge
                 .set(crate::tenant_slots::TenantCharge::new(Arc::clone(b)));
+            session.invalidate_journal_identity();
         }
     }
 
@@ -1291,6 +1292,9 @@ impl ProxyServer {
             rate_permit: parking_lot::Mutex::new(None),
             #[cfg(feature = "rate-limiting")]
             rate_permit_held: std::sync::atomic::AtomicBool::new(false),
+            journal_identity: parking_lot::Mutex::new(Default::default()),
+            journal_identity_generation: std::sync::atomic::AtomicU64::new(1),
+            journal_identity_resolved: std::sync::atomic::AtomicU64::new(0),
             startup_slot: parking_lot::Mutex::new(None),
             reads_pinned: std::sync::atomic::AtomicBool::new(false),
             read_node: parking_lot::Mutex::new(None),

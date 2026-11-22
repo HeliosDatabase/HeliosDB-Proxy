@@ -193,8 +193,11 @@ async fn commit_flush_journal_finishes_before_client_publication() {
     register(&session, &[("end", "COMMIT")]);
     let (socket, mut peer) = pair().await;
     let mut client = ClientStream::Plain(socket);
-    // Existing source-identity lock gives an exact journal barrier: a correct
+    // The source-identity lock gives an exact journal barrier: a correct
     // relay cannot publish C while applying its commit is still waiting here.
+    // The identity is resolved once per session, so make this commit resolve
+    // it again.
+    session.invalidate_journal_identity();
     let barrier = session.variables.write().await;
     let task_session = session.clone();
     let state = server.state.clone();
