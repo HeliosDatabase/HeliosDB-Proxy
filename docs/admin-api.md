@@ -522,7 +522,7 @@ Per-node connection pool statistics (active/idle/pending, lifetime created/close
 ### GET /version
 
 ```json
-{ "version": "3.0.0", "build_time": "3.0.0" }
+{ "version": "3.0.1", "build_time": "3.0.1" }
 ```
 
 > Both fields derive from the crate version (`CARGO_PKG_VERSION`); `build_time` is the version string, not a wall-clock timestamp.
@@ -582,7 +582,7 @@ Example (abridged; the example fixture has every field):
 ```json
 {
   "schema_version": 1,
-  "proxy_version": "3.0.0",
+  "proxy_version": "3.0.1",
   "generated_at": "2026-11-06T10:15:02.123Z",
   "uptime_secs": 86400,
   "nodes": {

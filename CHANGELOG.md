@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-11-23
+
+Performance patch release. No configuration, wire-protocol or library API change. Notes:
+[docs/releases/3.0.1.md](docs/releases/3.0.1.md).
+
 ### Changed
 
 - **Less proxy CPU per statement on the relay path.** A session's backend connections are
