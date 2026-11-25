@@ -675,6 +675,7 @@ pub(super) struct BackendConn {
     pub(super) _tenant_slot: crate::node_slots::Slot,
     /// When the backend connection was opened: `[pool] / [pool_mode]
     /// max_lifetime_secs` count from here (a pooled connection keeps it).
+    #[cfg_attr(not(feature = "pool-modes"), allow(dead_code))]
     pub(super) opened_at: std::time::Instant,
     /// Leased from the idle pool without the liveness probe (`[pool]
     /// test_on_acquire = false`), and no request written on it yet: a first

@@ -1294,6 +1294,7 @@ impl ProxyServer {
     /// waiting before it looks for an idle connection to close, so it either
     /// closed this one already or is seen here, and one idle connection of
     /// that node or tenant is closed for it.
+    #[cfg(feature = "pool-modes")]
     fn hand_over_parked(
         state: &ServerState,
         pool: &crate::pool::BackendIdlePool,

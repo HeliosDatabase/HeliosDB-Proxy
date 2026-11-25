@@ -4116,6 +4116,7 @@ impl AdminState {
         *self.pool_manager.write().await = Some(manager);
     }
 
+    #[cfg(feature = "pool-modes")]
     pub async fn with_backend_pool(&self, pool: Arc<crate::pool::BackendIdlePool>) {
         *self.backend_pool.write().await = Some(pool);
     }
