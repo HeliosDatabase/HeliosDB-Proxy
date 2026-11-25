@@ -82,9 +82,16 @@ fn deployment_issue4_defaults_do_not_bypass_validation() {
     .unwrap_err()
     .to_string()
     .contains("admin_token"));
+    // 3.1: `[pool] max_connections = 0` means unlimited, and an
+    // `acquire_timeout_secs` of 0 (which timed every dial out) is warned
+    // about and read as the default: both load.
     assert!(
         load("[pool]\nmax_connections = 0\n[[nodes]]\nhost = '127.0.0.1'\nrole = 'primary'\n")
-            .is_err()
+            .is_ok()
     );
+    assert!(load(
+        "[pool]\nacquire_timeout_secs = 0\n[[nodes]]\nhost = '127.0.0.1'\nrole = 'primary'\n"
+    )
+    .is_ok());
     assert!(load("strict_config = true\n[health]\ncheck_intervl_secs = 1\n[[nodes]]\nhost = '127.0.0.1'\nrole = 'primary'\n").unwrap_err().to_string().contains("health.check_intervl_secs"));
 }

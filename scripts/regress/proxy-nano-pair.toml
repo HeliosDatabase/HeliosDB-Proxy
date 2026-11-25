@@ -18,10 +18,6 @@ tr_mode = "session"
 write_timeout_secs = 30
 
 [pool]
-min_connections = 2
-max_connections = 50
-idle_timeout_secs = 300
-max_lifetime_secs = 1800
 acquire_timeout_secs = 5
 test_on_acquire = true
 

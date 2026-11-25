@@ -373,9 +373,32 @@ impl ProxyServer {
             tracing::debug!(target = %t.addr, "routing connection to cutover target");
             (t.addr.clone(), p)
         } else {
+            // W07: the pinned tenant's isolation (its schema in `options`,
+            // its database, or its branch), and the `[[hba]]` rules again
+            // for the database the session really gets.
+            let mut tenant_params = params.clone();
+            if let Some(plan) = session.tenant.get() {
+                plan.rewrite_startup(&mut tenant_params);
+                let effective = tenant_params
+                    .get("database")
+                    .map(String::as_str)
+                    .unwrap_or(user);
+                if effective != database
+                    && !Self::hba_admits(&config.hba, session.client_addr.ip(), user, effective)
+                {
+                    tracing::info!(%user, %database, %effective, tenant = plan.id(), "connection rejected by hba rule for the tenant's database");
+                    let err = Self::create_error_response(
+                        "28000",
+                        "connection rejected by proxy admission rules",
+                    );
+                    *error_response_started = true;
+                    let _ = client_stream.write_all(&err).await;
+                    return Ok((None, String::new()));
+                }
+            }
             (
                 Self::select_node_for_startup(session, state, config).await?,
-                params.clone(),
+                tenant_params,
             )
         };
 

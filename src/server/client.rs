@@ -16,6 +16,9 @@ pub(super) struct NamedTextFacts {
     pub(super) effect: super::session_bound::Effect,
     /// Whether it ends every session-level advisory lock.
     pub(super) unlocks: bool,
+    /// Whether it may create, drop or discard prepared statements
+    /// (`sql_prepared::may_change`).
+    pub(super) prepares: bool,
 }
 
 /// How the slow path of a tenant's active-query gate ended (ac858d61400b).
@@ -352,6 +355,33 @@ impl ProxyServer {
                 .set(crate::tenant_slots::TenantCharge::new(Arc::clone(b)));
             session.invalidate_journal_identity();
         }
+    }
+
+    /// W07: pin the session to the known tenant its startup packet names
+    /// (its isolation, pool and caps hold for the session's life, whatever
+    /// its startup parameters are rewritten to), and take the slot its
+    /// startup connection will hold under the tenant's
+    /// `pool_max_connections`. `Err`: the tenant stayed at that cap for the
+    /// whole `[limits] backend_slot_wait_ms` (the caller refuses with 53300).
+    pub(super) async fn pin_tenant(
+        state: &ServerState,
+        session: &ClientSession,
+        first: &StartupMessage,
+    ) -> std::result::Result<(), String> {
+        let StartupMessage::Startup { params, .. } = first else {
+            return Ok(());
+        };
+        let Some(plan) = state.tenant_slots.identify(params) else {
+            return Ok(());
+        };
+        let _ = session.tenant.set(Arc::clone(plan));
+        let slot = match Self::acquire_tenant_pool_slot(session, state).await {
+            Ok(slot) => slot,
+            Err(ProxyError::PoolExhausted(reason)) => return Err(reason),
+            Err(e) => return Err(e.to_string()),
+        };
+        *session.startup_tenant_slot.lock() = slot;
+        Ok(())
     }
 
     /// PostgreSQL `ErrorResponse` bytes for a session terminated by the
@@ -815,6 +845,7 @@ impl ProxyServer {
         let facts = Self::parse_msg_sql(parse).map(|sql| NamedTextFacts {
             effect: super::session_bound::text_effect(sql),
             unlocks: Self::releases_session_locks(sql),
+            prepares: super::sql_prepared::may_change(sql),
         });
         memo.insert(name.to_string(), (parse.clone(), facts));
         facts
@@ -1296,6 +1327,14 @@ impl ProxyServer {
             journal_identity_generation: std::sync::atomic::AtomicU64::new(1),
             journal_identity_resolved: std::sync::atomic::AtomicU64::new(0),
             startup_slot: parking_lot::Mutex::new(None),
+            tenant: std::sync::OnceLock::new(),
+            startup_tenant_slot: parking_lot::Mutex::new(None),
+            #[cfg(feature = "pool-modes")]
+            stale_lease: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "pool-modes")]
+            fresh_dial: std::sync::atomic::AtomicBool::new(false),
+            sql_prepared: parking_lot::Mutex::new(Default::default()),
+            sql_prepared_live: std::sync::atomic::AtomicBool::new(false),
             reads_pinned: std::sync::atomic::AtomicBool::new(false),
             read_node: parking_lot::Mutex::new(None),
             last_write: parking_lot::Mutex::new(None),
@@ -1419,15 +1458,36 @@ impl ProxyServer {
                                 _session_guard._tenant_slot = tenant_slot;
                                 _session_guard._client_slot = slot;
                                 Self::attach_tenant_budget(&state, &session, &msg);
-                                Self::client_loop(
-                                    &mut client_stream,
-                                    Some(msg),
-                                    buffer,
-                                    &session,
-                                    &state,
-                                    &config,
-                                )
-                                .await
+                                // W07: the session's tenant, for its life, and
+                                // the startup connection's slot under the
+                                // tenant's `pool_max_connections`.
+                                match Self::pin_tenant(&state, &session, &msg).await {
+                                    Err(refusal) => {
+                                        tracing::warn!(
+                                            client = %addr,
+                                            reason = %refusal,
+                                            "tenant pool_max_connections reached; refusing connection"
+                                        );
+                                        Self::refuse_with(
+                                            &mut client_stream,
+                                            &Self::create_fatal_response("53300", &refusal),
+                                            state.limits.client_write_timeout,
+                                        )
+                                        .await;
+                                        Ok(())
+                                    }
+                                    Ok(()) => {
+                                        Self::client_loop(
+                                            &mut client_stream,
+                                            Some(msg),
+                                            buffer,
+                                            &session,
+                                            &state,
+                                            &config,
+                                        )
+                                        .await
+                                    }
+                                }
                             }
                             Err(()) => {
                                 tracing::warn!(
@@ -2077,6 +2137,30 @@ impl ProxyServer {
                 // The BackendKeyData relayed to the client at startup is
                 // this socket's.
                 bc.backend_key = session.cancel_key.get().copied();
+                // W07: the slot taken at admission under the tenant's
+                // `pool_max_connections`, and its `search_path` when it is
+                // set on every acquired connection.
+                bc._tenant_slot = session.startup_tenant_slot.lock().take();
+                if let Some(plan) = session.tenant.get() {
+                    if let Some(pool) = plan.pool() {
+                        pool.note_dial();
+                    }
+                    if let Some(set) = plan.set_on_acquire() {
+                        if let Err(e) = Self::apply_search_path(&mut bc, &set, state).await {
+                            tracing::warn!(tenant = plan.id(), error = %e, "could not set the tenant's search_path; closing the session");
+                            Self::refuse_with(
+                                stream,
+                                &Self::create_fatal_response(
+                                    "08006",
+                                    &format!("the tenant's search_path could not be set: {e}"),
+                                ),
+                                state.limits.client_write_timeout,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                    }
+                }
                 conns.insert(node_addr.clone(), bc);
                 Some(node_addr)
             }
@@ -2228,6 +2312,10 @@ impl ProxyServer {
         // What the batch's statements do to the state only the session's
         // backend has (`session_bound`), in order.
         let mut batch_bound = super::session_bound::Effect::default();
+        // A statement of the batch may prepare, deallocate or discard SQL
+        // `PREPARE`d statements (`[pool_mode] prepared_statement_mode =
+        // "track"`, pooled modes): its effects are read once it ran.
+        let mut batch_prepares = false;
         // Which named statements take a session-level advisory lock,
         // memoized against the registry's Parse bytes
         // (`named_takes_session_lock`); kept only while tracking.
@@ -2763,6 +2851,48 @@ impl ProxyServer {
                 } else {
                     msg
                 };
+                // `[pool_mode] prepared_statement_mode` (transaction /
+                // statement pooling): a named Parse, or one of a SQL PREPARE,
+                // is refused under "disable"; under "track" a SQL PREPARE the
+                // session's registry has no room for is. The cycle is
+                // refused like a hook refusal (discarded to its Sync).
+                let prepare_refusal = (hook_refusal.is_none()
+                    && msg.msg_type == MessageType::Parse
+                    && config.pool_mode.pooled())
+                .then(|| Self::parse_name_and_text(&msg.payload))
+                .flatten()
+                .and_then(|(name, text)| {
+                    if !name.is_empty() && Self::named_parse_refused(config) {
+                        return Some((
+                            super::sql_prepared::DISABLED_SQLSTATE,
+                            super::sql_prepared::DISABLED_MESSAGE.to_string(),
+                        ));
+                    }
+                    let sql = std::str::from_utf8(text).ok()?;
+                    Self::sql_prepare_refusal(sql, session, state, config)
+                });
+                let msg = match prepare_refusal {
+                    Some((sqlstate, reason)) => {
+                        if tr.ext_dispatched
+                            || tr.ext_copy_end.is_some()
+                            || session.copy_in_progress.load(Ordering::Relaxed)
+                        {
+                            Self::refuse_with(
+                                stream,
+                                &Self::create_fatal_response(sqlstate, &reason),
+                                state.limits.client_write_timeout,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        hook_refusal = Some((
+                            Self::create_error_response(sqlstate, &reason),
+                            msg.payload.first() == Some(&0),
+                        ));
+                        Message::empty(MessageType::Flush)
+                    }
+                    None => msg,
+                };
                 let msg = if ext_hooks_on
                     && hooks_due
                     && hook_refusal.is_none()
@@ -3009,6 +3139,14 @@ impl ProxyServer {
                         #[cfg(not(feature = "wasm-plugins"))]
                         let PreQueryAction::Forward = action;
 
+                        // `[pool_mode] prepared_statement_mode` (transaction /
+                        // statement pooling): a SQL PREPARE is refused under
+                        // "disable", and under "track" when the session's
+                        // registry has no room for it (never a query that
+                        // continues a cycle: only its backend settles it).
+                        let prepare_refusal = query_sql
+                            .filter(|_| !continues_cycle)
+                            .and_then(|sql| Self::sql_prepare_refusal(sql, session, state, config));
                         // An unreadable statement's refusal, a plugin's Block,
                         // or its cached result, answers the query before any
                         // backend.
@@ -3020,6 +3158,12 @@ impl ProxyServer {
                                 STATEMENT_POOLING_TRANSACTION,
                             )
                             .await?;
+                            state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                            true
+                        } else if let Some((sqlstate, reason)) = prepare_refusal.as_ref() {
+                            let sent =
+                                Self::write_statement_refusal(stream, session, sqlstate, reason)
+                                    .await?;
                             state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
                             true
                         } else if unreadable {
@@ -3386,6 +3530,26 @@ impl ProxyServer {
                         {
                             Self::copy_drained(tr, false, session, state, config).await;
                         }
+                        // `[pool_mode] prepared_statement_mode = "track"`: what
+                        // the query's statements did to the session's
+                        // SQL-prepared statements, read before the tally of
+                        // its completions is reset.
+                        if reached && config.pool_mode.pooled() {
+                            if let Some(sql) =
+                                query_sql.filter(|sql| super::sql_prepared::may_change(sql))
+                            {
+                                let (completed, _) = Self::tally(session);
+                                Self::note_sql_prepares(
+                                    conns,
+                                    current_node.as_deref(),
+                                    &super::sql_prepared::statements(sql),
+                                    completed,
+                                    session,
+                                    state,
+                                    config,
+                                );
+                            }
+                        }
                         if refused {
                             Self::tr_discard_refused(tr, session);
                             if !session
@@ -3703,6 +3867,8 @@ impl ProxyServer {
                                 {
                                     batch_bound =
                                         batch_bound.then(super::session_bound::text_effect(sql));
+                                    batch_prepares |= config.pool_mode.pooled()
+                                        && super::sql_prepared::may_change(sql);
                                 }
                                 if pending_route_sql.is_none() {
                                     if let Some(end) = msg.payload.iter().position(|&b| b == 0) {
@@ -3908,6 +4074,7 @@ impl ProxyServer {
                                     })
                                 }) {
                                     batch_bound = batch_bound.then(facts.effect);
+                                    batch_prepares |= config.pool_mode.pooled() && facts.prepares;
                                 }
                                 // Unnamed statement: not tracked in
                                 // batch_refs, but the edge invalidation must
@@ -4023,6 +4190,7 @@ impl ProxyServer {
                         let takes_locks = std::mem::take(&mut batch_locks);
                         let releases_locks = std::mem::take(&mut batch_unlocks);
                         let bound_effect = std::mem::take(&mut batch_bound);
+                        let prepares = std::mem::take(&mut batch_prepares);
                         let status_before = session
                             .last_rfq_status
                             .load(std::sync::atomic::Ordering::Relaxed);
@@ -4483,6 +4651,27 @@ impl ProxyServer {
                             {
                                 plugin_unnamed = None;
                             }
+                        }
+                        // What the batch's statements did to the session's
+                        // SQL-prepared statements (`track`), read from the
+                        // statements its Executes ran and its tally.
+                        if delivered && prepares {
+                            let ran = super::sql_prepared::executed_texts(
+                                &batch,
+                                held_unnamed.as_ref().map(|(parse, _)| &parse[..]),
+                                &stmt_registry,
+                            );
+                            let ran: Vec<&str> = ran.iter().map(String::as_str).collect();
+                            let (completed, _) = Self::tally(session);
+                            Self::note_sql_prepares(
+                                conns,
+                                current_node.as_deref(),
+                                &ran,
+                                completed,
+                                session,
+                                state,
+                                config,
+                            );
                         }
                         // What the batch did to state only the session's
                         // backend has: a Flush leaves its cycle open (inside

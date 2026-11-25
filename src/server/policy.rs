@@ -6,6 +6,13 @@ use super::*;
 const UNIDENTIFIED_TENANT_REFUSAL: &str =
     "statement refused: this session has no identified tenant and the statement references a tenant table";
 
+/// The refusal message for a statement that would change the `search_path`
+/// of a schema-isolated session (`[multi_tenancy] lock_search_path`).
+#[cfg(feature = "multi-tenancy")]
+pub(super) const SEARCH_PATH_LOCKED: &str =
+    "statement refused: this session's search_path is its tenant's schema ([multi_tenancy] \
+     lock_search_path); qualify names with their schema instead";
+
 /// The outcome of [`ProxyServer::tenant_statement`].
 #[cfg(feature = "multi-tenancy")]
 pub(super) enum TenantStatement {
@@ -626,8 +633,20 @@ impl ProxyServer {
         sql: &str,
         session: &Arc<ClientSession>,
     ) -> TenantStatement {
-        let ctx = Self::tenant_request_ctx(session).await;
-        match tm.identify_tenant(&ctx) {
+        // The tenant pinned at admission (W07): the session's startup
+        // parameters may have been rewritten for its isolation since.
+        let tenant = session
+            .tenant
+            .get()
+            .map(|plan| crate::multi_tenancy::TenantId::new(plan.id()));
+        if let Some(plan) = session.tenant.get() {
+            if plan.locks_search_path()
+                && Self::changes_search_path(sql, plan.reset_leaves_schema())
+            {
+                return TenantStatement::Refused(SEARCH_PATH_LOCKED.into());
+            }
+        }
+        match tenant {
             Some(tenant) => {
                 let res = tm.transform_query(sql, &tenant);
                 if let Some(reason) = res.refusal {
@@ -649,23 +668,62 @@ impl ProxyServer {
         }
     }
 
-    /// Build a multi-tenancy `RequestContext` from the session's startup
-    /// parameters (user, database, application_name, ...) so the configured
-    /// identifier can resolve the tenant.
+    /// Whether `sql` (any of its statements) changes the session's
+    /// `search_path`: `SET [SESSION | LOCAL] search_path`, `SET SCHEMA`, a
+    /// `set_config` call naming `search_path`, and, when `resets` (the
+    /// schema was `SET` on the connection, `schema_apply =
+    /// "set_on_acquire"`), `RESET search_path`, `RESET ALL` and `DISCARD
+    /// ALL`, which return it to the backend's default. A text that cannot
+    /// be split is read as changing it if it names `search_path` at all.
     #[cfg(feature = "multi-tenancy")]
-    pub(super) async fn tenant_request_ctx(
-        session: &Arc<ClientSession>,
-    ) -> crate::multi_tenancy::RequestContext {
-        let vars = session.variables.read().await;
-        crate::multi_tenancy::RequestContext {
-            headers: vars.clone(),
-            username: vars.get("user").cloned(),
-            database: vars.get("database").cloned(),
-            auth_token: None,
-            sql_context: HashMap::new(),
-            client_ip: Some(session.client_addr.ip().to_string()),
-            connection_id: Some(session.id.as_u64_pair().0),
+    pub(super) fn changes_search_path(sql: &str, resets: bool) -> bool {
+        if !crate::protocol::contains_ci(sql, "search_path")
+            && !crate::protocol::contains_ci(sql, "schema")
+            && !(resets
+                && (crate::protocol::contains_ci(sql, "reset")
+                    || crate::protocol::contains_ci(sql, "discard")))
+        {
+            return false;
         }
+        let statements = match crate::replay_sql::split_statements(sql) {
+            Ok(statements) => statements,
+            Err(_) => return crate::protocol::contains_ci(sql, "search_path"),
+        };
+        statements.into_iter().any(|statement| {
+            let mut words: Vec<(String, bool)> = Vec::with_capacity(4);
+            let _ = crate::replay_sql::words(statement, |w| {
+                let text = if w.quoted {
+                    w.text.trim_matches('"').to_string()
+                } else {
+                    w.text.to_ascii_lowercase()
+                };
+                words.push((text, w.quoted));
+                words.len() < 4
+            });
+            let word = |i: usize| words.get(i).map(|(w, _)| w.as_str());
+            let set_target = match (word(0), word(1)) {
+                (Some("set"), Some("session" | "local")) => word(2),
+                (Some("set"), _) => word(1),
+                _ => None,
+            };
+            if matches!(set_target, Some("search_path" | "schema")) {
+                return true;
+            }
+            if resets {
+                match (word(0), word(1)) {
+                    (Some("reset"), Some("search_path" | "all"))
+                    | (Some("discard"), Some("all")) => return true,
+                    _ => {}
+                }
+            }
+            // `set_config('search_path', ...)`: a call of it in a statement
+            // that names the setting.
+            crate::protocol::contains_ci(statement, "search_path")
+                && !crate::replay_sql::all_calls_satisfy(statement, |w| {
+                    !w.text.eq_ignore_ascii_case("set_config")
+                })
+                .unwrap_or(false)
+        })
     }
 
     // ---- TR-07 recovery-journal capture hooks --------------------------

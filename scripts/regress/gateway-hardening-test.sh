@@ -60,16 +60,11 @@ auth_token = "$GTOK"
 name = "users"
 columns = ["id", "name"]
 [pool]
-min_connections = 1
-max_connections = 20
-idle_timeout_secs = 300
-max_lifetime_secs = 1800
 acquire_timeout_secs = 5
 test_on_acquire = true
 [load_balancer]
 read_strategy = "round_robin"
 read_write_split = false
-latency_threshold_ms = 100
 [health]
 check_interval_secs = 5
 check_timeout_secs = 3

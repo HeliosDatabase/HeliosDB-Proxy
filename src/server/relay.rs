@@ -84,7 +84,7 @@ impl ProxyServer {
         fwd: ForwardCtx<'_>,
         msg: &Message,
     ) -> Result<(Option<String>, u64)> {
-        Self::forward_simple_query_inner(fwd, msg, None).await
+        Self::forward_simple_query_settled(fwd, msg, None).await
     }
 
     /// Forward a Query frame already structurally validated by the client
@@ -97,7 +97,60 @@ impl ProxyServer {
     ) -> Result<(Option<String>, u64)> {
         debug_assert_eq!(query_end + 1, msg.payload.len());
         debug_assert_eq!(msg.payload.get(query_end), Some(&0));
-        Self::forward_simple_query_inner(fwd, msg, Some(query_end)).await
+        Self::forward_simple_query_settled(fwd, msg, Some(query_end)).await
+    }
+
+    /// [`Self::forward_simple_query_inner`], sent once more on a fresh
+    /// connection when a pooled one leased without its liveness probe
+    /// refused it before delivery (`Self::send_failed`), and answered with
+    /// 53300 when no backend connection could be had within the proxy's
+    /// bounds (`Self::answer_no_connection`).
+    async fn forward_simple_query_settled(
+        fwd: ForwardCtx<'_>,
+        msg: &Message,
+        validated_query_end: Option<usize>,
+    ) -> Result<(Option<String>, u64)> {
+        let ForwardCtx {
+            client,
+            conns,
+            current_node,
+            reads,
+            session,
+            state,
+            config,
+            fault,
+            continues_cycle,
+        } = fwd;
+        let mut retried = false;
+        loop {
+            let sent = Self::forward_simple_query_inner(
+                ForwardCtx {
+                    client: &mut *client,
+                    conns: &mut *conns,
+                    current_node,
+                    reads,
+                    session,
+                    state,
+                    config,
+                    fault: &mut *fault,
+                    continues_cycle,
+                },
+                msg,
+                validated_query_end,
+            )
+            .await;
+            match sent {
+                Err(_) if !retried && Self::retry_stale_lease(session, fault) => retried = true,
+                Err(e) => {
+                    return match Self::answer_no_connection(&e, fault, client, session, true).await
+                    {
+                        Some(answered) => answered,
+                        None => Err(e),
+                    };
+                }
+                ok => return ok,
+            }
+        }
     }
 
     async fn forward_simple_query_inner(
@@ -713,7 +766,7 @@ impl ProxyServer {
                     return Ok((Some(target), response.len() as u64));
                 }
                 Err(e) => {
-                    Self::record_backend_failure(state, &target, &e.to_string());
+                    Self::send_failed(conns, &target, &e, session, state);
                     BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                     Self::abandon_conn(conns, &target, session, state).await;
                     return Err(e);
@@ -909,6 +962,21 @@ impl ProxyServer {
 
         let backend = conns.get_mut(&target).expect("just ensured");
 
+        // `[pool_mode] prepared_statement_mode = "track"`: a SQL-prepared
+        // statement the request uses that this connection lacks is prepared
+        // here first (never inside a cycle the connection holds open).
+        if continues_cycle.is_none() {
+            if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
+                if let Err(e) = Self::reprepare_sql(backend, &[sql], session, state).await {
+                    Self::send_failed(conns, &target, &e, session, state);
+                    BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                    conns.remove(&target);
+                    return Err(e);
+                }
+            }
+        }
+        let backend = conns.get_mut(&target).expect("just ensured");
+
         // Conditional-reset bookkeeping: if this statement is not provably
         // session-neutral, mark the connection dirty so it is fully reset (not
         // clean-skipped) when parked. Still evaluated only when the
@@ -947,11 +1015,14 @@ impl ProxyServer {
         };
         if let Some(msg) = backend_err {
             let e = ProxyError::Network(msg);
-            Self::record_backend_failure(state, &target, &e.to_string());
+            Self::send_failed(conns, &target, &e, session, state);
             BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
             Self::drop_undelivered(conns, &target, continues_cycle.is_some(), session, state).await;
             return Err(e);
         }
+        let backend = conns.get_mut(&target).expect("just written");
+        // Delivered: a failure from here on is not a stale pooled socket's.
+        backend.unprobed = false;
 
         // TR-09: a read the proxy may re-execute can be held until its
         // ReadyForQuery (opt-in), so a fault before then retries it.
@@ -1249,8 +1320,71 @@ impl ProxyServer {
     /// `Parse` (`ExtHooks::route`).
     ///
     /// `fwd.fault` is filled on a backend fault exactly like
-    /// `forward_simple_query`.
+    /// `forward_simple_query`. Like it, the batch is sent once more on a
+    /// fresh connection when a stale unprobed lease refused it, and answered
+    /// with 53300 when no backend connection could be had.
     pub(super) async fn forward_extended_batch(
+        fwd: ForwardCtx<'_>,
+        ext: ExtBatch<'_>,
+        reprepare: &[String],
+        registry: &HashMap<String, bytes::Bytes>,
+        hold: usize,
+        plugin_route: &RouteOverride,
+    ) -> Result<(Option<String>, u64)> {
+        let ForwardCtx {
+            client,
+            conns,
+            current_node,
+            reads,
+            session,
+            state,
+            config,
+            fault,
+            continues_cycle,
+        } = fwd;
+        let mut retried = false;
+        loop {
+            let sent = Self::forward_extended_batch_once(
+                ForwardCtx {
+                    client: &mut *client,
+                    conns: &mut *conns,
+                    current_node,
+                    reads,
+                    session,
+                    state,
+                    config,
+                    fault: &mut *fault,
+                    continues_cycle,
+                },
+                ext,
+                reprepare,
+                registry,
+                hold,
+                plugin_route,
+            )
+            .await;
+            match sent {
+                Err(_) if !retried && Self::retry_stale_lease(session, fault) => retried = true,
+                Err(e) => {
+                    return match Self::answer_no_connection(
+                        &e,
+                        fault,
+                        client,
+                        session,
+                        ext.wait_ready,
+                    )
+                    .await
+                    {
+                        Some(answered) => answered,
+                        None => Err(e),
+                    };
+                }
+                ok => return ok,
+            }
+        }
+    }
+
+    async fn forward_extended_batch_once(
         fwd: ForwardCtx<'_>,
         ext: ExtBatch<'_>,
         reprepare: &[String],
@@ -1569,7 +1703,7 @@ impl ProxyServer {
                 .await;
                 if let Err(e) = closed {
                     if matches!(e, ProxyError::Network(_)) {
-                        Self::record_backend_failure(state, &target, &e.to_string());
+                        Self::send_failed(conns, &target, &e, session, state);
                         BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                     }
                     Self::drop_undelivered(
@@ -1618,7 +1752,7 @@ impl ProxyServer {
                     // was never sent); a backend *rejecting* the re-prepare is
                     // a protocol-level problem and is propagated as before.
                     if matches!(e, ProxyError::Network(_)) {
-                        Self::record_backend_failure(state, &target, &e.to_string());
+                        Self::send_failed(conns, &target, &e, session, state);
                         BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                     }
                     Self::drop_undelivered(
@@ -1663,7 +1797,7 @@ impl ProxyServer {
                     .await;
                     if let Err(e) = closed {
                         if matches!(e, ProxyError::Network(_)) {
-                            Self::record_backend_failure(state, &target, &e.to_string());
+                            Self::send_failed(conns, &target, &e, session, state);
                             BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                         }
                         Self::drop_undelivered(
@@ -1724,7 +1858,7 @@ impl ProxyServer {
                     }
                     Err(e) => {
                         if matches!(e, ProxyError::Network(_)) {
-                            Self::record_backend_failure(state, &target, &e.to_string());
+                            Self::send_failed(conns, &target, &e, session, state);
                             BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                         }
                         Self::drop_undelivered(conns, &target, false, session, state).await;
@@ -1775,7 +1909,7 @@ impl ProxyServer {
                 // The connection failed before the batch was written.
                 Err(e) => {
                     if matches!(e, ProxyError::Network(_)) {
-                        Self::record_backend_failure(state, &target, &e.to_string());
+                        Self::send_failed(conns, &target, &e, session, state);
                         BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                     }
                     Self::drop_undelivered(
@@ -1788,6 +1922,29 @@ impl ProxyServer {
                     .await;
                     return Err(e);
                 }
+            }
+        }
+
+        // `[pool_mode] prepared_statement_mode = "track"`: SQL-prepared
+        // statements the batch runs that this connection lacks are prepared
+        // here first, at a cycle start, unless the batch relies on the
+        // unnamed statement of an earlier cycle (the proxy's own Query would
+        // destroy it).
+        if starts_cycle
+            && session.sql_prepared_live.load(Ordering::Relaxed)
+            && (unnamed.is_some() || !super::sql_prepared::uses_prior_unnamed(batch))
+        {
+            let texts = super::sql_prepared::executed_texts(
+                batch,
+                unnamed.map(|(parse, _)| &parse[..]),
+                registry,
+            );
+            let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+            if let Err(e) = Self::reprepare_sql(backend, &texts, session, state).await {
+                Self::send_failed(conns, &target, &e, session, state);
+                BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                Self::drop_undelivered(conns, &target, false, session, state).await;
+                return Err(e);
             }
         }
 
@@ -1812,7 +1969,7 @@ impl ProxyServer {
                 .and_then(|r| {
                     r.map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))
                 }) {
-                    Self::record_backend_failure(state, &target, &e.to_string());
+                    Self::send_failed(conns, &target, &e, session, state);
                     BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                     Self::drop_undelivered(
                         conns,
@@ -1837,9 +1994,33 @@ impl ProxyServer {
         if !proven {
             backend.forget_cache_scope();
         }
+        // A connection leased without its liveness probe that takes none of
+        // the batch's bytes reached no backend: a socket the backend closed
+        // while it was parked (`Self::send_failed`).
+        let mut written = 0usize;
+        if backend.unprobed && !batch.is_empty() {
+            match tokio::time::timeout(
+                state.limits.backend_write_timeout,
+                backend.stream.write(batch),
+            )
+            .await
+            {
+                Ok(Ok(n)) => written = n,
+                failed => {
+                    let e = ProxyError::Network(match failed {
+                        Ok(Err(e)) => format!("Backend write error: {}", e),
+                        _ => "Backend write timeout".to_string(),
+                    });
+                    Self::send_failed(conns, &target, &e, session, state);
+                    BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                    Self::drop_undelivered(conns, &target, false, session, state).await;
+                    return Err(e);
+                }
+            }
+        }
         if let Err((e, phase)) = Self::tr_write_batch(
             &mut backend.stream,
-            batch,
+            &batch[written..],
             state.limits.backend_write_timeout,
         )
         .await
@@ -1849,6 +2030,7 @@ impl ProxyServer {
             Self::abandon_conn(conns, &target, session, state).await;
             return Err(e);
         }
+        backend.unprobed = false;
         // Register delivered extended-protocol messages before reading their
         // responses so the journal can associate Parse/Bind/Execute outcomes.
         if config.tr_enabled || Self::cache_needs_capture(state) {

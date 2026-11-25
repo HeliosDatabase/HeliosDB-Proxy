@@ -74,7 +74,9 @@ fn test_module_01_connection_pooling_config() {
 
     let stmt = heliosdb_proxy::config::PoolModeConfig::statement_mode();
     assert_eq!(stmt.mode, PoolingMode::Statement);
-    assert_eq!(stmt.prepared_statement_mode, PreparedStatementMode::Disable);
+    // 3.1: the statement-mode preset tracks prepared statements (before 3.1
+    // the mode was not read, so `Disable` there refused nothing).
+    assert_eq!(stmt.prepared_statement_mode, PreparedStatementMode::Track);
 
     for cfg in [&session, &tx, &stmt] {
         assert!(cfg.max_pool_size > 0);

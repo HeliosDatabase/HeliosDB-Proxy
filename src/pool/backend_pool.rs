@@ -19,7 +19,10 @@
 //! authenticated before it could reach the pool. This is exactly PgBouncer's
 //! per-(user,db) pooling model; it does not multiplex distinct users onto one
 //! backend identity (that would need proxy-terminated auth with a shared
-//! backend credential, which is a separate, larger change).
+//! backend credential, which is a separate, larger change). A tenant with pool
+//! settings of its own (`[[multi_tenancy.tenant_settings]] pool_max_idle` /
+//! `pool_max_connections`) adds `\0t=<tenant>` to its keys, so its connections
+//! are pooled apart and capped on their own.
 //!
 //! ## Cleanliness
 //!
@@ -27,11 +30,21 @@
 //! (see the release path in `server/backend_conn.rs`), so the next borrower — possibly a
 //! *different* client of the same identity — never inherits GUCs, temp tables,
 //! prepared statements, or advisory locks. On checkout the connection is
-//! liveness-probed so a peer that closed the socket while idle is dropped
-//! rather than handed out.
+//! liveness-probed (`[pool] test_on_acquire`) so a peer that closed the socket
+//! while idle is dropped rather than handed out.
+//!
+//! ## Lifetime and ahead-of-use connections
+//!
+//! A connection remembers when it was opened: past `max_lifetime` it is
+//! closed instead of being parked, dropped at checkout and reaped
+//! ([`BackendIdlePool::reap`]). The reaper keeps the newest `min_idle`
+//! connections of each key through the idle TTL; the [`DialSpec`]s recorded
+//! at check-in tell it how to open the ones missing (`[pool_mode] min_idle`,
+//! `[pool] min_connections`).
 
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
@@ -86,12 +99,77 @@ pub struct PooledConn {
     pub backend_key: BackendKey,
     /// What is known about its settings ([`ParkedSettings`]).
     pub settings: ParkedSettings,
+    /// The connection's slot under its tenant's `pool_max_connections`.
+    pub tenant_slot: crate::node_slots::Slot,
+    /// When the backend connection was opened (its lifetime starts there).
+    pub opened_at: Instant,
+}
+
+impl PooledConn {
+    /// A connection opened just now, with no slot, no key and nothing known
+    /// about its settings.
+    pub fn fresh(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            slot: None,
+            backend_key: None,
+            settings: ParkedSettings::default(),
+            tenant_slot: None,
+            opened_at: Instant::now(),
+        }
+    }
+
+    /// Whether the connection outlived `max_lifetime` (`None`: no limit).
+    pub fn expired(&self, max_lifetime: Option<Duration>) -> bool {
+        max_lifetime.is_some_and(|max| self.opened_at.elapsed() >= max)
+    }
 }
 
 /// One parked connection.
 struct Parked {
     conn: PooledConn,
     parked_at: Instant,
+}
+
+/// How [`BackendIdlePool::checkout_conn_with`] leases.
+#[derive(Debug, Clone, Copy)]
+pub struct LeaseOptions {
+    /// Probe the connection for liveness before handing it out (`[pool]
+    /// test_on_acquire`).
+    pub probe: bool,
+    /// Connections older than this are closed instead of handed out.
+    pub max_lifetime: Option<Duration>,
+}
+
+impl LeaseOptions {
+    /// Probe every lease; no lifetime limit.
+    pub const PROBED: LeaseOptions = LeaseOptions {
+        probe: true,
+        max_lifetime: None,
+    };
+}
+
+/// How the idle reaper opens a connection for one pool identity on its own
+/// (`[pool_mode] min_idle`, `[pool] min_connections`), recorded when a
+/// session parks a connection under that identity.
+#[derive(Debug, Clone)]
+pub struct DialSpec {
+    /// The node, `host:port`.
+    pub node: String,
+    /// The startup packet the session's connections were opened with.
+    pub startup: Arc<[u8]>,
+    /// The user the backend authenticates (the proxy answers its challenges
+    /// only with a credential of its own, `[auth] auth_file`).
+    pub user: String,
+    /// The tenant pool whose cap the identity's connections count against.
+    pub tenant_pool: Option<Arc<crate::tenant_slots::TenantPool>>,
+    /// The identity's idle cap.
+    pub max_idle: usize,
+    /// When a session last parked a connection of the identity.
+    pub last_used: Instant,
+    /// The backend asked for a password the proxy does not hold (pass-through
+    /// auth): the identity is never opened ahead of use.
+    pub no_credential: bool,
 }
 
 /// A bounded set of idle, authenticated backend connections, partitioned by
@@ -108,6 +186,10 @@ pub struct BackendIdlePool {
     /// Live count of parked connections (kept in step with `idle`) so the
     /// global-cap check and `idle_count()` are O(1) instead of O(keys).
     total_idle: AtomicUsize,
+    /// How to open each recently used identity ahead of use; only recorded
+    /// while `min_idle` or `min_connections` asks for it. At most
+    /// `max_total_idle` entries.
+    specs: DashMap<String, DialSpec>,
     /// Checkout hits — a parked connection was reused.
     reuses: AtomicU64,
     /// Connections parked (checked in) successfully.
@@ -127,6 +209,25 @@ pub struct BackendIdlePool {
     /// Idle connections closed to make room on a backend that refused a new
     /// connection with 53300 (`too_many_connections`).
     capacity_evictions: AtomicU64,
+    /// Connections closed for outliving the pool's max lifetime: at release
+    /// instead of parking, at checkout, or by the reaper.
+    lifetime_expired: AtomicU64,
+    /// Requests refused with 53300 because no backend connection could be
+    /// opened within `[pool_mode] acquire_timeout_secs`.
+    acquire_timeouts: AtomicU64,
+    /// Connections leased without the liveness probe (`[pool] test_on_acquire
+    /// = false`) that refused their first write, replaced by a fresh dial.
+    stale_lease_redials: AtomicU64,
+    /// Connections the reaper opened ahead of use (`min_idle`,
+    /// `min_connections`).
+    topped_up: AtomicU64,
+    /// Ahead-of-use dials that failed (connect, authentication).
+    topup_failures: AtomicU64,
+    /// Released connections closed instead of parked because a session was
+    /// waiting for their node's or tenant's slot.
+    handed_over: AtomicU64,
+    /// The no-credential warning was logged.
+    no_credential_warned: std::sync::atomic::AtomicBool,
 }
 
 impl BackendIdlePool {
@@ -140,6 +241,7 @@ impl BackendIdlePool {
             max_idle_per_key: max_idle_per_key.max(1),
             max_total_idle: max_total_idle.max(1),
             total_idle: AtomicUsize::new(0),
+            specs: DashMap::new(),
             reuses: AtomicU64::new(0),
             parked: AtomicU64::new(0),
             over_capacity: AtomicU64::new(0),
@@ -147,7 +249,19 @@ impl BackendIdlePool {
             reaped: AtomicU64::new(0),
             resets_skipped: AtomicU64::new(0),
             capacity_evictions: AtomicU64::new(0),
+            lifetime_expired: AtomicU64::new(0),
+            acquire_timeouts: AtomicU64::new(0),
+            stale_lease_redials: AtomicU64::new(0),
+            topped_up: AtomicU64::new(0),
+            topup_failures: AtomicU64::new(0),
+            handed_over: AtomicU64::new(0),
+            no_credential_warned: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The idle cap per identity (`[pool_mode] max_pool_size`, at least 1).
+    pub fn max_idle_per_key(&self) -> usize {
+        self.max_idle_per_key
     }
 
     /// Record that a provably-clean connection was parked without a reset.
@@ -164,14 +278,15 @@ impl BackendIdlePool {
     /// usable one (caller then dials a fresh connection). Dead/stale parked
     /// connections are evicted in passing.
     pub fn checkout(&self, key: &str) -> Option<TcpStream> {
-        self.checkout_with_slot(key).map(|(stream, _slot)| stream)
+        self.checkout_conn_with(key, LeaseOptions::PROBED)
+            .map(|conn| conn.stream)
     }
 
     /// [`Self::checkout`], also handing back the connection's node slot
     /// (H-05) so it stays held while the connection is in use.
     pub fn checkout_with_slot(&self, key: &str) -> Option<(TcpStream, crate::node_slots::Slot)> {
-        self.checkout_keyed(key)
-            .map(|(stream, slot, _backend_key)| (stream, slot))
+        self.checkout_conn_with(key, LeaseOptions::PROBED)
+            .map(|conn| (conn.stream, conn.slot))
     }
 
     /// [`Self::checkout_with_slot`], also handing back the BackendKeyData
@@ -180,17 +295,31 @@ impl BackendIdlePool {
         &self,
         key: &str,
     ) -> Option<(TcpStream, crate::node_slots::Slot, BackendKey)> {
-        self.checkout_conn(key)
+        self.checkout_conn_with(key, LeaseOptions::PROBED)
             .map(|conn| (conn.stream, conn.slot, conn.backend_key))
     }
 
     /// [`Self::checkout_keyed`], also handing back what is known about the
-    /// connection's settings ([`Self::checkin_conn`]).
+    /// connection's settings: the newest live connection of `key`, probed
+    /// for liveness, with no lifetime limit ([`LeaseOptions::PROBED`]).
     pub fn checkout_conn(&self, key: &str) -> Option<PooledConn> {
+        self.checkout_conn_with(key, LeaseOptions::PROBED)
+    }
+
+    /// Take the newest parked connection of `key` that is usable under
+    /// `opts`: one past `opts.max_lifetime` is closed (counted in
+    /// [`Self::lifetime_expired`]); with `opts.probe`, one whose peer closed
+    /// it (or sent anything) while it was parked is closed too (counted in
+    /// [`Self::stale_evicted`]). `None` when nothing usable is parked.
+    pub fn checkout_conn_with(&self, key: &str, opts: LeaseOptions) -> Option<PooledConn> {
         let mut guard = self.idle.get_mut(key)?;
         while let Some(Parked { conn, .. }) = guard.pop() {
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
-            if Self::probe_alive(&conn.stream) {
+            if conn.expired(opts.max_lifetime) {
+                self.lifetime_expired.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if !opts.probe || Self::probe_alive(&conn.stream) {
                 self.reuses.fetch_add(1, Ordering::Relaxed);
                 return Some(conn);
             }
@@ -228,20 +357,32 @@ impl BackendIdlePool {
         slot: crate::node_slots::Slot,
         backend_key: BackendKey,
     ) -> bool {
-        self.checkin_conn(
+        self.checkin_conn_capped(
             key,
             PooledConn {
                 stream,
                 slot,
                 backend_key,
                 settings: ParkedSettings::default(),
+                tenant_slot: None,
+                opened_at: Instant::now(),
             },
+            self.max_idle_per_key,
         )
     }
 
     /// [`Self::checkin_keyed`] with what is known about the connection's
-    /// settings, for [`Self::checkout_conn`] to hand back.
+    /// settings, at most the pool's per-key idle cap
+    /// ([`Self::checkin_conn_capped`] takes another cap).
     pub fn checkin_conn(&self, key: &str, conn: PooledConn) -> bool {
+        self.checkin_conn_capped(key, conn, self.max_idle_per_key)
+    }
+
+    /// Park `conn` under `key`, with what is known about its settings for
+    /// [`Self::checkout_conn_with`] to hand back, at most `max_idle` per key (at
+    /// least 1) and `max_total_idle` across all keys. `false` when a cap is
+    /// reached: the connection, its slots with it, is dropped (closed).
+    pub fn checkin_conn_capped(&self, key: &str, conn: PooledConn, max_idle: usize) -> bool {
         // Global ceiling first — bounds total FDs across all identities. Reserve
         // the slot atomically (fetch_add, inspect the prior value) rather than
         // load-then-act: a plain load outside the lock lets N concurrent
@@ -254,7 +395,7 @@ impl BackendIdlePool {
             return false; // `conn` dropped here → socket closed.
         }
         let mut entry = self.idle.entry(key.to_string()).or_default();
-        if entry.len() >= self.max_idle_per_key {
+        if entry.len() >= max_idle.max(1) {
             // Per-key cap reached — release the global slot we reserved.
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
             self.over_capacity.fetch_add(1, Ordering::Relaxed);
@@ -274,19 +415,68 @@ impl BackendIdlePool {
     /// Returns the number reaped. Intended to be called periodically by a
     /// background task.
     pub fn reap_idle(&self, max_age: Duration) -> usize {
-        let mut reaped = 0usize;
+        self.reap(Some(max_age), None, 0, None)
+    }
+
+    /// The idle reaper's pass: close parked connections idle longer than
+    /// `idle_ttl` (`None`: never), except the newest `keep_newest` of each key
+    /// (`[pool_mode] min_idle`) and, with `closable`, beyond the number of
+    /// idle closes each node may still take (its open connections above
+    /// `[pool] min_connections`; a node not listed has no floor); and every
+    /// one older than `max_lifetime` (`None`: no limit), kept or not.
+    /// Returns how many were closed.
+    pub fn reap(
+        &self,
+        idle_ttl: Option<Duration>,
+        max_lifetime: Option<Duration>,
+        keep_newest: usize,
+        mut closable: Option<&mut std::collections::HashMap<String, usize>>,
+    ) -> usize {
+        if idle_ttl.is_none() && max_lifetime.is_none() {
+            return 0;
+        }
+        let (mut idle_closed, mut expired) = (0usize, 0usize);
         for mut entry in self.idle.iter_mut() {
-            let before = entry.value().len();
-            entry
-                .value_mut()
-                .retain(|p| p.parked_at.elapsed() < max_age);
-            reaped += before - entry.value().len();
+            let node = entry
+                .key()
+                .split('\0')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let stack = entry.value_mut();
+            // Newest last: the last `keep_newest` are the floor.
+            let floor_from = stack.len().saturating_sub(keep_newest);
+            let mut index = 0usize;
+            stack.retain(|p| {
+                let kept_by_floor = index >= floor_from;
+                index += 1;
+                if p.conn.expired(max_lifetime) {
+                    expired += 1;
+                    return false;
+                }
+                let idle_expired = idle_ttl.is_some_and(|ttl| p.parked_at.elapsed() >= ttl);
+                if !idle_expired || kept_by_floor {
+                    return true;
+                }
+                // The node's floor: close only while it stays above it.
+                if let Some(budget) = closable.as_deref_mut().and_then(|c| c.get_mut(&node)) {
+                    if *budget == 0 {
+                        return true;
+                    }
+                    *budget -= 1;
+                }
+                idle_closed += 1;
+                false
+            });
         }
-        if reaped > 0 {
-            self.total_idle.fetch_sub(reaped, Ordering::Relaxed);
-            self.reaped.fetch_add(reaped as u64, Ordering::Relaxed);
+        let closed = idle_closed + expired;
+        if closed > 0 {
+            self.total_idle.fetch_sub(closed, Ordering::Relaxed);
+            self.reaped.fetch_add(idle_closed as u64, Ordering::Relaxed);
+            self.lifetime_expired
+                .fetch_add(expired as u64, Ordering::Relaxed);
         }
-        reaped
+        closed
     }
 
     /// Liveness probe for an idle parked connection: a clean idle backend has
@@ -304,6 +494,21 @@ impl BackendIdlePool {
     /// Total idle connections currently parked across all identities (O(1)).
     pub fn idle_count(&self) -> usize {
         self.total_idle.load(Ordering::Relaxed)
+    }
+
+    /// Idle connections parked under `key`.
+    pub fn idle_count_for(&self, key: &str) -> usize {
+        self.idle.get(key).map_or(0, |e| e.len())
+    }
+
+    /// Idle connections parked for `node`, any identity (O(keys)).
+    pub fn idle_count_for_node(&self, node: &str) -> usize {
+        let prefix = format!("{node}\0");
+        self.idle
+            .iter()
+            .filter(|e| e.key().starts_with(&prefix))
+            .map(|e| e.value().len())
+            .sum()
     }
 
     /// Global ceiling on parked idle connections.
@@ -336,6 +541,76 @@ impl BackendIdlePool {
         self.stale_evicted.load(Ordering::Relaxed)
     }
 
+    /// Count a connection closed at release for outliving the lifetime.
+    pub fn note_lifetime_expired(&self) {
+        self.lifetime_expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Connections closed for outliving the max lifetime.
+    pub fn lifetime_expired(&self) -> u64 {
+        self.lifetime_expired.load(Ordering::Relaxed)
+    }
+
+    /// Count a request refused at `[pool_mode] acquire_timeout_secs`.
+    pub fn note_acquire_timeout(&self) {
+        self.acquire_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Requests refused with 53300 at `[pool_mode] acquire_timeout_secs`.
+    pub fn acquire_timeouts(&self) -> u64 {
+        self.acquire_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Count an unprobed lease replaced after its first write failed.
+    pub fn note_stale_lease_redial(&self) {
+        self.stale_lease_redials.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Unprobed leases replaced by a fresh dial.
+    pub fn stale_lease_redials(&self) -> u64 {
+        self.stale_lease_redials.load(Ordering::Relaxed)
+    }
+
+    /// Count an ahead-of-use dial: parked (`true`) or failed.
+    pub fn note_topup(&self, parked: bool) {
+        if parked {
+            self.topped_up.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.topup_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Connections opened ahead of use and parked.
+    pub fn topped_up(&self) -> u64 {
+        self.topped_up.load(Ordering::Relaxed)
+    }
+
+    /// Ahead-of-use dials that failed.
+    pub fn topup_failures(&self) -> u64 {
+        self.topup_failures.load(Ordering::Relaxed)
+    }
+
+    /// Count a released connection closed for a session waiting for its
+    /// slot.
+    pub fn note_handed_over(&self) {
+        self.handed_over.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Released connections closed so that a waiting session got their
+    /// node's or tenant's slot.
+    pub fn handed_over(&self) -> u64 {
+        self.handed_over.load(Ordering::Relaxed)
+    }
+
+    /// `true` the first time only: the warning that an identity cannot be
+    /// opened ahead of use (the proxy holds no credential for it) is logged
+    /// once per process.
+    pub fn first_no_credential_warning(&self) -> bool {
+        !self
+            .no_credential_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Close the longest-parked idle connection to `node` (any identity), to
     /// hand its backend slot to a new connection the backend just refused with
     /// `53300 too_many_connections`. Parked connections hold backend capacity
@@ -344,8 +619,19 @@ impl BackendIdlePool {
     /// parked.
     pub fn evict_one_idle_for_node(&self, node: &str) -> bool {
         let prefix = format!("{}\0", node);
+        self.evict_one_where(|key| key.starts_with(&prefix))
+    }
+
+    /// Close the longest-parked idle connection of the tenant whose pool keys
+    /// end in `suffix` (`TenantPlan::pool_suffix`), to hand its tenant slot
+    /// to a new connection of the tenant. `false` when none is parked.
+    pub fn evict_one_idle_for_tenant(&self, suffix: &str) -> bool {
+        self.evict_one_where(|key| key.ends_with(suffix))
+    }
+
+    fn evict_one_where(&self, matches: impl Fn(&str) -> bool) -> bool {
         for mut entry in self.idle.iter_mut() {
-            if !entry.key().starts_with(&prefix) || entry.value().is_empty() {
+            if !matches(entry.key()) || entry.value().is_empty() {
                 continue;
             }
             // Oldest first: index 0 was parked earliest (checkin pushes).
@@ -377,6 +663,64 @@ impl BackendIdlePool {
     /// Idle connections closed by [`Self::evict_one_idle_for_node`].
     pub fn capacity_evictions(&self) -> u64 {
         self.capacity_evictions.load(Ordering::Relaxed)
+    }
+
+    /// Note that a session parked a connection of `key` now: the reaper may
+    /// open the identity ahead of use. `make` builds the spec the first time
+    /// (the only time the startup packet is built). A full table first drops
+    /// its least recently used spec.
+    pub fn note_use(&self, key: &str, now: Instant, make: impl FnOnce() -> DialSpec) {
+        if let Some(mut spec) = self.specs.get_mut(key) {
+            spec.last_used = now;
+            return;
+        }
+        if self.specs.len() >= self.max_total_idle {
+            let oldest = self
+                .specs
+                .iter()
+                .min_by_key(|e| e.value().last_used)
+                .map(|e| e.key().clone());
+            if let Some(oldest) = oldest {
+                self.specs.remove(&oldest);
+            }
+        }
+        let mut spec = make();
+        spec.last_used = now;
+        self.specs.insert(key.to_string(), spec);
+    }
+
+    /// Forget the identities no session used within `ttl` (`None`: keep).
+    pub fn expire_specs(&self, ttl: Option<Duration>) {
+        if let Some(ttl) = ttl {
+            self.specs.retain(|_, spec| spec.last_used.elapsed() < ttl);
+        }
+    }
+
+    /// The identities the reaper may open ahead of use, with their keys.
+    pub fn specs(&self) -> Vec<(String, DialSpec)> {
+        self.specs
+            .iter()
+            .filter(|e| !e.value().no_credential)
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
+    }
+
+    /// The most recently used identity of `node` that may be opened ahead
+    /// of use.
+    pub fn latest_spec_for(&self, node: &str) -> Option<(String, DialSpec)> {
+        self.specs
+            .iter()
+            .filter(|e| e.value().node == node && !e.value().no_credential)
+            .max_by_key(|e| e.value().last_used)
+            .map(|e| (e.key().clone(), e.value().clone()))
+    }
+
+    /// The backend asked `key`'s identity for a password the proxy does not
+    /// hold: it is not opened ahead of use again.
+    pub fn mark_no_credential(&self, key: &str) {
+        if let Some(mut spec) = self.specs.get_mut(key) {
+            spec.no_credential = true;
+        }
     }
 }
 
@@ -540,22 +884,29 @@ mod tests {
             proof: Some(proof),
             immutable_proof: None,
         };
-        assert!(pool.checkin_conn(
+        assert!(pool.checkin_conn_capped(
             &key,
             PooledConn {
                 stream: c1,
                 slot: None,
                 backend_key: Some((3, 4)),
                 settings,
-            }
+                tenant_slot: None,
+                opened_at: Instant::now(),
+            },
+            8,
         ));
         // The keyed API parks with nothing known.
         assert!(pool.checkin_keyed(&key, c2, None, None));
 
-        let plain = pool.checkout_conn(&key).expect("parked");
+        let plain = pool
+            .checkout_conn_with(&key, LeaseOptions::PROBED)
+            .expect("parked");
         assert_eq!(plain.settings, ParkedSettings::default());
         assert!(!plain.settings.baseline);
-        let proven = pool.checkout_conn(&key).expect("parked");
+        let proven = pool
+            .checkout_conn_with(&key, LeaseOptions::PROBED)
+            .expect("parked");
         assert_eq!(proven.settings, settings);
         assert_eq!(proven.backend_key, Some((3, 4)));
         assert_eq!(pool.idle_count(), 0);
@@ -672,5 +1023,232 @@ mod tests {
         assert_eq!(pool.reaped(), 1);
         // A subsequent checkout misses (it was reaped).
         assert!(pool.checkout(&key).is_none());
+    }
+
+    /// A parked connection opened `age` ago.
+    fn aged(stream: TcpStream, age: Duration) -> PooledConn {
+        PooledConn {
+            opened_at: Instant::now() - age,
+            ..PooledConn::fresh(stream)
+        }
+    }
+
+    /// W02 max lifetime: a connection past it is never handed out (closed
+    /// at checkout), and the reaper closes it even within the idle TTL and
+    /// the min_idle floor; younger ones are untouched.
+    #[tokio::test]
+    async fn lifetime_closes_old_connections_at_checkout_and_in_the_reaper() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = BackendIdlePool::new(8, 100);
+        let key = pool_key("n", "u", "d");
+        let life = Some(Duration::from_secs(60));
+        let (old, _s1) = live_pair(&listener).await;
+        let (young, _s2) = live_pair(&listener).await;
+        let young_addr = young.local_addr().unwrap();
+        assert!(pool.checkin_conn_capped(&key, aged(young, Duration::from_secs(1)), 8));
+        // Newest last: the old one is handed out first, and refused.
+        assert!(pool.checkin_conn_capped(&key, aged(old, Duration::from_secs(120)), 8));
+        let got = pool
+            .checkout_conn_with(
+                &key,
+                LeaseOptions {
+                    probe: true,
+                    max_lifetime: life,
+                },
+            )
+            .expect("the young one");
+        assert_eq!(got.stream.local_addr().unwrap(), young_addr);
+        assert_eq!(pool.lifetime_expired(), 1);
+        assert_eq!(pool.idle_count(), 0);
+        // Without a lifetime the same old connection is fine.
+        let (old, _s3) = live_pair(&listener).await;
+        assert!(pool.checkin_conn_capped(&key, aged(old, Duration::from_secs(120)), 8));
+        assert!(pool
+            .checkout_conn_with(&key, LeaseOptions::PROBED)
+            .is_some());
+
+        // The reaper: the floor keeps idle connections, not old ones.
+        let (old, _s4) = live_pair(&listener).await;
+        let (young, _s5) = live_pair(&listener).await;
+        assert!(pool.checkin_conn_capped(&key, aged(old, Duration::from_secs(120)), 8));
+        assert!(pool.checkin_conn_capped(&key, aged(young, Duration::from_secs(1)), 8));
+        assert_eq!(pool.reap(Some(Duration::from_secs(600)), life, 2, None), 1);
+        assert_eq!(pool.lifetime_expired(), 2);
+        assert_eq!(pool.reaped(), 0, "a lifetime close is not an idle reap");
+        assert_eq!(pool.idle_count(), 1);
+    }
+
+    /// W02 min_idle: the reaper's idle TTL spares the newest `keep_newest`
+    /// connections of each key; with no TTL and no lifetime it closes
+    /// nothing.
+    #[tokio::test]
+    async fn reaper_keeps_the_newest_min_idle_of_each_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = BackendIdlePool::new(8, 100);
+        let (a, b) = (pool_key("n", "a", "d"), pool_key("n", "b", "d"));
+        let mut halves = Vec::new();
+        for key in [&a, &a, &a, &b] {
+            let (c, s) = live_pair(&listener).await;
+            halves.push(s);
+            assert!(pool.checkin(key, c));
+        }
+        let newest_a = {
+            let (c, s) = live_pair(&listener).await;
+            halves.push(s);
+            let addr = c.local_addr().unwrap();
+            assert!(pool.checkin(&a, c));
+            addr
+        };
+        assert_eq!(pool.reap(None, None, 0, None), 0, "nothing to reap by");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(pool.reap(Some(Duration::from_millis(5)), None, 2, None), 2);
+        assert_eq!(pool.idle_count_for(&a), 2);
+        assert_eq!(pool.idle_count_for(&b), 1);
+        assert_eq!(pool.idle_count_for_node("n"), 3);
+        assert_eq!(pool.idle_count_for_node("m"), 0);
+        let kept = pool.checkout(&a).unwrap();
+        assert_eq!(kept.local_addr().unwrap(), newest_a, "the newest stayed");
+        // Without a floor the TTL closes the rest.
+        assert_eq!(pool.reap(Some(Duration::from_millis(5)), None, 0, None), 2);
+        assert_eq!(pool.idle_count(), 0);
+    }
+
+    /// W02 min_connections: with a per-node budget the idle TTL closes a
+    /// node's connections only while it stays at its floor; a node not
+    /// listed has none.
+    #[tokio::test]
+    async fn reaper_keeps_each_nodes_min_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = BackendIdlePool::new(8, 100);
+        let mut halves = Vec::new();
+        for key in [
+            pool_key("n", "a", "d"),
+            pool_key("n", "b", "d"),
+            pool_key("n", "b", "d"),
+            pool_key("m", "a", "d"),
+        ] {
+            let (c, s) = live_pair(&listener).await;
+            halves.push(s);
+            assert!(pool.checkin(&key, c));
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        // `n` may lose one more connection; `m` has no floor.
+        let mut closable = std::collections::HashMap::from([("n".to_string(), 1usize)]);
+        let ttl = Some(Duration::from_millis(5));
+        assert_eq!(pool.reap(ttl, None, 0, Some(&mut closable)), 2);
+        assert_eq!(closable["n"], 0);
+        assert_eq!(pool.idle_count_for_node("n"), 2);
+        assert_eq!(pool.idle_count_for_node("m"), 0);
+        assert_eq!(
+            pool.reap(ttl, None, 0, Some(&mut closable)),
+            0,
+            "at the floor"
+        );
+        assert_eq!(pool.idle_count(), 2);
+        assert_eq!(pool.reaped(), 2);
+    }
+
+    /// W02 test_on_acquire = false: a checkout without the probe hands out a
+    /// connection whose peer closed while it was parked (the probe would have
+    /// dropped it).
+    #[tokio::test]
+    async fn an_unprobed_checkout_skips_the_liveness_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = BackendIdlePool::new(4, 100);
+        let key = pool_key("n", "u", "d");
+        for probe in [true, false] {
+            let (client, server) = live_pair(&listener).await;
+            assert!(pool.checkin(&key, client));
+            drop(server);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let got = pool.checkout_conn_with(
+                &key,
+                LeaseOptions {
+                    probe,
+                    max_lifetime: None,
+                },
+            );
+            assert_eq!(got.is_some(), !probe, "probe = {probe}");
+        }
+        assert_eq!(pool.stale_evicted(), 1);
+    }
+
+    /// A per-key idle cap below the global one (a tenant's `pool_max_idle`),
+    /// and the eviction of one idle connection of a tenant by its key
+    /// suffix.
+    #[tokio::test]
+    async fn per_key_idle_caps_and_tenant_eviction() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = BackendIdlePool::new(10, 100);
+        let tenant = format!("{}\0t=acme", pool_key("n", "u", "d"));
+        let other = pool_key("n", "u", "d");
+        let mut halves = Vec::new();
+        for expect in [true, true, false] {
+            let (c, s) = live_pair(&listener).await;
+            halves.push(s);
+            assert_eq!(
+                pool.checkin_conn_capped(&tenant, PooledConn::fresh(c), 2),
+                expect
+            );
+        }
+        let (c, s) = live_pair(&listener).await;
+        halves.push(s);
+        assert!(pool.checkin_conn_capped(&other, PooledConn::fresh(c), 10));
+        assert_eq!(pool.over_capacity(), 1);
+        assert!(pool.evict_one_idle_for_tenant("\0t=acme"));
+        assert_eq!(pool.idle_count_for(&tenant), 1);
+        assert_eq!(pool.idle_count_for(&other), 1, "other keys untouched");
+        assert!(pool.evict_one_idle_for_tenant("\0t=acme"));
+        assert!(!pool.evict_one_idle_for_tenant("\0t=acme"));
+        assert!(!pool.evict_one_idle_for_tenant("\0t=globex"));
+    }
+
+    fn spec(node: &str) -> DialSpec {
+        DialSpec {
+            node: node.to_string(),
+            startup: Arc::from(&b"startup"[..]),
+            user: "u".to_string(),
+            tenant_pool: None,
+            max_idle: 4,
+            last_used: Instant::now(),
+            no_credential: false,
+        }
+    }
+
+    /// The top-up specs: recorded once per key (later uses only refresh
+    /// it), the newest per node found, expired after the TTL, never offered
+    /// once marked as needing a credential, and bounded by the global idle
+    /// cap.
+    #[test]
+    fn dial_specs_are_recorded_once_refreshed_and_expired() {
+        let pool = BackendIdlePool::new(4, 2);
+        let t0 = Instant::now() - Duration::from_secs(10);
+        let mut built = 0;
+        pool.note_use("a", t0, || {
+            built += 1;
+            spec("n1")
+        });
+        pool.note_use("a", Instant::now(), || {
+            built += 1;
+            spec("n1")
+        });
+        assert_eq!(built, 1, "the startup packet is built once");
+        pool.note_use("b", t0, || spec("n1"));
+        assert_eq!(pool.latest_spec_for("n1").unwrap().0, "a");
+        assert!(pool.latest_spec_for("n2").is_none());
+        // The table is full (2 = max_total_idle): the least recent goes.
+        pool.note_use("c", Instant::now(), || spec("n2"));
+        let mut keys: Vec<String> = pool.specs().into_iter().map(|(k, _)| k).collect();
+        keys.sort();
+        assert_eq!(keys, ["a", "c"]);
+        pool.mark_no_credential("a");
+        assert!(pool.latest_spec_for("n1").is_none());
+        assert_eq!(pool.specs().len(), 1);
+        pool.note_use("old", t0, || spec("n3"));
+        pool.expire_specs(Some(Duration::from_secs(5)));
+        assert!(pool.latest_spec_for("n3").is_none());
+        assert!(pool.latest_spec_for("n2").is_some());
+        pool.expire_specs(None);
+        assert!(pool.latest_spec_for("n2").is_some());
     }
 }

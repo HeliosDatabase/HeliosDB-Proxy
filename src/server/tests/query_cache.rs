@@ -3475,14 +3475,16 @@ async fn effective_scope_pool_keeps_an_immutable_proof_with_its_connection() {
     assert_eq!(state.metrics.cache_scope_proofs.load(Ordering::Relaxed), 1);
 
     let key = ProxyServer::pool_key_for(&relay.addr, &relay.session).await;
-    let mut parked = pool.checkout_conn(&key).expect("parked");
+    let mut parked = pool
+        .checkout_conn_with(&key, crate::pool::LeaseOptions::PROBED)
+        .expect("parked");
     parked
         .settings
         .immutable_proof
         .as_mut()
         .expect("the immutable proof is parked with the connection")
         .startup = [0xAB; 32];
-    assert!(pool.checkin_conn(&key, parked));
+    assert!(pool.checkin_conn_capped(&key, parked, 8));
     let (node, reply) = relay.query(SQL).await;
     assert!(node.is_none(), "proved again, same scope: a hit");
     assert_eq!(reply, backend_reply());

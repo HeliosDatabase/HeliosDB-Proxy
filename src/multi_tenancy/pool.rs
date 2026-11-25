@@ -3,6 +3,9 @@
 //! This module provides connection pool management with per-tenant isolation
 //! and resource allocation.
 
+// Deprecated since 3.1; the module uses its own deprecated types.
+#![allow(deprecated)]
+
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,6 +128,10 @@ impl PooledConnection {
 
 /// Per-tenant connection pool
 #[derive(Debug)]
+#[deprecated(
+    since = "3.1.0",
+    note = "library-only bookkeeping no daemon path uses; the daemon's per-tenant pools are `[multi_tenancy] tenant_settings` pool settings (`tenant_slots::TenantPool`)"
+)]
 pub struct TenantPool {
     /// Tenant ID
     tenant_id: TenantId,
@@ -313,6 +320,10 @@ pub struct TenantPoolStats {
 /// Tenant connection pool manager
 ///
 /// Manages connection pools across all tenants.
+#[deprecated(
+    since = "3.1.0",
+    note = "library-only bookkeeping no daemon path uses; the daemon's per-tenant pools are `[multi_tenancy] tenant_settings` pool settings (`tenant_slots::TenantPool`)"
+)]
 pub struct TenantConnectionPool {
     /// Per-tenant pools
     pools: DashMap<TenantId, Arc<TenantPool>>,
@@ -522,6 +533,10 @@ pub enum AcquireResult {
 }
 
 /// Connection lease for tenant
+#[deprecated(
+    since = "3.1.0",
+    note = "library-only bookkeeping no daemon path uses; the daemon's per-tenant pools are `[multi_tenancy] tenant_settings` pool settings (`tenant_slots::TenantPool`)"
+)]
 pub struct TenantConnectionLease {
     /// The pooled connection
     connection: PooledConnection,

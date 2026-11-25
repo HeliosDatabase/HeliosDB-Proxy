@@ -287,6 +287,14 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         journal_identity_generation: std::sync::atomic::AtomicU64::new(1),
         journal_identity_resolved: std::sync::atomic::AtomicU64::new(0),
         startup_slot: parking_lot::Mutex::new(None),
+        tenant: std::sync::OnceLock::new(),
+        startup_tenant_slot: parking_lot::Mutex::new(None),
+        #[cfg(feature = "pool-modes")]
+        stale_lease: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "pool-modes")]
+        fresh_dial: std::sync::atomic::AtomicBool::new(false),
+        sql_prepared: parking_lot::Mutex::new(Default::default()),
+        sql_prepared_live: std::sync::atomic::AtomicBool::new(false),
         reads_pinned: std::sync::atomic::AtomicBool::new(false),
         read_node: parking_lot::Mutex::new(None),
         last_write: parking_lot::Mutex::new(None),
@@ -535,6 +543,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         routing: Arc::new(crate::routing_snapshot::RoutingView::new(false)),
         gateway_pools: Arc::new(crate::gateway_pool::GatewayPools::new(1)),
         node_slots: Arc::new(crate::node_slots::NodeSlots::default()),
+        latency_gate: Default::default(),
         node_overrides: Arc::new(crate::node_overrides::NodeOverrides::new()),
         tenant_slots: Arc::new(crate::tenant_slots::TenantSlots::default()),
         latency: Arc::new(crate::metrics_hist::ProxyLatency::new(
@@ -573,8 +582,6 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         tenant_manager: None,
         #[cfg(feature = "schema-routing")]
         schema_analyzer: None,
-        #[cfg(feature = "pool-modes")]
-        pool_manager: None,
         #[cfg(feature = "pool-modes")]
         backend_pool: None,
         plugin_manager: Some(pm),
@@ -1669,7 +1676,9 @@ async fn a_sighup_keeps_the_running_client_tcp_keepalive() {
 
     std::fs::write(
         &path,
-        format!("[pool]\nmax_connections = 77\n{nodes}[limits]\nclient_tcp_keepalive_secs = 60\n"),
+        format!(
+            "[pool]\nacquire_timeout_secs = 77\n{nodes}[limits]\nclient_tcp_keepalive_secs = 60\n"
+        ),
     )
     .unwrap();
     server.reload_config().await;
@@ -1680,7 +1689,7 @@ async fn a_sighup_keeps_the_running_client_tcp_keepalive() {
     );
     assert_eq!(server.state.limits.client_tcp_keepalive, None);
     assert_eq!(
-        live.pool.max_connections, 77,
+        live.pool.acquire_timeout_secs, 77,
         "the rest of the reload applies"
     );
 }

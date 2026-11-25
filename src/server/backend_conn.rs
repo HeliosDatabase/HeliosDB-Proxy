@@ -578,29 +578,216 @@ impl ProxyServer {
         // Transaction/Statement pooling: lease a parked, identity-matched
         // connection before paying for a fresh TCP connect + startup + auth.
         // The parked connection was `DISCARD ALL`-reset on release, so it is
-        // clean for this (same-identity) client.
+        // clean for this (same-identity) client. A retry after a stale
+        // unprobed lease dials fresh instead (`fresh_dial`).
         #[cfg(feature = "pool-modes")]
         if let Some(pool) = state.backend_pool.as_ref() {
-            let key = Self::pool_key_for(target, session).await;
-            if let Some(parked) = pool.checkout_conn(&key) {
-                tracing::info!(
-                    target: "helios::pool",
-                    node = %target,
-                    "reused pooled backend connection"
-                );
-                let mut bc = BackendConn::with_slot(parked.stream, parked.slot);
-                bc.backend_key = parked.backend_key;
-                #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-                Self::adopt_parked_settings(&mut bc, parked.settings, session).await;
-                conns.insert(target.to_string(), bc);
-                return Ok(());
+            let fresh = session.fresh_dial.load(Ordering::Relaxed)
+                && session.fresh_dial.swap(false, Ordering::Relaxed);
+            if !fresh {
+                let key = Self::pool_key_for(target, session).await;
+                let probe = config.pool.test_on_acquire;
+                let lease = crate::pool::LeaseOptions {
+                    probe,
+                    max_lifetime: config.pool_max_lifetime(),
+                };
+                if let Some(conn) = pool.checkout_conn_with(&key, lease) {
+                    tracing::debug!(
+                        target: "helios::pool",
+                        node = %target,
+                        "reused pooled backend connection"
+                    );
+                    let plan = session.tenant.get();
+                    if let Some(tenant_pool) = plan.and_then(|p| p.pool()) {
+                        tenant_pool.note_checkout();
+                    }
+                    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+                    let settings = conn.settings;
+                    let mut bc = BackendConn::leased(conn, !probe);
+                    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+                    Self::adopt_parked_settings(&mut bc, settings, session).await;
+                    if let Some(set) = plan.and_then(|p| p.set_on_acquire()) {
+                        Self::apply_search_path(&mut bc, &set, state).await?;
+                    }
+                    conns.insert(target.to_string(), bc);
+                    return Ok(());
+                }
             }
         }
 
+        // `[pool_mode] acquire_timeout_secs` (transaction / statement pooling):
+        // one deadline over the whole dial (the slot waits, the connect, the
+        // authentication, the 53300 retries).
+        let mut bc = match config.pool_acquire_deadline() {
+            None => Self::dial_backend(target, session, config, state).await?,
+            Some(deadline) => {
+                match tokio::time::timeout(
+                    deadline,
+                    Self::dial_backend(target, session, config, state),
+                )
+                .await
+                {
+                    Ok(dialed) => dialed?,
+                    Err(_) => {
+                        #[cfg(feature = "pool-modes")]
+                        if let Some(pool) = state.backend_pool.as_ref() {
+                            pool.note_acquire_timeout();
+                        }
+                        tracing::warn!(
+                            target: "helios::pool",
+                            node = %target,
+                            timeout_secs = deadline.as_secs(),
+                            "no backend connection within [pool_mode] acquire_timeout_secs; refusing the request with 53300"
+                        );
+                        return Err(ProxyError::PoolExhausted(format!(
+                            "no backend connection to {target} within [pool_mode] \
+                             acquire_timeout_secs ({} s): {} reached",
+                            deadline.as_secs(),
+                            crate::node_slots::REFUSAL_MARKER
+                        )));
+                    }
+                }
+            }
+        };
+        if let Some(set) = session.tenant.get().and_then(|p| p.set_on_acquire()) {
+            Self::apply_search_path(&mut bc, &set, state).await?;
+        }
+        conns.insert(target.to_string(), bc);
+        Ok(())
+    }
+
+    /// `[multi_tenancy] schema_apply = "set_on_acquire"`: give a connection
+    /// the session tenant's `search_path` (`set`, the `SET` statement) before
+    /// it serves the session. The connection is reset before it is parked
+    /// again, so no other session inherits it.
+    pub(super) async fn apply_search_path(
+        bc: &mut BackendConn,
+        set: &str,
+        state: &ServerState,
+    ) -> Result<()> {
+        Self::tr_run_discard(
+            &mut bc.stream,
+            set,
+            state.limits.backend_write_timeout,
+            state.limits.backend_read_timeout,
+            state.limits.max_backend_frame_bytes,
+            None,
+        )
+        .await
+        .map_err(|e| match e {
+            ProxyError::Protocol(m) => {
+                ProxyError::Connection(format!("the tenant's search_path was refused: {m}"))
+            }
+            e => e,
+        })?;
+        bc.unnamed_destroyed();
+        #[cfg(feature = "pool-modes")]
+        {
+            bc.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// The first write of a request (or of the proxy's own exchange ahead
+    /// of it) failed on `target`'s connection with `e`, before anything of
+    /// the request was delivered. For a connection leased without its
+    /// liveness probe (`[pool] test_on_acquire = false`) and never written
+    /// to, that is a pooled socket the backend closed while it was parked:
+    /// no node fault is recorded and the session is told to redial once
+    /// ([`ClientSession::stale_lease`]). Anything else is a backend fault,
+    /// recorded as before.
+    pub(super) fn send_failed(
+        conns: &ConnMap,
+        target: &str,
+        e: &ProxyError,
+        session: &ClientSession,
+        state: &Arc<ServerState>,
+    ) {
+        #[cfg(feature = "pool-modes")]
+        if conns.get(target).is_some_and(|bc| bc.unprobed) {
+            if let Some(pool) = state.backend_pool.as_ref() {
+                pool.note_stale_lease_redial();
+            }
+            tracing::debug!(
+                target: "helios::pool",
+                node = %target,
+                error = %e,
+                "a pooled connection leased without the liveness probe was closed while parked; redialing"
+            );
+            session.stale_lease.store(true, Ordering::Relaxed);
+            return;
+        }
+        let _ = (conns, session);
+        Self::record_backend_failure(state, target, &e.to_string());
+    }
+
+    /// A request failed before delivery on a stale unprobed lease
+    /// ([`Self::send_failed`]): `true` once, with the fault cleared and the
+    /// next dial made fresh, for the caller to send it again.
+    pub(super) fn retry_stale_lease(
+        session: &ClientSession,
+        fault: &mut Option<BackendFault>,
+    ) -> bool {
+        #[cfg(feature = "pool-modes")]
+        if session.stale_lease.swap(false, Ordering::Relaxed) {
+            *fault = None;
+            session.fresh_dial.store(true, Ordering::Relaxed);
+            return true;
+        }
+        let _ = (session, fault);
+        false
+    }
+
+    /// A request found no backend connection within a proxy-side bound (a
+    /// node or tenant slot, the reconnect permit, `[pool_mode]
+    /// acquire_timeout_secs`, a backend at `max_connections`): it is
+    /// answered with 53300 and the session goes on, and nothing of it ran.
+    /// `wait_ready`: the request ends with a Sync (or is a simple Query),
+    /// so the answer ends with ReadyForQuery. `None` for any other error.
+    pub(super) async fn answer_no_connection(
+        e: &ProxyError,
+        fault: &mut Option<BackendFault>,
+        client: &mut ClientStream,
+        session: &ClientSession,
+        wait_ready: bool,
+    ) -> Option<Result<(Option<String>, u64)>> {
+        let ProxyError::PoolExhausted(message) = e else {
+            return None;
+        };
+        *fault = None;
+        let mut reply = Self::create_error_response(SQLSTATE_TOO_MANY_CONNECTIONS, message);
+        if wait_ready {
+            reply.extend_from_slice(&Self::create_ready_for_query(
+                session.last_rfq_status.load(Ordering::Relaxed),
+            ));
+        }
+        Some(
+            client
+                .write_all(&reply)
+                .await
+                .map(|()| (None, reply.len() as u64))
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e))),
+        )
+    }
+
+    /// Open a new authenticated backend connection to `target` for the
+    /// session: its tenant's slot, the node's slot, the reconnect permit,
+    /// the connect, the startup packet from the session's parameters and the
+    /// authentication (with the session's backend credential), retrying a
+    /// backend that refuses at `max_connections` until `[pool]
+    /// acquire_timeout_secs`.
+    async fn dial_backend(
+        target: &str,
+        session: &Arc<ClientSession>,
+        config: &ProxyConfig,
+        state: &Arc<ServerState>,
+    ) -> Result<BackendConn> {
         let params = session.variables.read().await.clone();
         let startup = Self::build_startup_message(&params);
         let user = params.get("user").map(String::as_str).unwrap_or("");
         let credential = session.backend_credential.read().await.clone();
+        // W07: a slot under the session tenant's `pool_max_connections`.
+        let tenant_slot = Self::acquire_tenant_pool_slot(session, state).await?;
         // A 53300 refusal (backend at max_connections) is retried after
         // freeing one idle pooled connection to this node, bounded by the
         // pool acquire timeout — see `connect_and_authenticate`.
@@ -670,11 +857,51 @@ impl ProxyServer {
             tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
         }
         tracing::debug!(node = %target, "opened backend connection");
+        if let Some(tenant_pool) = session.tenant.get().and_then(|p| p.pool()) {
+            tenant_pool.note_dial();
+        }
         let mut bc = BackendConn::with_slot(backend, slot);
+        bc._tenant_slot = tenant_slot;
         bc.hot_standby = hot_standby;
         bc.backend_key = backend_key;
-        conns.insert(target.to_string(), bc);
-        Ok(())
+        Ok(bc)
+    }
+
+    /// A slot under the session tenant's `pool_max_connections` (W07) for a
+    /// new backend connection: a full tenant first gives up one of its idle
+    /// pooled connections, then waits up to `[limits] backend_slot_wait_ms`,
+    /// then fails with `PoolExhausted` (53300). `None` for a session of no
+    /// tenant, or one without the cap.
+    pub(super) async fn acquire_tenant_pool_slot(
+        session: &ClientSession,
+        state: &ServerState,
+    ) -> Result<crate::node_slots::Slot> {
+        let Some(plan) = session.tenant.get() else {
+            return Ok(None);
+        };
+        let Some(pool) = plan.pool() else {
+            return Ok(None);
+        };
+        let (permit, waited) = pool
+            .acquire(state.limits.backend_slot_wait, || {
+                Self::free_idle_tenant(state, plan)
+            })
+            .await
+            .map_err(ProxyError::PoolExhausted)?;
+        if let Some(waited) = waited {
+            state.latency.backend_slot_wait.record(waited);
+        }
+        Ok(permit)
+    }
+
+    /// Close one idle pooled connection of `plan`'s tenant, for its slot.
+    fn free_idle_tenant(state: &ServerState, plan: &crate::tenant_slots::TenantPlan) -> bool {
+        #[cfg(feature = "pool-modes")]
+        if let (Some(pool), Some(suffix)) = (state.backend_pool.as_ref(), plan.pool_suffix()) {
+            return pool.evict_one_idle_for_tenant(suffix);
+        }
+        let _ = (state, plan);
+        false
     }
 
     /// The BackendKeyData (process id, secret key) in a backend's startup
@@ -990,14 +1217,16 @@ impl ProxyServer {
     /// connection was authenticated as. When any routing-relevant startup GUC
     /// (see `POOL_IDENTITY_PARAMS`) is set, a hash of those is folded in so the
     /// borrower also matches the lender's value-formatting settings. The common
-    /// case (no custom GUCs) keeps the bare `(node,user,db)` key unchanged.
+    /// case (no custom GUCs) keeps the bare `(node,user,db)` key unchanged. A
+    /// tenant with pool settings of its own (W07) ends its keys with its
+    /// `\0t=<tenant>` suffix, so its connections are pooled and capped apart.
     #[cfg(feature = "pool-modes")]
     pub(super) async fn pool_key_for(target: &str, session: &Arc<ClientSession>) -> String {
         let vars = session.variables.read().await;
         let user = vars.get("user").map(|s| s.as_str()).unwrap_or("");
         // PostgreSQL defaults the database to the role name when unset.
         let database = vars.get("database").map(|s| s.as_str()).unwrap_or(user);
-        let base = crate::pool::pool_key(target, user, database);
+        let mut key = crate::pool::pool_key(target, user, database);
 
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1010,9 +1239,77 @@ impl ProxyServer {
             }
         }
         if any {
-            format!("{}\0{:016x}", base, h.finish())
-        } else {
-            base
+            use std::fmt::Write as _;
+            let _ = write!(key, "\0{:016x}", h.finish());
+        }
+        if let Some(suffix) = session.tenant.get().and_then(|p| p.pool_suffix()) {
+            key.push_str(suffix);
+        }
+        key
+    }
+
+    /// The idle cap of the session's pool keys: its tenant's `pool_max_idle`,
+    /// else `[pool_mode] max_pool_size`.
+    #[cfg(feature = "pool-modes")]
+    fn session_max_idle(session: &ClientSession, pool: &crate::pool::BackendIdlePool) -> usize {
+        session
+            .tenant
+            .get()
+            .and_then(|p| p.pool_max_idle())
+            .unwrap_or_else(|| pool.max_idle_per_key())
+    }
+
+    /// Park `bc` under `key`, and, while `[pool_mode] min_idle` or `[pool]
+    /// min_connections` asks for connections ahead of use, note how to open
+    /// the identity again (the startup packet is built the first time only).
+    #[cfg(feature = "pool-modes")]
+    async fn park(
+        pool: &crate::pool::BackendIdlePool,
+        key: &str,
+        node: &str,
+        bc: BackendConn,
+        settings: crate::pool::ParkedSettings,
+        session: &Arc<ClientSession>,
+        config: &ProxyConfig,
+    ) -> bool {
+        let max_idle = Self::session_max_idle(session, pool);
+        if config.pool_mode.min_idle > 0 || config.pool.min_connections > 0 {
+            let vars = session.variables.read().await;
+            pool.note_use(key, std::time::Instant::now(), || crate::pool::DialSpec {
+                node: node.to_string(),
+                startup: Self::build_startup_message(&vars).into(),
+                user: vars.get("user").cloned().unwrap_or_default(),
+                tenant_pool: session.tenant.get().and_then(|p| p.pool().cloned()),
+                max_idle,
+                last_used: std::time::Instant::now(),
+                no_credential: false,
+            });
+        }
+        pool.checkin_conn_capped(key, bc.into_pooled(settings), max_idle)
+    }
+
+    /// After parking a released connection: a session may have started
+    /// waiting for its node's or tenant's slot while it was being reset
+    /// (the release checked before the reset). A waiter counts itself as
+    /// waiting before it looks for an idle connection to close, so it either
+    /// closed this one already or is seen here, and one idle connection of
+    /// that node or tenant is closed for it.
+    fn hand_over_parked(
+        state: &ServerState,
+        pool: &crate::pool::BackendIdlePool,
+        node: &str,
+        session: &ClientSession,
+    ) {
+        if state.node_slots.has_waiters(node) && pool.evict_one_idle_for_node(node) {
+            pool.note_handed_over();
+            return;
+        }
+        if let Some(plan) = session.tenant.get() {
+            if let (Some(tenant_pool), Some(suffix)) = (plan.pool(), plan.pool_suffix()) {
+                if tenant_pool.has_waiters() && pool.evict_one_idle_for_tenant(suffix) {
+                    pool.note_handed_over();
+                }
+            }
         }
     }
 
@@ -1260,6 +1557,33 @@ impl ProxyServer {
             return;
         }
 
+        // Past its max lifetime: closed now instead of being reset and
+        // parked (it is idle, so nothing of the session is lost).
+        if let Some(max) = config.pool_max_lifetime() {
+            if bc.opened_at.elapsed() >= max {
+                pool.note_lifetime_expired();
+                tracing::debug!(target: "helios::pool", node = %node, "closed a backend connection past its max lifetime instead of parking it");
+                return;
+            }
+        }
+
+        // A session is waiting for a slot of the node (`max_connections`) or
+        // of the tenant (`pool_max_connections`): close the connection
+        // instead of parking it, so its slot goes to that session now rather
+        // than once the wait times out behind an idle connection. Without a
+        // capped node or tenant this reads one flag.
+        if state.node_slots.has_waiters(node)
+            || session
+                .tenant
+                .get()
+                .and_then(|p| p.pool())
+                .is_some_and(|p| p.has_waiters())
+        {
+            pool.note_handed_over();
+            tracing::debug!(target: "helios::pool", node = %node, "closed a released backend connection: a session is waiting for its slot");
+            return;
+        }
+
         // Conditional reset: a connection that provably touched no session
         // state — no dirtying simple statement, no named prepared statement, no
         // unnamed prepared statement — can be parked WITHOUT the `DISCARD ALL`
@@ -1278,16 +1602,9 @@ impl ProxyServer {
         if holds_nothing && (untouched || (config.pool_mode.skip_clean_reset && !bc.dirty)) {
             let key = Self::pool_key_for(node, session).await;
             let settings = Self::parked_settings(&bc, None, session);
-            if pool.checkin_conn(
-                &key,
-                crate::pool::PooledConn {
-                    stream: bc.stream,
-                    slot: bc._slot,
-                    backend_key: bc.backend_key,
-                    settings,
-                },
-            ) {
+            if Self::park(pool, &key, node, bc, settings, session, config).await {
                 pool.note_reset_skipped();
+                Self::hand_over_parked(state, pool, node, session);
                 tracing::debug!(target: "helios::pool", node = %node, "parked clean backend connection (reset skipped)");
             }
             return;
@@ -1305,15 +1622,8 @@ impl ProxyServer {
             let restores =
                 !reported && Self::reset_restores_settings(&config.pool_mode.reset_query);
             let settings = Self::parked_settings(&bc, Some(restores), session);
-            if pool.checkin_conn(
-                &key,
-                crate::pool::PooledConn {
-                    stream: bc.stream,
-                    slot: bc._slot,
-                    backend_key: bc.backend_key,
-                    settings,
-                },
-            ) {
+            if Self::park(pool, &key, node, bc, settings, session, config).await {
+                Self::hand_over_parked(state, pool, node, session);
                 tracing::debug!(target: "helios::pool", node = %node, "parked backend connection for reuse");
             }
             return;

@@ -2495,10 +2495,12 @@ fn enabled_capabilities_are_actually_wired() {
     // binding used in a no-default-features build too.
     assert!(state.sessions.is_empty(), "fresh server has sessions");
 
+    // The data-path pool exists exactly in the pooled modes.
     #[cfg(feature = "pool-modes")]
-    assert!(
-        state.pool_manager.is_some(),
-        "pool-modes compiled but not wired"
+    assert_eq!(
+        state.backend_pool.is_some(),
+        state.live_config.load().pool_mode.pooled(),
+        "pool-modes compiled but its data-path pool not wired to the pool mode"
     );
 
     #[cfg(feature = "query-cache")]

@@ -89,7 +89,7 @@ Other material, which does not configure a promotion authority and is not a reco
 |---|---|---|---|
 | Language | Rust | C | C |
 | Pooling modes | session, transaction, statement | session, transaction, statement [1] | none: TCP/L4 proxy [5] |
-| Prepared statements in transaction pooling | opt-in (`prepared_statement_mode = "track"`), default off | yes, on by default since 1.24 (`max_prepared_statements`, default 200) [2][3] | n/a |
+| Prepared statements in transaction pooling | yes, on by default (`prepared_statement_mode = "track"`: named protocol-level statements and SQL `PREPARE`, re-prepared on whichever connection runs them; `[limits] max_prepared_statements`, default 200) | yes, on by default since 1.24 (`max_prepared_statements`, default 200) [2][3] | n/a |
 | Read/write split | yes (query classification, hints) | no: a `host` list is round-robined and "all hosts must be available at all times" [2] | separate ports/backends chosen by health checks, for example Patroni's `/primary` and `/replica` REST endpoints [4][5] |
 | Session survives a primary change | yes, via Transaction Replay (needs an externally promoted primary) | no: connections to the old server end and clients reconnect | no: a TCP proxy cannot re-home an established session |
 | Follows the promoted primary | yes (`postgres` / `patroni` providers) | no: re-point config or DNS [2] | via health checks: `pgsql-check` only tests that a server answers [5]; Patroni's REST check tests the role [4] |
@@ -231,7 +231,7 @@ The four core jobs above are the product; everything below is optional. HeliosPr
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Multi-Tenancy** | `multi-tenancy` | Tenant identification from startup parameters, row-level isolation (tenant filter on every statement, both protocols), per-tenant client, active-query, replay and journal budgets. Per-tenant pools and schema or database isolation are not built |
+| **Multi-Tenancy** | `multi-tenancy` | Tenants identified from the startup packet and pinned for the session: row isolation (injected filters), or a schema, database or branch of their own (startup parameters rewritten); per-tenant client caps, active-query, replay and journal budgets, and pool caps (`pool_max_connections`, `pool_max_idle`) |
 | **WASM Plugins** | `wasm-plugins` | Sandboxed WebAssembly plugin runtime: pre-query, route, post-query and authenticate hooks on both wire protocols, hot reload of the plugin directory (`hot_reload`, SIGHUP, `POST /plugins/reload`), signed `.tar.gz` artefacts, and per-call memory, time and fuel limits |
 | **GraphQL Gateway** | `graphql-gateway` | GraphQL-to-SQL over the tables listed in `[[graphql_gateway.tables]]` (columns typed as text); no schema introspection or result cache |
 | **MCP Agent Gateway** | *(config-gated, `[mcp]`)* | JSON-RPC 2.0 over HTTP for AI agents — `query`, `list_tables`, `explain` tools, with result caps. Per-agent principals (`[[mcp.principals]]`, or the shared `[mcp].auth_token`), an opt-in per-principal tool-result cache (`tool_cache_*`, `/api/mcp/cache`) and opt-in PostgreSQL-backed agent memory tools (`memory_put`/`get`/`list`/`search`/`delete`) |
@@ -338,14 +338,13 @@ listen_address = "0.0.0.0:6432"
 admin_address = "127.0.0.1:9090"
 
 # Pooling mode lives in [pool_mode] (mode = session | transaction | statement),
-# NOT [pool]. [pool] holds the size/timeout knobs.
+# NOT [pool]. [pool] holds the per-node caps and connection timeouts.
 [pool_mode]
 mode = "transaction"
+idle_timeout_secs = 300   # close a parked backend connection idle this long
 
 [pool]
-min_connections = 5
-max_connections = 100
-idle_timeout_secs = 300
+max_connections = 100     # backend connections per node, in use and parked (0 = unlimited)
 
 [load_balancer]
 # Field is read_strategy: round_robin | weighted_round_robin |
@@ -488,7 +487,8 @@ curl http://localhost:9090/readyz
 # Node status and replication lag
 curl http://localhost:9090/nodes
 
-# Connection pool metrics
+# Connection pool metrics (per node: active, idle, waiting, opened, closed)
+curl http://localhost:9090/pools
 curl http://localhost:9090/metrics
 
 # Force a node unhealthy to exercise failover (chaos/fault injection).

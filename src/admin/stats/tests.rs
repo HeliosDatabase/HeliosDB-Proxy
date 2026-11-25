@@ -274,7 +274,7 @@ async fn populated_state(stats_max_items: usize) -> Arc<AdminState> {
     config.admin.stats_max_items = stats_max_items;
     let mt = &mut config.multi_tenancy;
     mt.enabled = true;
-    mt.tenants = vec!["acme".to_string(), "globex".to_string()];
+    mt.tenants = vec!["acme".into(), "globex".into()];
     mt.max_clients_per_tenant = 3;
     mt.tenant_max_active_queries.insert("acme".to_string(), 2);
     mt.tenant_max_replay_bytes

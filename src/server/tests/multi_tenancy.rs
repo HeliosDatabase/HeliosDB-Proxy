@@ -129,7 +129,7 @@ async fn a_sighup_keeps_the_running_multi_tenancy_section() {
     std::fs::write(
         &path,
         format!(
-            "[pool]\nmax_connections = 77\n{boot}max_clients_per_tenant = 4\n\
+            "[pool]\nacquire_timeout_secs = 77\n{boot}max_clients_per_tenant = 4\n\
              [multi_tenancy.tenant_max_active_queries]\nacme = 9\n"
         ),
     )
@@ -138,7 +138,7 @@ async fn a_sighup_keeps_the_running_multi_tenancy_section() {
     let live = server.state.live_config.load_full();
     assert_eq!(live.multi_tenancy, running, "the running section is kept");
     assert_eq!(
-        live.pool.max_connections, 77,
+        live.pool.acquire_timeout_secs, 77,
         "the rest of the reload applies"
     );
     let acme = &server.state.tenant_slots.budget_stats()[0];
@@ -241,5 +241,56 @@ async fn a_sighup_resizes_existing_tenant_caps() {
             .await
             .unwrap()
             .is_some()
+    );
+}
+
+/// W07: a SIGHUP resizes the caps of a tenants entry it already has (its
+/// client cap, `pool_max_connections`, `pool_max_idle`); a change of its
+/// isolation needs a restart, so the whole running section is kept.
+#[tokio::test]
+async fn a_sighup_resizes_tenant_entries_but_keeps_their_isolation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.toml");
+    let entry = |isolation: &str, clients: usize, conns: usize, idle: usize| {
+        format!(
+            "[[nodes]]\nhost = \"db\"\nport = 5432\nrole = \"primary\"\n\
+             [multi_tenancy]\nenabled = true\nidentify_by = \"user\"\n\
+             [[multi_tenancy.tenant_settings]]\nid = \"acme\"\nisolation = \"{isolation}\"\n\
+             max_clients = {clients}\npool_max_connections = {conns}\npool_max_idle = {idle}\n"
+        )
+    };
+    std::fs::write(&path, entry("schema", 2, 2, 3)).unwrap();
+    let config = ProxyConfig::from_file(path.to_str().unwrap()).unwrap();
+    let server = ProxyServer::new(config)
+        .unwrap()
+        .with_config_path(Some(path.to_string_lossy().into_owned()));
+    let slots = &server.state.tenant_slots;
+    let plan = slots.plan("acme").expect("a known tenant").clone();
+    assert_eq!(plan.pool_max_idle(), Some(3));
+    assert_eq!(slots.pool_stats()[0].limit, Some(2));
+
+    // Resized: the running caps follow and the section is published.
+    std::fs::write(&path, entry("schema", 3, 4, 5)).unwrap();
+    server.reload_config().await;
+    let live = server.state.live_config.load_full();
+    assert_eq!(live.multi_tenancy.client_cap("acme"), 3);
+    assert_eq!(live.multi_tenancy.pool_connection_cap("acme"), 4);
+    assert_eq!(slots.stats()[0].limit, 3);
+    assert_eq!(slots.pool_stats()[0].limit, Some(4));
+    assert_eq!(plan.pool_max_idle(), Some(5));
+
+    // Another isolation: refused whole, the resize in it included.
+    let running = live.multi_tenancy.clone();
+    std::fs::write(&path, entry("database", 9, 9, 9)).unwrap();
+    server.reload_config().await;
+    let live = server.state.live_config.load_full();
+    assert_eq!(live.multi_tenancy, running, "the running section is kept");
+    assert_eq!(slots.pool_stats()[0].limit, Some(4));
+    assert_eq!(plan.pool_max_idle(), Some(5));
+    assert_eq!(
+        plan.isolation(),
+        &crate::tenant_slots::IsolationPlan::Schema {
+            search_path: "\"acme\"".into()
+        }
     );
 }

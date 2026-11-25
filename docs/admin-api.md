@@ -491,12 +491,23 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_mcp_memory_ops_total` | counter | `op` | MCP memory tool calls completed, by tool (`[mcp] memory_enabled`). |
 | `heliosdb_proxy_mcp_memory_refused_total` | counter | `reason` | MCP memory tool calls refused, by reason. |
 | `heliosdb_proxy_mcp_memory_entries_quota_hits_total` | counter | — | `memory_put` calls refused by `[mcp] memory_max_entries_per_owner`. |
+| `heliosdb_proxy_tenant_pool_limit`, `_pool_in_use` | gauge | `tenant` | A tenant's `pool_max_connections` and the backend connections (in use and parked) holding its slots now. Only tenants with pool settings of their own (`pool_max_idle` / `pool_max_connections`) appear in this and the next rows; these two only with `pool_max_connections`. |
+| `heliosdb_proxy_tenant_pool_waits_total`, `_pool_refusals_total` | counter | `tenant` | Backend connections of the tenant that waited for a slot, and requests refused with 53300 at its cap. |
+| `heliosdb_proxy_tenant_pool_dials_total`, `_pool_checkouts_total` | counter | `tenant` | Backend connections opened for the tenant's sessions, and parked connections they borrowed. |
+| `heliosdb_proxy_pool_idle_connections` | gauge | — | Backend connections parked in the data-path pool (transaction/statement pooling; this and the next rows only then). |
+| `heliosdb_proxy_pool_reuses_total` | counter | — | Checkouts that reused a parked connection. |
+| `heliosdb_proxy_pool_lifetime_expired_total` | counter | — | Pooled connections closed for outliving `max_lifetime_secs` (at release, checkout or by the reaper). |
+| `heliosdb_proxy_pool_acquire_timeouts_total` | counter | — | Requests refused with 53300 at `[pool_mode] acquire_timeout_secs`. |
+| `heliosdb_proxy_pool_stale_lease_redials_total` | counter | — | Connections leased without the liveness probe (`[pool] test_on_acquire = false`) that refused their first write and were replaced by a fresh dial. |
+| `heliosdb_proxy_pool_topped_up_total`, `_topup_failures_total` | counter | — | Connections the idle reaper opened ahead of use (`min_idle`, `min_connections`), and such dials that failed. |
+| `heliosdb_proxy_pool_handed_over_total` | counter | — | Released connections closed instead of parked because a session was waiting for their node's slot (`max_connections`) or their tenant's (`pool_max_connections`): the waiter gets the slot at once. |
 | `heliosdb_proxy_tenant_query_wait_seconds` | histogram | — | How long requests waited for a tenant active-query permit (only requests that waited; every wait, whether it ended admitted, refused, cancelled or abandoned). One series for all tenants, not labelled by tenant: its `_count` is the sum of `heliosdb_proxy_tenant_query_waits_total` over all tenants. |
 
 Histogram buckets are `[limits] latency_buckets_ms`, exported in seconds as `_bucket{le="…"}`,
 `_sum` and `_count`. `GET /metrics` carries the same data as JSON under `latency`
 (`bounds_us`, cumulative counts, `sum_us`, `count`, and `tr_replay_refusals`),
-`gateway_pools`, `query_cache`, `edge_cache`, `tenant_slots` and `tenant_budgets`.
+`gateway_pools`, `query_cache`, `edge_cache`, `tenant_slots`, `tenant_budgets`,
+`tenant_pools` and `backend_pool` (the pool counters above, unsuffixed).
 `query_cache` carries `entries`, `evictions` (each by `l1`, `l2`, `l3`) and
 `compression_saved_bytes` next to the counters above.
 `query_cache.semantic` is the semantic tier's state (`endpoint`, `embed_requests`,
@@ -517,7 +528,21 @@ the server counters carry `cache_excluded`, `cache_catalog_skipped`,
 
 ### GET /pools
 
-Per-node connection pool statistics (active/idle/pending, lifetime created/closed). Useful for watching a single-node drain complete.
+Per-node backend connection statistics, for every node the proxy knows (sorted):
+
+```json
+[{ "node": "db-1:5432", "active_connections": 12, "idle_connections": 4,
+   "pending_requests": 0, "total_connections_created": 310,
+   "total_connections_closed": 294, "max_connections": 100 }]
+```
+
+`active_connections` serve sessions now and `idle_connections` are parked in the data-path
+pool (transaction/statement pooling; 0 in session pooling); together they are the node's
+open connections (health and topology probes not counted). `pending_requests` are sessions
+waiting for a slot on the node's cap now. `total_connections_created` / `_closed` count
+backend connections opened and closed since startup. `max_connections` is the node's cap
+(`[[nodes]] max_connections`, else `[pool] max_connections`), `null` when unlimited.
+Useful for watching a single-node drain complete.
 
 ### GET /version
 
@@ -676,11 +701,15 @@ Per node:
 |-------|------|-------------|
 | `mode` | string | `[pool_mode] mode`: `session`, `transaction` or `statement`. |
 | `max_pool_size` | integer | Idle connections kept per (node, user, database) identity. |
-| `min_idle` | integer | `[pool_mode] min_idle`. |
+| `min_idle` | integer | `[pool_mode] min_idle`: idle connections kept ready per recently used identity (pooled modes). |
 | `max_total_idle` | integer | `[limits] max_total_idle_backend_conns`: idle connections kept across all identities. |
 | `idle_timeout_secs` | integer, seconds | `[pool_mode] idle_timeout_secs`. |
-| `acquire_timeout_secs` | integer, seconds | `[pool_mode] acquire_timeout_secs`. |
-| `idle_pool` | object, nullable | The data-path pool of parked, authenticated backend connections (transaction and statement mode); `null` in session mode. `idle` (parked now), `reuses_total` (checkouts that reused one), `parked_total` (check-ins), `over_capacity_total` (check-ins refused at an idle cap), `stale_evicted_total` (found dead at checkout), `reaped_total` (closed by the idle reaper), `resets_skipped_total` (parked without the reset query because provably clean: `skip_clean_reset`, or a connection leased only to prove its settings for a cache hit), `capacity_evictions_total` (closed to make room on a backend at `max_connections`). |
+| `acquire_timeout_secs` | integer, seconds | `[pool_mode] acquire_timeout_secs`: the overall deadline on opening a connection for a session (0 = none). |
+| `prepared_statement_mode` | string | The prepared-statement mode in effect: `named`, `track` or `disable`. |
+| `min_connections`, `max_connections` | integer | `[pool] min_connections` (0 = none) and `max_connections` (0 = unlimited). |
+| `test_on_acquire` | boolean | `[pool] test_on_acquire`. |
+| `effective_idle_timeout_secs`, `effective_max_lifetime_secs` | integer, seconds | The idle TTL and max lifetime in effect: the smaller non-zero of the `[pool]` and `[pool_mode]` keys (0 = none). |
+| `idle_pool` | object, nullable | The data-path pool of parked, authenticated backend connections (transaction and statement mode); `null` in session mode. `idle` (parked now), `reuses_total` (checkouts that reused one), `parked_total` (check-ins), `over_capacity_total` (check-ins refused at an idle cap), `stale_evicted_total` (found dead at checkout), `reaped_total` (closed by the idle reaper), `resets_skipped_total` (parked without the reset query because provably clean: `skip_clean_reset`, or a connection leased only to prove its settings for a cache hit), `capacity_evictions_total` (closed to make room on a backend at `max_connections`), `lifetime_expired_total` (closed for outliving the max lifetime), `acquire_timeouts_total` (requests refused at `acquire_timeout_secs`), `stale_lease_redials_total` (unprobed leases replaced after a failed first write), `topped_up_total` / `topup_failures_total` (connections opened ahead of use, and failed such dials), `handed_over_total` (released connections closed instead of parked so a session waiting for their node's or tenant's slot got it). |
 
 Version 1 has no per-(user, database) breakdown: the proxy keeps no counters by pool
 identity. Per-node connection counts are `nodes.items[].backend_connections`.
@@ -731,12 +760,12 @@ counters. Disabled without the `query-cache` feature or with `[cache] enabled = 
 | `not_cached` | object | Cacheable reads kept out of the cache: `oversize_total` (response over `max_cacheable_response_bytes`, not stored), `excluded_total` (`exclude_tables`), `catalog_total` (may name a system catalog), `time_travel_total` (an `AS OF` / `VERSIONS BETWEEN` comment), `ambiguous_text_total` (text PostgreSQL and HeliosDB-Nano/Lite may read differently). The last four are not looked up either. |
 | `heatmap` | object | Disabled while `[cache] heatmap_enabled = false`. Otherwise a summary of `GET /api/cache/heatmap` without per-table data: `window_secs`, `bucket_secs`, `max_tables`, `tables_tracked`, `tables_in_window`, `recommendations` (how many), `untracked_misses` and `invalidate_all` (in the window), `overflow_total`. |
 
-**`tenants`**: from `/metrics` `tenant_slots` and `tenant_budgets`. Disabled while
-`[multi_tenancy] enabled = false`.
+**`tenants`**: from `/metrics` `tenant_slots`, `tenant_budgets` and `tenant_pools`.
+Disabled while `[multi_tenancy] enabled = false`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `count`, `truncated`, `items` | | As for `nodes`, by tenant name. Only tenants with a client cap, an active-query cap or a replay-byte budget are listed: the proxy keeps no counters for the others. |
+| `count`, `truncated`, `items` | | As for `nodes`, by tenant name. Only tenants with a client cap, an active-query cap, a replay-byte budget or pool settings of their own are listed: the proxy keeps no counters for the others. |
 
 Per tenant:
 
@@ -746,6 +775,7 @@ Per tenant:
 | `sessions` | object, nullable | The client cap (`max_clients_per_tenant` / `tenant_max_clients`), `null` without one: `limit`, `active` (sessions holding a slot now), `waiting` (now), `waits_total`, `refusals_total` (53300). |
 | `queries` | object, nullable | The active-query cap (`max_active_queries_per_tenant` / `tenant_max_active_queries`), `null` without one: `limit`, `active` (permits held now), `idle` (holders idle now), `waiting` (now), `admitted_total`, `waits_total`, `refusals_total` (53300), `wait_cancels_total`, `idle_permit_timeouts_total`. |
 | `replay` | object, nullable | The replay-byte budget (`max_replay_bytes_per_tenant` / `tenant_max_replay_bytes`), `null` without one: `byte_limit`, `bytes` (held now), `refusals_total` (transactions marked non-replayable). |
+| `pool` | object, nullable | The tenant's own pool (`pool_max_idle` / `pool_max_connections`), `null` without one: `limit` (`pool_max_connections`, `null` without it), `in_use` (connections holding its slots now, `null` without a cap), `waiting` (now), `waits_total`, `refusals_total` (53300), `dials_total` (connections opened for its sessions), `checkouts_total` (parked connections they borrowed). |
 
 **`rate_limit`**: disabled without the `rate-limiting` feature or with
 `[rate_limit] enabled = false`.

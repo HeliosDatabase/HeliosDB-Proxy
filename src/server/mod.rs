@@ -30,10 +30,6 @@ use uuid::Uuid;
 // Pool-modes feature imports
 #[cfg(feature = "pool-modes")]
 use crate::pool::lease::ClientId;
-#[cfg(feature = "pool-modes")]
-use crate::pool::{ConnectionPoolManager, PoolModeConfig, PoolingMode};
-#[cfg(feature = "pool-modes")]
-use crate::NodeEndpoint;
 
 // WASM plugin system imports
 #[cfg(feature = "wasm-plugins")]
@@ -106,6 +102,14 @@ mod relay;
 
 mod sql_classify;
 
+// Prepared statements across pooled connections (`[pool_mode]
+// prepared_statement_mode`): SQL PREPARE tracked and re-issued, or refused.
+mod sql_prepared;
+
+// The idle reaper's top-ups (`[pool_mode] min_idle`, `[pool] min_connections`).
+#[cfg(feature = "pool-modes")]
+mod pool_topup;
+
 mod policy;
 #[cfg(feature = "multi-tenancy")]
 use policy::TenantStatement;
@@ -129,6 +133,9 @@ mod responses;
 mod hooks;
 
 mod health;
+
+// `[load_balancer] latency_threshold_ms`: standbys held out of reads.
+mod latency_gate;
 
 mod promotion;
 
@@ -413,8 +420,12 @@ struct ServerState {
     /// configuration reload and (with a provider) tracker change. Routing
     /// under a provider and `/topology` read this one value.
     routing: Arc<crate::routing_snapshot::RoutingView>,
-    /// H-05: per-node backend connection caps (`[[nodes]] max_connections`).
+    /// H-05: per-node backend connection caps (`[[nodes]] max_connections`,
+    /// else `[pool] max_connections`) and counts.
     node_slots: Arc<crate::node_slots::NodeSlots>,
+    /// W02 `[load_balancer] latency_threshold_ms`: the standbys whose
+    /// smoothed probe latency holds them out of reads.
+    latency_gate: latency_gate::LatencyGate,
     /// Operator overrides on node eligibility (`/nodes/{addr}/disable`,
     /// `/api/chaos force_unhealthy`): applied by every health publication
     /// and by the routing snapshot (Sprinter b251750f1d54).
@@ -504,9 +515,6 @@ struct ServerState {
     /// analytical (OLAP) queries are routed to the configured analytics node.
     #[cfg(feature = "schema-routing")]
     schema_analyzer: Option<Arc<crate::schema_routing::QueryAnalyzer>>,
-    /// Pool manager for Session/Transaction/Statement modes
-    #[cfg(feature = "pool-modes")]
-    pool_manager: Option<Arc<ConnectionPoolManager>>,
     /// Data-path idle backend-connection pool. `Some` only when pooling is
     /// active (mode is Transaction or Statement); `None` leaves the 1:1
     /// session-pinned path completely unchanged. This is the raw-stream pool
@@ -832,43 +840,6 @@ impl ProxyServer {
                 },
             );
         }
-
-        // Initialize pool manager if pool-modes feature is enabled
-        #[cfg(feature = "pool-modes")]
-        let pool_manager = {
-            use crate::pool::PreparedStatementMode as PoolPreparedStatementMode;
-
-            let pool_config = PoolModeConfig {
-                default_mode: match config.pool_mode.mode {
-                    crate::config::PoolingMode::Session => PoolingMode::Session,
-                    crate::config::PoolingMode::Transaction => PoolingMode::Transaction,
-                    crate::config::PoolingMode::Statement => PoolingMode::Statement,
-                },
-                max_pool_size: config.pool_mode.max_pool_size,
-                min_idle: config.pool_mode.min_idle,
-                idle_timeout_secs: config.pool_mode.idle_timeout_secs,
-                max_lifetime_secs: config.pool_mode.max_lifetime_secs,
-                acquire_timeout_secs: config.pool_mode.acquire_timeout_secs,
-                reset_query: config.pool_mode.reset_query.clone(),
-                prepared_statement_mode: match config.pool_mode.prepared_statement_mode {
-                    crate::config::PreparedStatementMode::Disable => {
-                        PoolPreparedStatementMode::Disable
-                    }
-                    crate::config::PreparedStatementMode::Track => PoolPreparedStatementMode::Track,
-                    crate::config::PreparedStatementMode::Named => PoolPreparedStatementMode::Named,
-                },
-                test_on_acquire: config.pool.test_on_acquire,
-                // Library-only fields: the manager never runs a validation
-                // query (test_on_acquire is a socket liveness check) and does
-                // not queue acquisitions, so these are not proxy.toml keys.
-                // A `[pool_mode] validation_query` in a file is reported as
-                // unknown with that explanation (ab502f27cbe2).
-                validation_query: "SELECT 1".to_string(),
-                queue_timeout_secs: 30,
-                max_queue_size: 0,
-            };
-            Some(Arc::new(ConnectionPoolManager::new(pool_config)))
-        };
 
         // The raw-stream data-path pool is only built when pooling is active
         // (Transaction/Statement). Session mode leaves it `None` so the hot
@@ -1197,7 +1168,7 @@ impl ProxyServer {
         // Build the multi-tenancy manager from the configured tenants.
         #[cfg(feature = "multi-tenancy")]
         let tenant_manager = if config.multi_tenancy.enabled
-            && !config.multi_tenancy.tenants.is_empty()
+            && config.multi_tenancy.tenant_ids().next().is_some()
         {
             use crate::multi_tenancy::{
                 IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantConfig,
@@ -1239,14 +1210,24 @@ impl ProxyServer {
                 .config(mtc)
                 .query_transformer(transformer)
                 .build();
-            for id in &mt.tenants {
-                tm.register_tenant(TenantConfig::new(
-                    TenantId::new(id.clone()),
-                    IsolationStrategy::row("public", mt.tenant_column.clone()),
-                ));
+            // Each tenant with its own isolation (W07): the row filter
+            // applies to row tenants only; a schema, database or branch is
+            // applied to the session's startup parameters at admission.
+            for spec in &mt.tenant_list() {
+                use crate::config::TenantIsolation;
+                let isolation = match spec.isolation {
+                    TenantIsolation::Row => {
+                        IsolationStrategy::row("public", mt.tenant_column.clone())
+                    }
+                    TenantIsolation::Schema => IsolationStrategy::schema("", spec.schema_name()),
+                    TenantIsolation::Database => IsolationStrategy::database(spec.database_name()),
+                    TenantIsolation::Branch => IsolationStrategy::branch(spec.branch_name()),
+                };
+                tm.register_tenant(TenantConfig::new(TenantId::new(spec.id.clone()), isolation));
             }
             tracing::info!(
                 tenants = mt.tenants.len(),
+                isolated = mt.has_non_row_tenants(),
                 identify_by = %mt.identify_by,
                 "multi-tenancy enabled"
             );
@@ -1292,7 +1273,7 @@ impl ProxyServer {
         #[cfg(not(feature = "multi-tenancy"))]
         if config.multi_tenancy.enabled {
             tracing::warn!(
-                "[multi_tenancy] enabled = true but this build lacks the `multi-tenancy` feature: row isolation, tenant client caps and request budgets are inactive"
+                "[multi_tenancy] enabled = true but this build lacks the `multi-tenancy` feature: row isolation, tenant client caps, request budgets and per-tenant pool settings are inactive"
             );
         }
         let state = Arc::new(ServerState {
@@ -1318,6 +1299,7 @@ impl ProxyServer {
             )),
             gateway_pools,
             node_slots: Arc::new(crate::node_slots::NodeSlots::from_config(&config)),
+            latency_gate: Default::default(),
             node_overrides: Arc::new(crate::node_overrides::NodeOverrides::new()),
             #[cfg(feature = "multi-tenancy")]
             tenant_slots: Arc::new(crate::tenant_slots::TenantSlots::from_config(&config)),
@@ -1369,8 +1351,6 @@ impl ProxyServer {
             tenant_manager,
             #[cfg(feature = "schema-routing")]
             schema_analyzer,
-            #[cfg(feature = "pool-modes")]
-            pool_manager,
             #[cfg(feature = "pool-modes")]
             backend_pool,
             #[cfg(feature = "wasm-plugins")]
@@ -1704,12 +1684,31 @@ impl ProxyServer {
             tracing::warn!(old = %old.admin_address, new = %new_config.admin_address,
                 "admin_address change needs a restart; the bound socket is kept");
         }
+        // The node caps (`[pool] max_connections`) size the node slots, and
+        // the pooling mode and `max_pool_size` the data-path pool, once at
+        // startup: keep the running values (W02).
+        if new_config.pool.max_connections != old.pool.max_connections
+            || new_config.pool_mode.mode != old.pool_mode.mode
+            || new_config.pool_mode.max_pool_size != old.pool_mode.max_pool_size
+        {
+            tracing::warn!(
+                old_max_connections = old.pool.max_connections,
+                new_max_connections = new_config.pool.max_connections,
+                old_mode = ?old.pool_mode.mode,
+                new_mode = ?new_config.pool_mode.mode,
+                old_max_pool_size = old.pool_mode.max_pool_size,
+                new_max_pool_size = new_config.pool_mode.max_pool_size,
+                "[pool] max_connections / [pool_mode] mode / max_pool_size changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
+            );
+            new_config.pool.max_connections = old.pool.max_connections;
+            new_config.pool_mode.mode = old.pool_mode.mode;
+            new_config.pool_mode.max_pool_size = old.pool_mode.max_pool_size;
+        }
         // Reconcile node health to the new node set before publishing the
         // config, so the first connection on the new config can route to it.
         Self::reconcile_health(&self.state, &new_config);
         let nodes = new_config.nodes.len();
         let hba_rules = new_config.hba.len();
-        let pool_max = new_config.pool.max_connections;
         // Standbys that refused password-less logins get another try: their
         // auth may have changed along with the config.
         self.state.offload_refusals.clear();
@@ -1728,8 +1727,7 @@ impl ProxyServer {
         tracing::info!(
             nodes,
             hba_rules,
-            pool_max,
-            "SIGHUP: configuration reloaded — applies to new connections"
+            "SIGHUP: configuration reloaded — applies to new connections (the idle reaper's pool settings at its next tick)"
         );
     }
 
@@ -2392,14 +2390,8 @@ impl ProxyServer {
                 admin_state.with_plugin_manager(pm.clone()).await;
             }
 
-            // Attach the pool manager so /api/pools surfaces real per-node
-            // pool statistics instead of an empty list.
-            #[cfg(feature = "pool-modes")]
-            if let Some(ref pm) = state.pool_manager {
-                admin_state.with_pool_manager(pm.clone()).await;
-            }
-            // The data-path idle pool (transaction / statement mode), for its
-            // counters on /api/stats.
+            // The data-path idle pool (transaction / statement mode), for
+            // `/pools` (with the node slots) and its counters on /api/stats.
             #[cfg(feature = "pool-modes")]
             if let Some(ref pool) = state.backend_pool {
                 admin_state.with_backend_pool(pool.clone()).await;
@@ -2616,9 +2608,12 @@ impl ProxyServer {
         })
     }
 
-    /// Spawn pool manager background task
+    /// Spawn the data-path pool's idle reaper (W02): every `[limits]
+    /// pool_reap_interval_secs` it applies the idle TTL, the max lifetime
+    /// and the `min_idle` / `min_connections` floors
+    /// (`ProxyServer::pool_maintenance`). Without the data-path pool
+    /// (session pooling) it only waits for the shutdown.
     fn spawn_pool_manager(&self) -> tokio::task::JoinHandle<()> {
-        // Only referenced by the pool-modes eviction/cleanup arms below.
         #[cfg(feature = "pool-modes")]
         let state = self.state.clone();
         // Resolved from [limits] at startup; captured before the move so the
@@ -2628,54 +2623,14 @@ impl ProxyServer {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(reap_interval);
-
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        // Evict idle connections from pool-modes manager
                         #[cfg(feature = "pool-modes")]
-                        if let Some(ref pool_manager) = state.pool_manager {
-                            pool_manager.evict_idle().await;
-                            tracing::trace!("Pool-modes idle eviction completed");
-                        }
-                        // Reap data-path idle backend connections older than the
-                        // configured idle timeout, so a connection the backend
-                        // would close on its own idle timeout is never handed out
-                        // stale and idle FDs are returned to the OS.
-                        #[cfg(feature = "pool-modes")]
-                        if let Some(ref backend_pool) = state.backend_pool {
-                            let ttl = std::time::Duration::from_secs(
-                                state.live_config.load().pool_mode.idle_timeout_secs,
-                            );
-                            // idle_timeout_secs = 0 means "no idle TTL" (the
-                            // PgBouncer convention). Skip reaping entirely rather
-                            // than reaping every parked connection each cycle
-                            // (elapsed() < ZERO is always false → retain drops
-                            // all), which would defeat connection reuse.
-                            let n = if ttl.is_zero() {
-                                0
-                            } else {
-                                backend_pool.reap_idle(ttl)
-                            };
-                            if n > 0 {
-                                tracing::debug!(
-                                    target: "helios::pool",
-                                    reaped = n,
-                                    idle_remaining = backend_pool.idle_count(),
-                                    "reaped idle backend connections (TTL)"
-                                );
-                            }
-                        }
+                        Self::pool_maintenance(&state).await;
                     }
-                    _ = shutdown_rx.recv() => {
-                        // Cleanup on shutdown
-                        #[cfg(feature = "pool-modes")]
-                        if let Some(ref pool_manager) = state.pool_manager {
-                            pool_manager.close_all().await;
-                            tracing::info!("Pool-modes manager closed all connections");
-                        }
-                        break;
-                    }
+                    _ = shutdown_rx.recv() => break,
                 }
             }
         })
@@ -2780,54 +2735,51 @@ impl ProxyServer {
         let _ = self.shutdown_tx.send(());
     }
 
-    /// Get pool mode statistics (if pool-modes feature enabled)
+    /// Pool statistics of the data-path pool (transaction / statement
+    /// pooling); `None` in session pooling, which parks nothing.
     #[cfg(feature = "pool-modes")]
+    #[deprecated(
+        since = "3.1.0",
+        note = "use `GET /api/stats` / `heliosdb_proxy_pool_*`; transactions, statements and lease durations are not counted (0)"
+    )]
     pub async fn pool_mode_stats(&self) -> Option<PoolModeStatsSnapshot> {
-        if let Some(ref pool_manager) = self.state.pool_manager {
-            let stats = pool_manager.get_stats().await;
-            let metrics = pool_manager.metrics().snapshot();
-            let default_mode = pool_manager.default_mode();
-
-            // Calculate average lease duration across all modes
-            let avg_lease_duration_ms = metrics
-                .mode_stats
-                .get(&default_mode)
-                .map(|s| s.avg_lease_duration_ms as u64)
-                .unwrap_or(0);
-
-            Some(PoolModeStatsSnapshot {
-                mode: format!("{:?}", default_mode),
-                total_connections: stats.total_connections,
-                active_leases: stats.active_connections,
-                idle_connections: stats.idle_connections,
-                node_count: stats.node_count,
-                acquires: metrics.acquires,
-                releases: metrics.releases,
-                acquire_failures: metrics.acquire_failures,
-                acquire_timeouts: metrics.acquire_timeouts,
-                transactions_completed: metrics.transactions_completed,
-                statements_executed: metrics.statements_executed,
-                avg_lease_duration_ms,
-            })
-        } else {
-            None
-        }
+        let pool = self.state.backend_pool.as_ref()?;
+        let config = self.state.live_config.load();
+        let total_connections: usize = config
+            .nodes
+            .iter()
+            .map(|n| self.state.node_slots.open(n.address()))
+            .sum();
+        let idle_connections = pool.idle_count();
+        Some(PoolModeStatsSnapshot {
+            mode: format!("{:?}", config.pool_mode.mode),
+            total_connections,
+            active_leases: total_connections.saturating_sub(idle_connections),
+            idle_connections,
+            node_count: config.nodes.len(),
+            acquires: pool.reuses(),
+            releases: pool.parked(),
+            acquire_failures: pool.acquire_timeouts(),
+            acquire_timeouts: pool.acquire_timeouts(),
+            transactions_completed: 0,
+            statements_executed: 0,
+            avg_lease_duration_ms: 0,
+        })
     }
 
-    /// Add a node to the pool manager (if pool-modes feature enabled)
+    /// Before 3.1 this registered `node` with a pool manager the data path
+    /// never used. The data-path pool opens connections per node on demand
+    /// from `[[nodes]]` and the topology, so there is nothing to register.
     #[cfg(feature = "pool-modes")]
+    #[deprecated(
+        since = "3.1.0",
+        note = "no effect: the data-path pool serves every configured node on demand"
+    )]
     pub async fn add_node_to_pool(&self, node: &NodeConfig) {
-        if let Some(ref pool_manager) = self.state.pool_manager {
-            let endpoint = NodeEndpoint::new(&node.host, node.port)
-                .with_role(match node.role {
-                    NodeRole::Primary => crate::NodeRole::Primary,
-                    NodeRole::Standby => crate::NodeRole::Standby,
-                    NodeRole::ReadReplica => crate::NodeRole::ReadReplica,
-                })
-                .with_weight(node.weight);
-            pool_manager.add_node(&endpoint).await;
-            tracing::info!("Added node {} to pool manager", node.address());
-        }
+        tracing::debug!(
+            node = %node.address(),
+            "add_node_to_pool: no effect since 3.1 (nodes come from [[nodes]] and the topology)"
+        );
     }
 
     /// Get server metrics

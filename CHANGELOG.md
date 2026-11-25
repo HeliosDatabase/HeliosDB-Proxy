@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The `[pool]` and `[pool_mode]` keys act (W02).** They were parsed and ignored; each
+  is now read by the data path, and every default reproduces the previous behaviour.
+  `[pool] max_connections` caps each node's backend connections (a `[[nodes]]
+  max_connections` overrides it); `min_connections` and `[pool_mode] min_idle` keep
+  connections open and parked ahead of use (the idle reaper opens them, with the proxy's
+  own credential or against a trust backend; an identity it holds no credential for is
+  never opened ahead of use and no node fault is recorded); `idle_timeout_secs` and
+  `max_lifetime_secs` (the smaller non-zero of the two sections) close idle and old
+  pooled connections, never one in use; `[pool_mode] acquire_timeout_secs` bounds the
+  whole dial of a later connection and answers 53300; `test_on_acquire = false` skips
+  the liveness probe and redials once, without a node fault, when the leased socket
+  refuses the first write; `prepared_statement_mode` (default `named`) acts in the
+  pooled modes: `track` (and `named`, which cannot hold across pooled connections)
+  tracks SQL `PREPARE` statements and prepares them again before an `EXECUTE` on
+  another connection, and `disable` refuses named and SQL prepared statements with
+  0A000. `[load_balancer]
+  latency_threshold_ms` (with `latency_readmit_ratio`, `latency_smoothing`) holds slow
+  standbys out of read offload. A request that finds no backend connection within the
+  proxy's own bounds (a node or tenant cap, the reconnect permit, the acquire deadline)
+  is answered with 53300 and its session goes on. A connection released while a session
+  waits for its node's or tenant's slot is closed instead of parked so the waiter gets
+  it. `GET /pools` reports every node's real connections (it reported the counters of a
+  pool manager no session used); `/metrics`, `/metrics/prometheus` and `/api/stats`
+  carry the data-path pool's counters (`heliosdb_proxy_pool_*`).
+- **Tenant isolation by schema, database or branch, and per-tenant pools (W07).**
+  The new `[multi_tenancy] tenant_settings` list (inline tables or
+  `[[multi_tenancy.tenant_settings]]` blocks) names a tenant's `isolation` (`row`,
+  `schema`, `database`, `branch`), its schema, database or branch, its caps, and
+  `pool_max_idle` / `pool_max_connections`; `tenants` keeps 3.0's list of ids. A session is pinned to its
+  tenant at admission; its startup parameters are rewritten once (`options -c
+  search_path`, `database`, `<db>@<branch>`), `[[hba]]` is checked again on the database
+  it really gets, `schema_apply = "set_on_acquire"` sets the schema on every connection
+  instead, `lock_search_path` refuses statements changing it (42501), and a branch move
+  is refused (0A000). A tenant with pool settings is pooled apart and capped (53300 at
+  its cap); `/metrics`, `heliosdb_proxy_tenant_pool_*` and `/api/stats` report its
+  dials, checkouts, waits and refusals. A SIGHUP resizes entry caps; an isolation change
+  needs a restart. Non-row isolation is refused with an identity the client chooses
+  freely, with `[mirror]`, with a gateway `tenant_header`, and in a build without the
+  `multi-tenancy` feature.
+
+### Upgrade notes
+
+- **Pool keys that were ignored now act (W02).** A configuration that set `[pool]
+  min_connections`, `max_connections`, `idle_timeout_secs`, `max_lifetime_secs`,
+  `test_on_acquire`, `[pool_mode] min_idle`, `max_lifetime_secs`,
+  `acquire_timeout_secs`, `prepared_statement_mode` or `[load_balancer]
+  latency_threshold_ms` gets their effect now: review them before upgrading (the
+  shipped examples no longer set them). Defaults keep the previous behaviour. In
+  particular an explicit `prepared_statement_mode = "disable"` (3.0's unread default
+  value) now refuses prepared statements in transaction and statement pooling.
+- **Nothing that starts on 3.0 is refused.** Values 3.0 accepted are warned about and
+  read safely instead: `[pool] acquire_timeout_secs = 0` (it timed every dial out) means
+  the default 30 s; timeouts above a year are capped at a year; a `min_connections`
+  above a node's cap and a `min_idle` above `max_pool_size` are held to the cap;
+  `named` acts as `track` in the pooled modes; empty or repeated `tenants` ids are
+  warned about; pooled-only keys set in session pooling are warned about, also under
+  `strict_config`. New keys (`tenant_settings`, the latency ratios) are validated
+  strictly. The `[pool_mode] queue_timeout_secs` / `max_queue_size` keys of the old full
+  example never existed and are reported with a hint.
+
+### Library API
+
+Additive, as in earlier minor releases: structs gain public fields
+(`MultiTenancyToml::{tenant_settings, schema_apply, lock_search_path}`,
+`LoadBalancerConfig::{latency_readmit_ratio, latency_smoothing}`,
+`PooledConn::{settings, tenant_slot, opened_at}`, ...; struct literals without
+`..Default::default()` must set them) and there are new items (`TenantSpec`,
+`TenantIsolation`, `SchemaApply`, `MultiTenancyToml::tenant_list`,
+`PoolModeConfig::{pooled, effective_prepared_statement_mode}`,
+`BackendIdlePool::{checkout_conn_with, checkin_conn_capped}`, `LeaseOptions`,
+`DialSpec`, `tenant_slots::{TenantPool, TenantPoolFull}`). Nothing is removed and no
+type changes. Deprecated, still working: `multi_tenancy::pool`'s
+`TenantConnectionPool`, `TenantPool` and `TenantConnectionLease`, and
+`TenantManager::{get_pool, pool_stats, aggregate_pool_stats}` (library-only
+bookkeeping no daemon path uses); `ProxyServer::pool_mode_stats` (now filled from the
+data-path pool; transactions, statements and lease durations are not counted and read
+0) and `ProxyServer::add_node_to_pool` (no effect: the data-path pool serves every
+configured node); `AdminState::{pool_manager, with_pool_manager}` (stored, unread).
+Value changes: `PoolModeConfig::default()` and `PoolModeConfig::statement_mode()` set
+`prepared_statement_mode` to `Named` and `Track` (were `Disable`, which 3.0 never read).
+
 ## [3.0.1] - 2026-11-23
 
 Performance patch release. No configuration, wire-protocol or library API change. Notes:

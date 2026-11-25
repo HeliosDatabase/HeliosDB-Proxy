@@ -138,12 +138,7 @@ tr_mode        = "${TR_MODE:-session}"
 write_timeout_secs = 30
 
 [pool]
-min_connections = 1
-max_connections = 32
-idle_timeout_secs = 60
-max_lifetime_secs = 300
 acquire_timeout_secs = 5
-test_on_acquire = false
 
 [pool_mode]
 mode = "$mode"
@@ -152,7 +147,6 @@ max_pool_size = 32
 [load_balancer]
 read_strategy = "round_robin"
 read_write_split = true
-latency_threshold_ms = 100
 
 [health]
 check_interval_secs = 5

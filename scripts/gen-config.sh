@@ -20,9 +20,14 @@
 #   PROXY_STANDBYS     Comma-separated standby addresses (host:port,host:port)
 #   PROXY_REPLICAS     Comma-separated read replica addresses
 #   PROXY_POOL_MODE    Pool mode: session|transaction|statement (default: transaction)
-#   PROXY_POOL_MIN     Min connections per node (default: 2)
-#   PROXY_POOL_MAX     Max connections per node (default: 100)
-#   PROXY_IDLE_TIMEOUT Pool idle timeout secs   (default: 300)
+#   PROXY_POOL_MIN     Connections kept open per node, opened ahead of use in
+#                      transaction/statement pooling; needs [auth] scram or a
+#                      trust backend (default: 0 = none)
+#   PROXY_POOL_MAX     Most connections per node, in use and parked
+#                      (default: 0 = unlimited)
+#   PROXY_IDLE_TIMEOUT [pool] idle timeout secs; the smaller of it and
+#                      [pool_mode] idle_timeout_secs (600) applies
+#                      (default: 0 = off)
 #   PROXY_TR_ENABLED   Enable Transaction Replay (default: true)
 #   PROXY_TR_MODE      TR mode: none|session|select|transaction (default: session)
 #   PROXY_LB_STRATEGY  Load balancer strategy   (default: round_robin)
@@ -44,9 +49,9 @@ PRIMARY="${PROXY_PRIMARY:-}"
 STANDBYS="${PROXY_STANDBYS:-}"
 REPLICAS="${PROXY_REPLICAS:-}"
 POOL_MODE="${PROXY_POOL_MODE:-transaction}"
-POOL_MIN="${PROXY_POOL_MIN:-2}"
-POOL_MAX="${PROXY_POOL_MAX:-100}"
-IDLE_TIMEOUT="${PROXY_IDLE_TIMEOUT:-300}"
+POOL_MIN="${PROXY_POOL_MIN:-0}"
+POOL_MAX="${PROXY_POOL_MAX:-0}"
+IDLE_TIMEOUT="${PROXY_IDLE_TIMEOUT:-0}"
 TR_ENABLED="${PROXY_TR_ENABLED:-true}"
 TR_MODE="${PROXY_TR_MODE:-session}"
 LB_STRATEGY="${PROXY_LB_STRATEGY:-round_robin}"
@@ -101,26 +106,25 @@ write_timeout_secs = ${WRITE_TIMEOUT}
 min_connections      = ${POOL_MIN}
 max_connections      = ${POOL_MAX}
 idle_timeout_secs    = ${IDLE_TIMEOUT}
-max_lifetime_secs    = 1800
+max_lifetime_secs    = 0
 acquire_timeout_secs = 10
 test_on_acquire      = true
 
 # ── Pool Mode ────────────────────────────────────────────────────────
 [pool_mode]
 mode                    = "${POOL_MODE}"
-max_pool_size           = ${POOL_MAX}
-min_idle                = ${POOL_MIN}
+max_pool_size           = 100
+min_idle                = 0
 idle_timeout_secs       = 600
-max_lifetime_secs       = 3600
-acquire_timeout_secs    = 5
+max_lifetime_secs       = 0
+acquire_timeout_secs    = 0
 reset_query             = "DISCARD ALL"
-prepared_statement_mode = "track"
 
 # ── Load Balancer ────────────────────────────────────────────────────
 [load_balancer]
 read_strategy        = "${LB_STRATEGY}"
 read_write_split     = ${RW_SPLIT}
-latency_threshold_ms = 100
+latency_threshold_ms = 0
 
 # ── Health Checks ────────────────────────────────────────────────────
 [health]

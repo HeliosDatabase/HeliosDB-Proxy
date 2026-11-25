@@ -403,6 +403,12 @@
         "max_total_idle",
         "idle_timeout_secs",
         "acquire_timeout_secs",
+        "prepared_statement_mode",
+        "min_connections",
+        "max_connections",
+        "test_on_acquire",
+        "effective_idle_timeout_secs",
+        "effective_max_lifetime_secs",
         "idle_pool"
       ],
       "properties": {
@@ -431,6 +437,28 @@
         "acquire_timeout_secs": {
           "$ref": "#/$defs/count"
         },
+        "prepared_statement_mode": {
+          "enum": [
+            "disable",
+            "track",
+            "named"
+          ]
+        },
+        "min_connections": {
+          "$ref": "#/$defs/count"
+        },
+        "max_connections": {
+          "$ref": "#/$defs/count"
+        },
+        "test_on_acquire": {
+          "type": "boolean"
+        },
+        "effective_idle_timeout_secs": {
+          "$ref": "#/$defs/count"
+        },
+        "effective_max_lifetime_secs": {
+          "$ref": "#/$defs/count"
+        },
         "idle_pool": {
           "anyOf": [
             {
@@ -453,7 +481,13 @@
         "stale_evicted_total",
         "reaped_total",
         "resets_skipped_total",
-        "capacity_evictions_total"
+        "capacity_evictions_total",
+        "lifetime_expired_total",
+        "acquire_timeouts_total",
+        "stale_lease_redials_total",
+        "topped_up_total",
+        "topup_failures_total",
+        "handed_over_total"
       ],
       "properties": {
         "idle": {
@@ -478,6 +512,24 @@
           "$ref": "#/$defs/count"
         },
         "capacity_evictions_total": {
+          "$ref": "#/$defs/count"
+        },
+        "lifetime_expired_total": {
+          "$ref": "#/$defs/count"
+        },
+        "acquire_timeouts_total": {
+          "$ref": "#/$defs/count"
+        },
+        "stale_lease_redials_total": {
+          "$ref": "#/$defs/count"
+        },
+        "topped_up_total": {
+          "$ref": "#/$defs/count"
+        },
+        "topup_failures_total": {
+          "$ref": "#/$defs/count"
+        },
+        "handed_over_total": {
           "$ref": "#/$defs/count"
         }
       }
@@ -800,7 +852,8 @@
         "tenant",
         "sessions",
         "queries",
-        "replay"
+        "replay",
+        "pool"
       ],
       "properties": {
         "tenant": {
@@ -833,6 +886,16 @@
             },
             {
               "$ref": "#/$defs/tenant_replay"
+            }
+          ]
+        },
+        "pool": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/tenant_pool"
             }
           ]
         }
@@ -923,6 +986,41 @@
           "$ref": "#/$defs/count"
         },
         "refusals_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "tenant_pool": {
+      "type": "object",
+      "required": [
+        "limit",
+        "in_use",
+        "waiting",
+        "waits_total",
+        "refusals_total",
+        "dials_total",
+        "checkouts_total"
+      ],
+      "properties": {
+        "limit": {
+          "$ref": "#/$defs/count_or_null"
+        },
+        "in_use": {
+          "$ref": "#/$defs/count_or_null"
+        },
+        "waiting": {
+          "$ref": "#/$defs/count"
+        },
+        "waits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "refusals_total": {
+          "$ref": "#/$defs/count"
+        },
+        "dials_total": {
+          "$ref": "#/$defs/count"
+        },
+        "checkouts_total": {
           "$ref": "#/$defs/count"
         }
       }

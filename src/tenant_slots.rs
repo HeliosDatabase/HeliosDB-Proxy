@@ -31,6 +31,13 @@
 //!   of transaction-replay bytes per tenant, the sum of its sessions'
 //!   [`TenantCharge`]s. A statement whose recording would take the tenant over
 //!   marks its transaction non-replayable.
+//!
+//! Isolation and pools (W07): every known tenant has a [`TenantPlan`], which
+//! a session is pinned to at admission ([`TenantSlots::identify`]): its
+//! isolation (row, schema, database or branch), applied to the session's
+//! startup parameters once, and, for a tenant with pool settings of its own,
+//! its [`TenantPool`]: the `pool_max_connections` cap on its backend
+//! connections (in use and parked) and the counters `/pools` reports.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -40,8 +47,286 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
-use crate::config::{MultiTenancyToml, ProxyConfig, TrMode};
+use crate::config::{
+    BranchRouteMode, MultiTenancyToml, ProxyConfig, SchemaApply, TenantIsolation, TrMode,
+};
 use crate::metrics_hist::LatencyHistogram;
+
+/// How a pinned session is isolated, resolved from its tenant's entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IsolationPlan {
+    /// Row filter on the shared tables (`[multi_tenancy] tenant_tables`).
+    Row,
+    /// `search_path` set to this schema (already double-quoted).
+    Schema { search_path: String },
+    /// Connect to this database.
+    Database { database: String },
+    /// Connect to this branch of the client's database.
+    Branch { branch: String },
+}
+
+/// One known tenant as the data path applies it (W07). A session is pinned
+/// to its tenant's plan at admission and keeps it for its life, whatever its
+/// startup parameters are rewritten to.
+#[derive(Debug)]
+pub struct TenantPlan {
+    id: String,
+    isolation: IsolationPlan,
+    schema_apply: SchemaApply,
+    branch_mode: BranchRouteMode,
+    lock_search_path: bool,
+    /// `"\0t=<id>"` for a tenant pooled apart from the others.
+    pool_suffix: Option<String>,
+    /// `pool_max_idle`; 0 = `[pool_mode] max_pool_size`. Resized by SIGHUP.
+    pool_max_idle: AtomicUsize,
+    pool: Option<Arc<TenantPool>>,
+}
+
+impl TenantPlan {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn isolation(&self) -> &IsolationPlan {
+        &self.isolation
+    }
+
+    /// The isolation pins what the session reaches beyond its rows (a
+    /// schema, a database or a branch): a branch move would take it out.
+    pub fn pins_database_or_schema(&self) -> bool {
+        self.isolation != IsolationPlan::Row
+    }
+
+    /// A schema tenant whose `search_path` is set on every connection the
+    /// session acquires: the `SET` to run, else `None`.
+    pub fn set_on_acquire(&self) -> Option<String> {
+        match (&self.isolation, self.schema_apply) {
+            (IsolationPlan::Schema { search_path }, SchemaApply::SetOnAcquire) => {
+                Some(format!("SET search_path TO {search_path}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Statements changing `search_path` are refused for this session
+    /// (`lock_search_path` with schema isolation).
+    pub fn locks_search_path(&self) -> bool {
+        self.lock_search_path && matches!(self.isolation, IsolationPlan::Schema { .. })
+    }
+
+    /// `RESET ALL` / `DISCARD ALL` also leave the tenant's schema (it was
+    /// set by `SET`, not at startup).
+    pub fn reset_leaves_schema(&self) -> bool {
+        self.schema_apply == SchemaApply::SetOnAcquire
+    }
+
+    /// The pool-key suffix of a tenant pooled apart, else `None`.
+    pub fn pool_suffix(&self) -> Option<&str> {
+        self.pool_suffix.as_deref()
+    }
+
+    /// The idle cap per identity of this tenant's pool keys; `None` = the
+    /// global `[pool_mode] max_pool_size`.
+    pub fn pool_max_idle(&self) -> Option<usize> {
+        match self.pool_max_idle.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// The tenant's pool (cap and counters), when it has pool settings.
+    pub fn pool(&self) -> Option<&Arc<TenantPool>> {
+        self.pool.as_ref()
+    }
+
+    /// Rewrite a session's startup parameters for the tenant's isolation:
+    /// the `search_path` in `options` (schema, `schema_apply = "startup"`),
+    /// the database (database), or the client's database's branch (branch).
+    /// Row isolation and `set_on_acquire` change nothing.
+    pub fn rewrite_startup(&self, params: &mut HashMap<String, String>) {
+        match &self.isolation {
+            IsolationPlan::Row => {}
+            IsolationPlan::Schema { search_path } => {
+                if self.schema_apply != SchemaApply::Startup {
+                    return;
+                }
+                // A `search_path` startup parameter is applied after
+                // `options`, so the client's own would win: it goes.
+                params.retain(|k, _| !k.eq_ignore_ascii_case("search_path"));
+                let setting = format!("-c search_path={search_path}");
+                let options = match params.get("options").filter(|o| !o.trim().is_empty()) {
+                    // A later `-c` of the same setting wins over the client's.
+                    Some(existing) => format!("{existing} {setting}"),
+                    None => setting,
+                };
+                params.insert("options".to_string(), options);
+            }
+            IsolationPlan::Database { database } => {
+                params.insert("database".to_string(), database.clone());
+            }
+            IsolationPlan::Branch { branch } => {
+                let client_db = params
+                    .get("database")
+                    .or_else(|| params.get("user"))
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let base = crate::database_name::split_branch(client_db).0;
+                let database = match self.branch_mode {
+                    BranchRouteMode::Database => branch.clone(),
+                    BranchRouteMode::Nano => format!("{base}@{branch}"),
+                };
+                params.insert("database".to_string(), database);
+            }
+        }
+    }
+}
+
+/// A tenant pool's `pool_max_connections` is reached ([`TenantPool::try_acquire`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantPoolFull;
+
+/// A tenant's backend connections (W07): the `pool_max_connections` cap,
+/// held by each connection (in use or parked) like a node slot, and the
+/// checkout and dial events of its sessions. `/pools` and `/metrics` report
+/// it.
+#[derive(Debug)]
+pub struct TenantPool {
+    tenant: String,
+    /// `None`: no cap (the tenant has `pool_max_idle` only).
+    cap: Option<TenantSlot>,
+    /// Backend connections opened for the tenant's sessions.
+    dials: AtomicU64,
+    /// Parked connections its sessions borrowed.
+    checkouts: AtomicU64,
+}
+
+/// What `/pools` and `/metrics` report for one tenant pool.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TenantPoolStats {
+    pub tenant: String,
+    /// `pool_max_connections`; `None` = uncapped.
+    pub limit: Option<usize>,
+    /// Backend connections (in use and parked) holding the tenant's slots;
+    /// `None` without a cap.
+    pub in_use: Option<usize>,
+    pub waiting: usize,
+    pub waits: u64,
+    pub refusals: u64,
+    pub dials: u64,
+    pub checkouts: u64,
+}
+
+impl TenantPool {
+    fn new(tenant: &str, limit: usize) -> Self {
+        Self {
+            tenant: tenant.to_string(),
+            cap: (limit > 0).then(|| TenantSlot::new(limit)),
+            dials: AtomicU64::new(0),
+            checkouts: AtomicU64::new(0),
+        }
+    }
+
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    /// Count a backend connection opened for the tenant.
+    pub fn note_dial(&self) {
+        self.dials.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a parked connection one of its sessions borrowed.
+    pub fn note_checkout(&self) {
+        self.checkouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A slot for a new backend connection of the tenant, held for the
+    /// connection's life (parked included). Uncapped: `Ok(None)`. Full: call
+    /// `free_idle` once (it closes one of the tenant's parked connections,
+    /// returning whether it did), retry, then wait up to `wait` in FIFO
+    /// order; `Err` names the cap.
+    pub async fn acquire(
+        &self,
+        wait: Duration,
+        free_idle: impl FnOnce() -> bool,
+    ) -> std::result::Result<(Option<OwnedSemaphorePermit>, Option<Duration>), String> {
+        let Some(cap) = self.cap.as_ref() else {
+            return Ok((None, None));
+        };
+        if let Ok(p) = cap.sem.clone().try_acquire_owned() {
+            return Ok((Some(p), None));
+        }
+        // Counted as waiting before looking for an idle connection to close,
+        // and until `wait_for` counts the wait itself (it registers before
+        // calling the closure): a session parking a connection of the tenant
+        // meanwhile either sees a waiter and closes it, or parks it before
+        // `free_idle` looks.
+        let announced = Waiting::new(&cap.waiting, None);
+        if free_idle() {
+            if let Ok(p) = cap.sem.clone().try_acquire_owned() {
+                return Ok((Some(p), None));
+            }
+        }
+        match cap
+            .wait_for(Some(wait), None, || {
+                drop(announced);
+                cap.sem.clone().acquire_owned()
+            })
+            .await
+        {
+            Ok((p, waited)) => Ok((Some(p), Some(waited))),
+            Err(_) => Err(format!(
+                "tenant {} is at its pool_max_connections ({}): {} reached",
+                self.tenant,
+                cap.limit(),
+                crate::node_slots::REFUSAL_MARKER
+            )),
+        }
+    }
+
+    /// A session of the tenant is waiting for a slot now.
+    pub fn has_waiters(&self) -> bool {
+        self.cap
+            .as_ref()
+            .is_some_and(|c| c.waiting.load(Ordering::Relaxed) > 0)
+    }
+
+    /// A slot without waiting and without closing a parked connection (the
+    /// idle reaper's top-ups): `Err` when the tenant is full.
+    pub fn try_acquire(&self) -> std::result::Result<Option<OwnedSemaphorePermit>, TenantPoolFull> {
+        match self.cap.as_ref() {
+            None => Ok(None),
+            Some(cap) => cap
+                .sem
+                .clone()
+                .try_acquire_owned()
+                .map(Some)
+                .map_err(|_| TenantPoolFull),
+        }
+    }
+
+    pub fn stats(&self) -> TenantPoolStats {
+        TenantPoolStats {
+            tenant: self.tenant.clone(),
+            limit: self.cap.as_ref().map(TenantSlot::limit),
+            in_use: self.cap.as_ref().map(TenantSlot::in_use),
+            waiting: self
+                .cap
+                .as_ref()
+                .map_or(0, |c| c.waiting.load(Ordering::Relaxed)),
+            waits: self
+                .cap
+                .as_ref()
+                .map_or(0, |c| c.waits.load(Ordering::Relaxed)),
+            refusals: self
+                .cap
+                .as_ref()
+                .map_or(0, |c| c.refusals.load(Ordering::Relaxed)),
+            dials: self.dials.load(Ordering::Relaxed),
+            checkouts: self.checkouts.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Shared accounting for a tenant's recovery-journal memory. Reservations are
 /// acquired atomically across sessions and returned when their RAII charges
@@ -146,6 +431,7 @@ impl Drop for TenantJournalCharge {
     }
 }
 
+#[derive(Debug)]
 struct TenantSlot {
     /// The cap in force. Changed only by [`TenantSlot::resize`] (a SIGHUP).
     limit: AtomicUsize,
@@ -192,7 +478,7 @@ impl Drop for Waiting<'_> {
 /// down, so they could not be taken out of the semaphore then. Every permit
 /// of the semaphore is either within the cap or owed, so
 /// `held + available == limit + owed` at rest.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct SlotDebt {
     owed: AtomicUsize,
     /// A collector task is running for this slot.
@@ -808,6 +1094,8 @@ pub struct TenantSlots {
     known: HashSet<String>,
     tenants: HashMap<String, TenantSlot>,
     budgets: HashMap<String, Arc<TenantBudget>>,
+    /// Every known tenant's plan (W07), by id.
+    plans: HashMap<String, Arc<TenantPlan>>,
     /// Some tenant has an active-query cap: only then can a session wait
     /// for a permit, so only then are the sessions behind each key counted.
     track_cancel_keys: bool,
@@ -827,23 +1115,35 @@ pub enum TenantCap {
     ActiveQueries,
     ReplayBytes,
     JournalBytes,
+    PoolConnections,
+    PoolIdle,
 }
 
 impl TenantCap {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 6] = [
         Self::Clients,
         Self::ActiveQueries,
         Self::ReplayBytes,
         Self::JournalBytes,
+        Self::PoolConnections,
+        Self::PoolIdle,
     ];
 
     /// The `[multi_tenancy]` keys that set it.
     pub fn keys(self) -> &'static str {
         match self {
-            Self::Clients => "max_clients_per_tenant / tenant_max_clients",
-            Self::ActiveQueries => "max_active_queries_per_tenant / tenant_max_active_queries",
-            Self::ReplayBytes => "max_replay_bytes_per_tenant / tenant_max_replay_bytes",
-            Self::JournalBytes => "max_journal_bytes_per_tenant / tenant_max_journal_bytes",
+            Self::Clients => "max_clients / max_clients_per_tenant / tenant_max_clients",
+            Self::ActiveQueries => {
+                "max_active_queries / max_active_queries_per_tenant / tenant_max_active_queries"
+            }
+            Self::ReplayBytes => {
+                "max_replay_bytes / max_replay_bytes_per_tenant / tenant_max_replay_bytes"
+            }
+            Self::JournalBytes => {
+                "max_journal_bytes / max_journal_bytes_per_tenant / tenant_max_journal_bytes"
+            }
+            Self::PoolConnections => "pool_max_connections",
+            Self::PoolIdle => "pool_max_idle",
         }
     }
 
@@ -853,12 +1153,17 @@ impl TenantCap {
             Self::ActiveQueries => config.active_query_cap(tenant),
             Self::ReplayBytes => config.replay_byte_cap(tenant),
             Self::JournalBytes => config.journal_byte_cap(tenant),
+            Self::PoolConnections => config.pool_connection_cap(tenant),
+            Self::PoolIdle => config.pool_idle_cap(tenant),
         }
     }
 
     /// A semaphore of permits, as opposed to a byte counter.
     fn counts_permits(self) -> bool {
-        matches!(self, Self::Clients | Self::ActiveQueries)
+        matches!(
+            self,
+            Self::Clients | Self::ActiveQueries | Self::PoolConnections
+        )
     }
 }
 
@@ -878,11 +1183,10 @@ impl TenantSlots {
             return Self::default();
         }
         let tenants = mt
-            .tenants
-            .iter()
+            .tenant_ids()
             .filter_map(|t| {
                 let limit = mt.client_cap(t);
-                (limit > 0).then(|| (t.clone(), TenantSlot::new(limit)))
+                (limit > 0).then(|| (t.to_string(), TenantSlot::new(limit)))
             })
             .collect();
         let query_wait =
@@ -890,8 +1194,7 @@ impl TenantSlots {
         let idle_permit_timeout = (mt.idle_permit_timeout_ms > 0)
             .then(|| Duration::from_millis(mt.idle_permit_timeout_ms));
         let budgets: HashMap<String, Arc<TenantBudget>> = mt
-            .tenants
-            .iter()
+            .tenant_ids()
             .filter_map(|t| {
                 let (queries, replay, journal) = (
                     mt.active_query_cap(t),
@@ -900,9 +1203,9 @@ impl TenantSlots {
                 );
                 (queries > 0 || replay > 0 || journal > 0).then(|| {
                     (
-                        t.clone(),
+                        t.to_string(),
                         Arc::new(TenantBudget::new(
-                            t.clone(),
+                            t.to_string(),
                             queries,
                             query_wait,
                             idle_permit_timeout,
@@ -911,6 +1214,40 @@ impl TenantSlots {
                         )),
                     )
                 })
+            })
+            .collect();
+        let plans: HashMap<String, Arc<TenantPlan>> = mt
+            .tenant_list()
+            .iter()
+            .map(|spec| {
+                let isolation = match spec.isolation {
+                    TenantIsolation::Row => IsolationPlan::Row,
+                    TenantIsolation::Schema => IsolationPlan::Schema {
+                        search_path: format!("\"{}\"", spec.schema_name()),
+                    },
+                    TenantIsolation::Database => IsolationPlan::Database {
+                        database: spec.database_name().to_string(),
+                    },
+                    TenantIsolation::Branch => IsolationPlan::Branch {
+                        branch: spec.branch_name().to_string(),
+                    },
+                };
+                let plan = TenantPlan {
+                    id: spec.id.clone(),
+                    isolation,
+                    schema_apply: mt.schema_apply,
+                    branch_mode: config.branch.route_mode,
+                    lock_search_path: mt.lock_search_path,
+                    pool_suffix: spec.has_own_pool().then(|| format!("\0t={}", spec.id)),
+                    pool_max_idle: AtomicUsize::new(spec.pool_max_idle.unwrap_or(0)),
+                    pool: spec.has_own_pool().then(|| {
+                        Arc::new(TenantPool::new(
+                            &spec.id,
+                            spec.pool_max_connections.unwrap_or(0),
+                        ))
+                    }),
+                };
+                (spec.id.clone(), Arc::new(plan))
             })
             .collect();
         if budgets.values().any(|b| b.has_replay_budget())
@@ -931,9 +1268,10 @@ impl TenantSlots {
         }
         Self {
             identify_by: mt.identify_by.clone(),
-            known: mt.tenants.iter().cloned().collect(),
+            known: mt.tenant_ids().map(str::to_string).collect(),
             tenants,
             budgets,
+            plans,
             track_cancel_keys,
             cancel_keys: dashmap::DashMap::new(),
             resizing: parking_lot::Mutex::new(()),
@@ -970,7 +1308,7 @@ impl TenantSlots {
         }
         let _serialized = self.resizing.lock();
         let mut changes = Vec::new();
-        for tenant in &new.tenants {
+        for tenant in new.tenant_ids() {
             for cap in TenantCap::ALL {
                 let (from, to) = (cap.configured(old, tenant), cap.configured(new, tenant));
                 if from == to {
@@ -996,7 +1334,7 @@ impl TenantSlots {
                     ));
                 }
                 changes.push(TenantCapChange {
-                    tenant: tenant.clone(),
+                    tenant: tenant.to_string(),
                     cap,
                     from,
                     to,
@@ -1012,11 +1350,16 @@ impl TenantSlots {
     /// Whether `tenant` runs under `cap` (it was above 0 at startup).
     fn has_cap(&self, tenant: &str, cap: TenantCap) -> bool {
         let budget = self.budgets.get(tenant);
+        let plan = self.plans.get(tenant);
         match cap {
             TenantCap::Clients => self.tenants.contains_key(tenant),
             TenantCap::ActiveQueries => budget.is_some_and(|b| b.has_query_cap()),
             TenantCap::ReplayBytes => budget.is_some_and(|b| b.has_replay_budget()),
             TenantCap::JournalBytes => budget.is_some_and(|b| b.has_journal_budget()),
+            TenantCap::PoolConnections => {
+                plan.and_then(|p| p.pool()).is_some_and(|p| p.cap.is_some())
+            }
+            TenantCap::PoolIdle => plan.is_some_and(|p| p.pool_max_idle().is_some()),
         }
     }
 
@@ -1042,6 +1385,17 @@ impl TenantSlots {
             TenantCap::JournalBytes => {
                 if let Some(journal) = budget.and_then(|b| b.journal.as_ref()) {
                     journal.limit.store(to, Ordering::Relaxed);
+                }
+            }
+            TenantCap::PoolConnections => {
+                let plan = self.plans.get(tenant);
+                if let Some(slot) = plan.and_then(|p| p.pool()).and_then(|p| p.cap.as_ref()) {
+                    slot.resize(to);
+                }
+            }
+            TenantCap::PoolIdle => {
+                if let Some(plan) = self.plans.get(tenant) {
+                    plan.pool_max_idle.store(to, Ordering::Relaxed);
                 }
             }
         }
@@ -1097,6 +1451,45 @@ impl TenantSlots {
     pub fn configured_tenant_of<'p>(&self, params: &'p HashMap<String, String>) -> Option<&'p str> {
         let value = self.key(params)?;
         self.known.contains(value).then_some(value)
+    }
+
+    /// The plan of the known tenant a startup packet names, which the
+    /// session is pinned to at admission (W07). A startup parameter matches a
+    /// tenant id exactly, else in lower case (as the row filter's identifier
+    /// reads it); `identify_by = "database"` resolves as [`Self::tenant_of`].
+    pub fn identify(&self, params: &HashMap<String, String>) -> Option<&Arc<TenantPlan>> {
+        if self.plans.is_empty() {
+            return None;
+        }
+        let value = self.key(params)?;
+        if let Some(plan) = self.plans.get(value) {
+            return Some(plan);
+        }
+        if self.identify_by == "database" {
+            return None;
+        }
+        self.plans.get(&value.to_lowercase())
+    }
+
+    /// The plan of the known tenant `tenant`.
+    pub fn plan(&self, tenant: &str) -> Option<&Arc<TenantPlan>> {
+        self.plans.get(tenant)
+    }
+
+    /// A known tenant uses schema, database or branch isolation.
+    pub fn has_non_row_tenants(&self) -> bool {
+        self.plans.values().any(|p| p.pins_database_or_schema())
+    }
+
+    /// Per tenant with pool settings of its own, sorted by tenant.
+    pub fn pool_stats(&self) -> Vec<TenantPoolStats> {
+        let mut out: Vec<TenantPoolStats> = self
+            .plans
+            .values()
+            .filter_map(|p| p.pool().map(|pool| pool.stats()))
+            .collect();
+        out.sort_by(|a, b| a.tenant.cmp(&b.tenant));
+        out
     }
 
     /// Take a slot of `tenant` for a new client session. Uncapped or unknown
@@ -2245,5 +2638,194 @@ mod tests {
             )
             .unwrap_err()
             .contains("not enforced"));
+    }
+
+    fn isolated(edit: impl FnOnce(&mut Vec<crate::config::TenantSpec>)) -> ProxyConfig {
+        let mut config = ProxyConfig::default();
+        let mt = &mut config.multi_tenancy;
+        mt.enabled = true;
+        mt.identify_by = "user".into();
+        let mut specs = vec!["acme".into(), "Globex".into()];
+        edit(&mut specs);
+        mt.tenants = Vec::new();
+        mt.tenant_settings = specs;
+        config
+    }
+
+    fn with(id: &str, isolation: TenantIsolation) -> crate::config::TenantSpec {
+        crate::config::TenantSpec {
+            isolation,
+            ..crate::config::TenantSpec::from(id)
+        }
+    }
+
+    /// W07: a session is pinned to the tenant its startup packet names, the
+    /// id exactly, else in lower case (as the row filter's identifier reads
+    /// it); `identify_by = "database"` resolves the database exactly as the
+    /// caps do, with no lower-case fallback.
+    #[test]
+    fn sessions_are_pinned_to_the_tenant_their_startup_names() {
+        let slots = TenantSlots::from_config(&isolated(|_| {}));
+        let id =
+            |pairs: &[(&str, &str)]| slots.identify(&params(pairs)).map(|p| p.id().to_string());
+        assert_eq!(id(&[("user", "acme")]).as_deref(), Some("acme"));
+        assert_eq!(id(&[("user", "ACME")]).as_deref(), Some("acme"));
+        assert_eq!(id(&[("user", "Globex")]).as_deref(), Some("Globex"));
+        assert_eq!(
+            id(&[("user", "globex")]),
+            None,
+            "an id is matched exactly first"
+        );
+        assert_eq!(id(&[("user", "nobody")]), None);
+        assert_eq!(id(&[("database", "acme")]), None);
+
+        let mut by_db = isolated(|_| {});
+        by_db.multi_tenancy.identify_by = "database".into();
+        let slots = TenantSlots::from_config(&by_db);
+        let id =
+            |pairs: &[(&str, &str)]| slots.identify(&params(pairs)).map(|p| p.id().to_string());
+        assert_eq!(
+            id(&[("user", "x"), ("database", "acme@b")]).as_deref(),
+            Some("acme")
+        );
+        assert_eq!(id(&[("user", "x"), ("database", "ACME")]), None);
+        assert_eq!(id(&[("user", "acme")]).as_deref(), Some("acme"));
+        // Disabled: nobody is pinned.
+        let mut off = isolated(|_| {});
+        off.multi_tenancy.enabled = false;
+        assert!(TenantSlots::from_config(&off)
+            .identify(&params(&[("user", "acme")]))
+            .is_none());
+    }
+
+    /// W07: the startup parameters each isolation gives a session.
+    #[test]
+    fn each_isolation_rewrites_the_startup_parameters() {
+        let config = isolated(|specs| {
+            let mut schema = with("s", TenantIsolation::Schema);
+            schema.schema = Some("tenant_s".into());
+            let mut db = with("d", TenantIsolation::Database);
+            db.database = Some("tenant_db".into());
+            let mut branch = with("b", TenantIsolation::Branch);
+            branch.branch = Some("feat".into());
+            specs.extend([schema, db, branch]);
+        });
+        let slots = TenantSlots::from_config(&config);
+        let plan = |id: &str| slots.plan(id).expect("known").clone();
+        let rewrite = |id: &str, pairs: &[(&str, &str)]| {
+            let mut p = params(pairs);
+            plan(id).rewrite_startup(&mut p);
+            p
+        };
+        // Row: nothing.
+        let row = params(&[("user", "acme"), ("database", "app")]);
+        assert_eq!(
+            rewrite("acme", &[("user", "acme"), ("database", "app")]),
+            row
+        );
+        assert!(!plan("acme").pins_database_or_schema());
+        // Schema: appended to the client's options; its own search_path goes.
+        let s = rewrite(
+            "s",
+            &[
+                ("user", "s"),
+                ("options", "-c x=1"),
+                ("SEARCH_PATH", "public"),
+            ],
+        );
+        assert_eq!(
+            s.get("options").map(String::as_str),
+            Some("-c x=1 -c search_path=\"tenant_s\"")
+        );
+        assert!(!s.contains_key("SEARCH_PATH"));
+        let s = rewrite("s", &[("user", "s"), ("options", "  ")]);
+        assert_eq!(
+            s.get("options").map(String::as_str),
+            Some("-c search_path=\"tenant_s\"")
+        );
+        assert!(plan("s").locks_search_path());
+        assert_eq!(plan("s").set_on_acquire(), None, "schema_apply = startup");
+        // Database.
+        let d = rewrite("d", &[("user", "d"), ("database", "app")]);
+        assert_eq!(d.get("database").map(String::as_str), Some("tenant_db"));
+        // Branch: the client's database's branch (by default the branch
+        // database itself; `<base>@<branch>` on HeliosDB-Nano).
+        let b = rewrite("b", &[("user", "b"), ("database", "app@x")]);
+        assert_eq!(b.get("database").map(String::as_str), Some("feat"));
+        let mut nano = config.clone();
+        nano.branch.route_mode = BranchRouteMode::Nano;
+        let nano = TenantSlots::from_config(&nano);
+        let mut p = params(&[("user", "app")]);
+        nano.plan("b").unwrap().rewrite_startup(&mut p);
+        assert_eq!(
+            p.get("database").map(String::as_str),
+            Some("app@feat"),
+            "no database: the user's"
+        );
+
+        // set_on_acquire leaves the startup alone and SETs instead.
+        let mut late = config.clone();
+        late.multi_tenancy.schema_apply = SchemaApply::SetOnAcquire;
+        late.multi_tenancy.lock_search_path = false;
+        let late = TenantSlots::from_config(&late);
+        let plan = late.plan("s").unwrap();
+        let mut p = params(&[("user", "s")]);
+        plan.rewrite_startup(&mut p);
+        assert_eq!(p, params(&[("user", "s")]));
+        assert_eq!(
+            plan.set_on_acquire().as_deref(),
+            Some("SET search_path TO \"tenant_s\"")
+        );
+        assert!(plan.reset_leaves_schema());
+        assert!(!plan.locks_search_path());
+    }
+
+    /// W07: a tenant with pool settings has a pool of its own: its key
+    /// suffix, its idle cap, and `pool_max_connections` held by each
+    /// connection; a full tenant frees one parked connection first, then
+    /// waits, then is refused naming the cap. Tenants without pool settings
+    /// have none.
+    #[tokio::test]
+    async fn tenant_pools_cap_their_connections() {
+        let config = isolated(|specs| {
+            specs[0].pool_max_connections = Some(1);
+            specs[0].pool_max_idle = Some(2);
+        });
+        let slots = TenantSlots::from_config(&config);
+        let acme = slots.plan("acme").unwrap();
+        assert_eq!(acme.pool_suffix(), Some("\0t=acme"));
+        assert_eq!(acme.pool_max_idle(), Some(2));
+        assert!(slots.plan("Globex").unwrap().pool().is_none());
+        let pool = acme.pool().unwrap();
+        let wait = Duration::from_millis(20);
+        let (held, waited) = pool.acquire(wait, || false).await.unwrap();
+        assert!(held.is_some() && waited.is_none());
+        assert!(pool.try_acquire().is_err(), "full");
+        let refused = pool.acquire(wait, || false).await.unwrap_err();
+        assert!(refused.contains("pool_max_connections (1)"), "{refused}");
+        assert!(refused.contains(crate::node_slots::REFUSAL_MARKER));
+        assert!(!pool.has_waiters());
+        // Freeing a parked connection hands its slot over at once.
+        let mut parked = held;
+        let (again, waited) = pool
+            .acquire(wait, || parked.take().is_some())
+            .await
+            .unwrap();
+        assert!(again.is_some() && waited.is_none());
+        pool.note_dial();
+        pool.note_checkout();
+        assert_eq!(
+            slots.pool_stats(),
+            vec![TenantPoolStats {
+                tenant: "acme".into(),
+                limit: Some(1),
+                in_use: Some(1),
+                waiting: 0,
+                waits: 1,
+                refusals: 1,
+                dials: 1,
+                checkouts: 1,
+            }]
+        );
     }
 }

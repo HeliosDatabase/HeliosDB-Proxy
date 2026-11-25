@@ -15,7 +15,10 @@
 //!   temporary objects, cursors `WITH HOLD`, SQL `PREPARE`d statements,
 //!   `LISTEN`, session advisory locks or session settings (0A000; see
 //!   `session_bound`). Protocol-level prepared statements are fine: the
-//!   proxy prepares them again on the new connection when they are used.
+//!   proxy prepares them again on the new connection when they are used;
+//! - never for a session whose tenant is isolated by its own schema,
+//!   database or branch (`[multi_tenancy] tenants`, 0A000): the move would
+//!   leave its isolation.
 //!
 //! The session then stays on the branch: later statements run there until
 //! another branch request (`branch=` with no name returns to the database
@@ -90,6 +93,23 @@ impl ProxyServer {
                 format!(
                     "this statement asks for branch {name:?}, but branch routing is off \
                      ([branch] route_enabled); it was not run"
+                ),
+            ));
+        }
+        // W07: a tenant isolated by schema, database or branch is pinned
+        // there; a move would take its session out of its isolation.
+        if let Some(plan) = session
+            .tenant
+            .get()
+            .filter(|plan| plan.pins_database_or_schema())
+        {
+            return Err((
+                "0A000",
+                format!(
+                    "cannot move the session to branch {name:?}: tenant {:?} is isolated by its \
+                     own schema, database or branch ([multi_tenancy] tenants), which a move \
+                     would leave; it was not run",
+                    plan.id()
                 ),
             ));
         }

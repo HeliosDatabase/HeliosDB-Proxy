@@ -236,7 +236,11 @@ pub struct TrMetricsSnapshot {
     pub session_set_untracked: u64,
 }
 
-/// Pool mode statistics snapshot (when pool-modes feature is enabled)
+/// Pool mode statistics snapshot (when pool-modes feature is enabled).
+///
+/// Deprecated since 3.1: filled from the data-path pool, which does not count
+/// completed transactions, statements or lease durations (those fields are 0);
+/// `GET /api/stats` and `heliosdb_proxy_pool_*` carry its counters.
 #[cfg(feature = "pool-modes")]
 #[derive(Debug, Clone)]
 pub struct PoolModeStatsSnapshot {

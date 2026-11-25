@@ -13,27 +13,18 @@ tr_mode    = "transaction"
 write_timeout_secs = 15
 
 [pool]
-min_connections      = 2
-max_connections      = 20
-idle_timeout_secs    = 300
-max_lifetime_secs    = 1800
 acquire_timeout_secs = 10
 test_on_acquire      = true
 
 [pool_mode]
 mode                    = "transaction"
 max_pool_size           = 20
-min_idle                = 2
 idle_timeout_secs       = 300
-max_lifetime_secs       = 1800
-acquire_timeout_secs    = 5
 reset_query             = "DISCARD ALL"
-prepared_statement_mode = "track"
 
 [load_balancer]
 read_strategy        = "least_connections"
 read_write_split     = true
-latency_threshold_ms = 50
 
 [health]
 check_interval_secs = 2

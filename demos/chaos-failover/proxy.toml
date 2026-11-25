@@ -15,10 +15,6 @@ write_timeout_secs = 20
 
 # ── Connection Pool ──────────────────────────────────────────────────
 [pool]
-min_connections      = 2
-max_connections      = 50
-idle_timeout_secs    = 300
-max_lifetime_secs    = 1800
 acquire_timeout_secs = 10
 test_on_acquire      = true
 
@@ -26,18 +22,13 @@ test_on_acquire      = true
 [pool_mode]
 mode                    = "transaction"
 max_pool_size           = 50
-min_idle                = 5
 idle_timeout_secs       = 300
-max_lifetime_secs       = 1800
-acquire_timeout_secs    = 5
 reset_query             = "DISCARD ALL"
-prepared_statement_mode = "track"
 
 # ── Load Balancer ────────────────────────────────────────────────────
 [load_balancer]
 read_strategy        = "least_connections"
 read_write_split     = true
-latency_threshold_ms = 50
 
 # ── Health Checks (2s interval for fast detection) ───────────────────
 [health]

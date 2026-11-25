@@ -38,16 +38,20 @@ write_timeout_secs = 30
 # =============================================================================
 
 [pool]
-# Size according to: (number of vCPUs * 2) + max_parallel_workers on the
-# PostgreSQL side, then subtract connections reserved for superuser and
-# replication. A safe default for most workloads:
-min_connections    = 10
+# max_connections caps the backend connections (in use and parked) per node:
+# size it below PostgreSQL's max_connections minus the connections reserved
+# for superuser and replication. min_connections keeps that many open per
+# node, opened ahead of use (needs [auth] mode = "scram" with plaintext
+# auth_file entries, or trust; 0 = none). The idle timeout and lifetime
+# combine with [pool_mode]'s: the smaller non-zero value applies.
+min_connections    = 0
 max_connections    = 100
 idle_timeout_secs  = 300
 max_lifetime_secs  = 1800
 acquire_timeout_secs = 5
 
-# Always verify a connection is alive before handing it to a client.
+# Verify a parked connection is alive (one non-blocking read) before handing
+# it to a client.
 test_on_acquire = true
 
 # =============================================================================
@@ -59,18 +63,19 @@ test_on_acquire = true
 # Each client gets a backend connection only for the duration of a transaction.
 mode = "transaction"
 
-max_pool_size        = 100
-min_idle             = 10
+max_pool_size        = 100    # idle connections parked per (node, user, database)
+min_idle             = 0      # kept ready per identity (needs a proxy-held credential)
 idle_timeout_secs    = 300
 max_lifetime_secs    = 1800
-acquire_timeout_secs = 5
+acquire_timeout_secs = 5      # overall deadline on opening a connection, 53300 on expiry
 
 # DISCARD ALL resets all session state (SET variables, prepared statements,
 # temp tables) when a connection is returned to the pool.
 reset_query = "DISCARD ALL"
 
-# Track prepared statements so the proxy can re-create them transparently
-# when a client's queries land on a different backend connection.
+# Track prepared statements (named protocol-level ones and SQL PREPARE) so
+# the proxy can re-create them transparently when a client's queries land on
+# a different backend connection.
 prepared_statement_mode = "track"
 
 # =============================================================================
@@ -84,8 +89,9 @@ read_strategy    = "round_robin"
 # Route SELECT queries to standbys; INSERT/UPDATE/DELETE/DDL to primary.
 read_write_split = true
 
-# If a standby's average latency exceeds this threshold (ms), stop routing
-# reads to it until latency recovers.
+# If a standby's smoothed health-probe latency exceeds this threshold (ms),
+# stop routing reads to it until it drops below 70% of it (0 = off). Probes
+# with [health] credentials include connect and authentication time.
 latency_threshold_ms = 100
 
 # =============================================================================

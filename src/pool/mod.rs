@@ -41,7 +41,9 @@ pub mod statement;
 pub mod transaction;
 
 // Re-exports
-pub use backend_pool::{pool_key, BackendIdlePool, ParkedSettings, PooledConn, SettingsProof};
+pub use backend_pool::{
+    pool_key, BackendIdlePool, DialSpec, LeaseOptions, ParkedSettings, PooledConn, SettingsProof,
+};
 pub use config::PoolModeConfig;
 pub use hardening::{
     ConnectionHealthValidator, HardeningStats, PoolExhaustionMonitor, PoolHardening,

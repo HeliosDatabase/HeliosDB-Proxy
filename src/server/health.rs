@@ -119,6 +119,15 @@ impl ProxyServer {
         // completed; no await is held under the guard.
         let _writers = state.health_write.lock();
         let mut next = (*state.health.load_full()).clone();
+        // W02 `[load_balancer] latency_threshold_ms`: while it is set, every
+        // successful probe's latency feeds the read gate's smoothed latency.
+        if config.load_balancer.latency_threshold_ms > 0 {
+            let samples: Vec<(String, f64)> = results
+                .iter()
+                .filter_map(|(addr, r)| r.as_ref().ok().map(|(ms, _)| (addr.clone(), *ms)))
+                .collect();
+            state.latency_gate.observe(&config.load_balancer, &samples);
+        }
         for (addr, result) in results {
             if let Some(node_health) = next.get_mut(&addr) {
                 let (ok, latency, lag) = match result {

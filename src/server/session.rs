@@ -207,6 +207,32 @@ pub struct ClientSession {
     /// The node slot (H-05) of the backend connection opened during startup,
     /// handed to that connection's `BackendConn` once the session starts.
     pub(crate) startup_slot: parking_lot::Mutex<crate::node_slots::Slot>,
+    /// W07: the known tenant the startup packet named, pinned at admission:
+    /// its isolation, pool and caps apply for the session's life, whatever
+    /// its startup parameters are rewritten to. Unset for a session of no
+    /// known tenant (and without `[multi_tenancy] enabled`).
+    pub(crate) tenant: std::sync::OnceLock<Arc<crate::tenant_slots::TenantPlan>>,
+    /// W07: the startup connection's slot under its tenant's
+    /// `pool_max_connections`, taken at admission and handed to that
+    /// connection's `BackendConn` once the session starts.
+    pub(crate) startup_tenant_slot: parking_lot::Mutex<crate::node_slots::Slot>,
+    /// W02: a connection leased from the pool without its liveness probe
+    /// (`[pool] test_on_acquire = false`) refused the first write of a
+    /// request, which therefore reached no backend: the forward path dials
+    /// a fresh connection and sends the request once more.
+    #[cfg(feature = "pool-modes")]
+    pub(crate) stale_lease: std::sync::atomic::AtomicBool,
+    /// W02: the next connection this session opens is dialed fresh, never
+    /// leased from the pool (set for the one retry after a stale lease).
+    #[cfg(feature = "pool-modes")]
+    pub(crate) fresh_dial: std::sync::atomic::AtomicBool,
+    /// W02 (`[pool_mode] prepared_statement_mode = "track"`): the statements
+    /// the session prepared with SQL `PREPARE`, prepared again on a pooled
+    /// connection that lacks one before a statement uses it.
+    pub(crate) sql_prepared: parking_lot::Mutex<super::sql_prepared::SqlPrepared>,
+    /// `sql_prepared` holds a statement: lets the request path skip it
+    /// without the lock.
+    pub(crate) sql_prepared_live: std::sync::atomic::AtomicBool,
     /// The session's reads stay on its home node (the primary) from now on:
     /// it created state that only that connection holds (temp tables,
     /// cursors, SQL `PREPARE`, `LISTEN`, untracked GUC changes), or mirroring
@@ -639,14 +665,34 @@ pub(super) struct BackendConn {
     /// socket while the backend may still be running it (`abandon_conn`).
     /// `None` when the backend sent none.
     pub(super) backend_key: Option<(u32, u32)>,
-    /// This socket's slot on its node's `max_connections` cap (H-05); `None`
-    /// for an uncapped node. Held for its `Drop`: released when the socket is
-    /// dropped, or moved into the idle pool with it (`pool-modes`).
+    /// This socket's slot on its node's `max_connections` cap (H-05), which
+    /// also counts the node's open connections. Held for its `Drop`:
+    /// released when the socket is dropped, or moved into the idle pool with
+    /// it (`pool-modes`).
     pub(super) _slot: crate::node_slots::Slot,
+    /// This socket's slot under its tenant's `pool_max_connections` (W07);
+    /// `None` for a tenant without one. Held and moved like `_slot`.
+    pub(super) _tenant_slot: crate::node_slots::Slot,
+    /// When the backend connection was opened: `[pool] / [pool_mode]
+    /// max_lifetime_secs` count from here (a pooled connection keeps it).
+    pub(super) opened_at: std::time::Instant,
+    /// Leased from the idle pool without the liveness probe (`[pool]
+    /// test_on_acquire = false`), and no request written on it yet: a first
+    /// write it refuses reached no backend (`ProxyServer::send_failed`).
+    pub(super) unprobed: bool,
+    /// The SQL `PREPARE`d statements (folded names) this socket holds, as
+    /// far as the proxy saw (`[pool_mode] prepared_statement_mode =
+    /// "track"`).
+    pub(super) sql_prepared: HashSet<String>,
 }
 
 impl BackendConn {
     pub(super) fn new(stream: TcpStream) -> Self {
+        Self::opened(stream, std::time::Instant::now())
+    }
+
+    /// A connection to a backend opened at `opened_at`.
+    fn opened(stream: TcpStream, opened_at: std::time::Instant) -> Self {
         Self {
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             cache_scope_unsupported: false,
@@ -673,6 +719,10 @@ impl BackendConn {
             session_locks: false,
             backend_key: None,
             _slot: None,
+            _tenant_slot: None,
+            opened_at,
+            unprobed: false,
+            sql_prepared: HashSet::new(),
         }
     }
 
@@ -681,6 +731,36 @@ impl BackendConn {
         Self {
             _slot: slot,
             ..Self::new(stream)
+        }
+    }
+
+    /// A connection leased from the idle pool: it keeps its slots, its
+    /// BackendKeyData and when it was opened. `unprobed`: leased without
+    /// the liveness probe.
+    #[cfg(feature = "pool-modes")]
+    pub(super) fn leased(conn: crate::pool::PooledConn, unprobed: bool) -> Self {
+        Self {
+            _slot: conn.slot,
+            _tenant_slot: conn.tenant_slot,
+            backend_key: conn.backend_key,
+            unprobed,
+            ..Self::opened(conn.stream, conn.opened_at)
+        }
+    }
+
+    /// The pool's form of this connection, to park it.
+    #[cfg(feature = "pool-modes")]
+    pub(super) fn into_pooled(
+        self,
+        settings: crate::pool::ParkedSettings,
+    ) -> crate::pool::PooledConn {
+        crate::pool::PooledConn {
+            stream: self.stream,
+            slot: self._slot,
+            tenant_slot: self._tenant_slot,
+            backend_key: self.backend_key,
+            settings,
+            opened_at: self.opened_at,
         }
     }
 

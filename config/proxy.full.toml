@@ -268,18 +268,27 @@ write_timeout_secs = 30
 # =============================================================================
 
 [pool]
-min_connections    = 5
+# Backend connections (in use and parked) kept open per node, opened ahead of
+# use by the idle reaper (transaction/statement pooling; needs a credential
+# the proxy holds, or a trust backend). 0 = none.
+min_connections    = 0
+# Most backend connections per node, in use and parked; [[nodes]]
+# max_connections overrides it. 0 = unlimited.
 max_connections    = 100
-idle_timeout_secs  = 300
-max_lifetime_secs  = 1800
+# Idle timeout of a parked connection (seconds); the smaller of this and
+# [pool_mode] idle_timeout_secs applies. 0 = off.
+idle_timeout_secs  = 0
+# A pooled connection this old (seconds) is closed instead of parked or
+# handed out; one in use never is. The smaller of this and [pool_mode]
+# max_lifetime_secs applies. 0 = off.
+max_lifetime_secs  = 0
+# Backend connect timeout (seconds), and how long a connection the backend
+# refuses at its max_connections (53300) is retried.
 acquire_timeout_secs = 5
-# Validate a pooled connection before handing it out; false skips
-# acquire-time validation entirely. Today that validation is a lightweight
-# state check (not a live socket probe) for every shipped deployment, since
-# the pool never attaches a real backend socket to its connections outside
-# of unit tests. The data-path liveness check operators actually rely on is
-# the idle backend pool's periodic stale-connection probe
-# (pool_reap_interval_secs, above).
+# Probe a parked connection for liveness (one non-blocking read) before
+# handing it out. false skips the probe; a connection that turns out closed
+# when its first request is sent is replaced by a fresh one once, without a
+# node fault.
 test_on_acquire    = true
 
 # =============================================================================
@@ -290,26 +299,25 @@ test_on_acquire    = true
 # session | transaction | statement
 mode = "${HELIOS_PROXY_POOL_MODE:-transaction}"
 
-max_pool_size        = 100    # Max connections per node
-min_idle             = 10     # Warm connections to keep ready
-idle_timeout_secs    = 600    # Seconds before closing idle connections
-max_lifetime_secs    = 3600   # Max age of a connection before recycling
-acquire_timeout_secs = 5      # Timeout to acquire a connection from pool
+max_pool_size        = 100    # Most idle connections parked per (node, user, database)
+min_idle             = 0      # Idle connections kept ready per recently used identity (<= max_pool_size)
+idle_timeout_secs    = 600    # Seconds before closing an idle parked connection (0 = never)
+max_lifetime_secs    = 0      # Max age of a pooled connection before it is recycled (0 = off)
+acquire_timeout_secs = 0      # Overall deadline on opening a connection for a session, 53300 on expiry (0 = off)
 
 # SQL to reset session state when returning connection to pool.
 reset_query = "DISCARD ALL"
 
-# Prepared statement handling:
-#   disable — never use prepared statements
-#   track   — proxy transparently re-creates them on new connections
-#   named   — protocol-level named statements (session mode only)
+# Prepared statement handling in transaction/statement pooling
+# (session pooling keeps them on the session's connection: "named"):
+#   track   — named protocol-level statements and SQL PREPARE are tracked
+#             and prepared again on any connection that runs them (default)
+#   disable — a named Parse or a SQL PREPARE is refused (0A000)
 prepared_statement_mode = "track"
 
-# How long clients wait in the queue when pool is exhausted (seconds).
-# queue_timeout_secs = 30
-
-# Maximum pending client requests when pool is full (0 = unlimited).
-# max_queue_size = 0
+# There is no request queue: a request waits for a backend connection up to
+# [limits] backend_slot_wait_ms for a node or tenant slot and
+# acquire_timeout_secs overall, then is refused with 53300.
 
 # =============================================================================
 # LOAD BALANCER — Read/write routing strategy
@@ -322,8 +330,11 @@ read_write_split = true
 # async (any standby) | sync (synchronous standbys only) | primary (no read offload)
 standby_reads    = "async"
 
-# Nodes exceeding this average latency (ms) are deprioritised.
-latency_threshold_ms = 100
+# A standby whose smoothed probe latency exceeds this (ms) serves no reads
+# until it drops below latency_readmit_ratio of it. 0 = off.
+latency_threshold_ms  = 0
+latency_readmit_ratio = 0.7   # re-admit below this fraction of the threshold
+latency_smoothing     = 0.3   # weight of the newest probe in the smoothed latency
 
 # =============================================================================
 # TOPOLOGY — authoritative primary tracking (H-01)
@@ -683,18 +694,23 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 
 # Build with multi-tenancy. Identity is an exact startup parameter, not a
 # username prefix or JWT claim. Authenticate it at a trusted application boundary;
-# use backend privileges/RLS as the security boundary. Applied at startup; a
-# SIGHUP can only resize caps and byte budgets that tenants already have.
+# use backend privileges/RLS as the security boundary. A session is pinned to
+# its tenant at admission. Applied at startup; a SIGHUP can only resize caps,
+# byte budgets and pool caps that tenants already have.
 # [multi_tenancy]
 # enabled = true
 # identify_by = "application_name"  # Or "database", "user", another startup key
-# tenants = ["acme", "widgetco"]
+#                                   # (schema/database/branch isolation needs
+#                                   # "user" or "database")
+# tenants = ["acme", "widgetco"]    # ids: row isolation, the caps below
 # tenant_column = "tenant_id"
 # tenant_tables = ["orders", "products"]
 # unknown_tenant = "refuse"         # "passthrough" keeps 2.2 behaviour
 # refused_functions = ["dblink", "dblink_exec", "lo_import", "lo_export", "pg_read_file"]
 #                                   # default: the XML exports, dblink*, lo_import/lo_export,
 #                                   # pg_read_file, pg_read_binary_file (see docs)
+# schema_apply = "startup"          # Or "set_on_acquire" (SET search_path per acquired connection)
+# lock_search_path = true           # Refuse SET search_path / set_config under schema isolation
 # max_clients_per_tenant = 20
 # max_active_queries_per_tenant = 4
 # active_query_wait_ms = 5000
@@ -708,6 +724,18 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # acme = 8
 # [multi_tenancy.tenant_max_journal_bytes]
 # acme = 134217728
+#
+# A tenant can instead be a table with its own isolation, caps and pool
+# (resolved entry -> tenant_max_* map -> section value; a cap may not be set
+# both in the entry and in a map):
+# [[multi_tenancy.tenant_settings]]
+# id = "globex"
+# isolation = "schema"              # row | schema | database | branch
+# schema = "globex"                 # default: the id (database / branch likewise)
+# max_clients = 10
+# max_active_queries = 2
+# pool_max_idle = 4                 # idle connections parked per identity (transaction/statement pooling)
+# pool_max_connections = 8          # backend connections in use and parked; 53300 when full
 
 # =============================================================================
 # AUTH — Client authentication

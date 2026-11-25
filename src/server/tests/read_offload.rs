@@ -802,3 +802,82 @@ fn dual_read_call_pins_session_change() {
         assert!(ProxyServer::pins_reads(sql), "{sql}");
     }
 }
+
+/// W02 `[load_balancer] latency_threshold_ms`: a standby whose smoothed
+/// probe latency is above the threshold serves no offloaded reads (the
+/// other standby does; with none left the primary does), a session stuck to
+/// it moves, and it serves again once below `latency_readmit_ratio` of the
+/// threshold. At 0 (the default) latency holds no standby out.
+#[tokio::test]
+async fn slow_standbys_are_held_out_of_reads() {
+    let mut config = offload_config(StandbyReads::Async);
+    config.load_balancer.latency_threshold_ms = 100;
+    config.load_balancer.latency_smoothing = 1.0;
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let primary = "pg-p:5432";
+    let (s1, s2) = ("pg-s1:5432", "pg-s2:5432");
+    let probe = |samples: &[(&str, f64)]| {
+        let samples: Vec<(String, f64)> = samples
+            .iter()
+            .map(|(addr, ms)| (addr.to_string(), *ms))
+            .collect();
+        server
+            .state
+            .latency_gate
+            .observe(&config.load_balancer, &samples);
+    };
+    let offload = |session: Arc<ClientSession>, config: ProxyConfig| {
+        let server = &server;
+        async move {
+            route(
+                server,
+                &config,
+                &session,
+                false,
+                Some(primary),
+                ReadRoute::Offload,
+            )
+            .await
+        }
+    };
+    probe(&[(s1, 250.0), (s2, 20.0)]);
+    for _ in 0..4 {
+        assert_eq!(
+            offload(make_test_session(), config.clone()).await,
+            (s2.to_string(), true)
+        );
+    }
+    // The session stuck to s2 moves when s2 turns slow; with both slow the
+    // primary serves the read.
+    let session = make_test_session();
+    assert_eq!(
+        offload(session.clone(), config.clone()).await,
+        (s2.to_string(), true)
+    );
+    probe(&[(s2, 300.0)]);
+    assert_eq!(
+        offload(session.clone(), config.clone()).await,
+        (primary.to_string(), false)
+    );
+    // s1 under the threshold but not under 70 % of it: still out.
+    probe(&[(s1, 90.0)]);
+    assert_eq!(
+        offload(session.clone(), config.clone()).await,
+        (primary.to_string(), false)
+    );
+    probe(&[(s1, 60.0)]);
+    assert_eq!(
+        offload(session.clone(), config.clone()).await,
+        (s1.to_string(), true)
+    );
+    // Threshold 0: the gate is not consulted.
+    let mut off = config.clone();
+    off.load_balancer.latency_threshold_ms = 0;
+    let (target, offloaded) = offload(make_test_session(), off.clone()).await;
+    assert!(offloaded && target != primary, "{target}");
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..16 {
+        seen.insert(offload(make_test_session(), off.clone()).await.0);
+    }
+    assert!(seen.contains(s2), "s2 serves reads again: {seen:?}");
+}

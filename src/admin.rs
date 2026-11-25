@@ -72,10 +72,14 @@ pub struct AdminState {
     read_lb_counter: AtomicUsize,
     /// Registered command handlers
     commands: RwLock<HashMap<String, CommandHandler>>,
-    /// Connection pool manager (Session/Transaction/Statement modes).
-    /// Attached at startup; `/api/pools` returns real per-node pool
-    /// stats when present, an empty list otherwise.
+    /// Deprecated since 3.1: a connection pool manager the data path never
+    /// used. Nothing reads it; `GET /pools` reports the data-path pool and
+    /// the real per-node connections.
     #[cfg(feature = "pool-modes")]
+    #[deprecated(
+        since = "3.1.0",
+        note = "unused; `GET /pools` reports the data-path pool"
+    )]
     pub pool_manager: RwLock<Option<Arc<crate::pool::ConnectionPoolManager>>>,
     /// Circuit-breaker manager. Attached at startup; `/api/circuit` reports
     /// each node's live circuit state (closed / open / half-open).
@@ -645,7 +649,15 @@ impl AdminServer {
                             map.insert("reconnect_slots".into(), serde_json::to_value(r)?);
                         }
                     }
+                    #[cfg(feature = "pool-modes")]
+                    if let Some(p) = state.backend_pool.read().await.as_ref() {
+                        map.insert("backend_pool".into(), Self::backend_pool_json(p));
+                    }
                     if let Some(s) = state.tenant_slots.read().await.as_ref() {
+                        let tenant_pools = s.pool_stats();
+                        if !tenant_pools.is_empty() {
+                            map.insert("tenant_pools".into(), serde_json::to_value(tenant_pools)?);
+                        }
                         if !s.is_empty() {
                             map.insert("tenant_slots".into(), serde_json::to_value(s.stats())?);
                         }
@@ -768,6 +780,11 @@ impl AdminServer {
                 if let Some(s) = state.tenant_slots.read().await.as_ref() {
                     Self::push_tenant_slots_prometheus(&mut prometheus, &s.stats());
                     Self::push_tenant_budgets_prometheus(&mut prometheus, &s.budget_stats());
+                    Self::push_tenant_pools_prometheus(&mut prometheus, &s.pool_stats());
+                }
+                #[cfg(feature = "pool-modes")]
+                if let Some(p) = state.backend_pool.read().await.as_ref() {
+                    Self::push_backend_pool_prometheus(&mut prometheus, p);
                 }
                 #[cfg(feature = "query-cache")]
                 if let Some(c) = state.query_cache.read().await.as_ref() {
@@ -1538,29 +1555,36 @@ impl AdminServer {
         }
     }
 
-    /// Get pool statistics
-    async fn get_pool_stats(_state: &Arc<AdminState>) -> Vec<PoolStatsResponse> {
-        // Real per-node pool stats from the attached pool manager. Returns
-        // an empty list when pool-modes is off or no manager is attached.
+    /// `GET /pools`: per node, the backend connections this proxy holds
+    /// (in use and parked, from the node slots), the parked ones (the
+    /// data-path pool, transaction / statement pooling), the sessions
+    /// waiting for a slot, and the connections opened and closed since
+    /// startup. Every node the proxy knows is listed, sorted.
+    async fn get_pool_stats(state: &Arc<AdminState>) -> Vec<PoolStatsResponse> {
+        let Some(slots) = state.node_slots.read().await.clone() else {
+            return Vec::new();
+        };
         #[cfg(feature = "pool-modes")]
-        if let Some(mgr) = _state.pool_manager.read().await.clone() {
-            let stats = mgr.get_stats().await;
-            return stats
-                .node_stats
-                .into_iter()
-                .map(|ns| PoolStatsResponse {
-                    node: ns.node_id.0.to_string(),
-                    active_connections: ns.active as u64,
-                    idle_connections: ns.idle as u64,
-                    // Per-node pending/created/closed counters are not tracked
-                    // separately by the manager; total is the live pool size.
-                    pending_requests: 0,
-                    total_connections_created: ns.total as u64,
-                    total_connections_closed: 0,
-                })
-                .collect();
-        }
-        Vec::new()
+        let pool = state.backend_pool.read().await.clone();
+        slots
+            .conn_stats()
+            .into_iter()
+            .map(|n| {
+                #[cfg(feature = "pool-modes")]
+                let idle = pool.as_ref().map_or(0, |p| p.idle_count_for_node(&n.node));
+                #[cfg(not(feature = "pool-modes"))]
+                let idle = 0;
+                PoolStatsResponse {
+                    active_connections: n.open.saturating_sub(idle) as u64,
+                    idle_connections: idle as u64,
+                    pending_requests: n.waiting as u64,
+                    total_connections_created: n.opened,
+                    total_connections_closed: n.opened.saturating_sub(n.open as u64),
+                    max_connections: n.limit.map(|l| l as u64),
+                    node: n.node,
+                }
+            })
+            .collect()
     }
 
     /// Handle `POST /api/replay`. Body is a JSON `ReplayRequestBody`.
@@ -2848,6 +2872,139 @@ impl AdminServer {
             .replace('\n', "\\n")
     }
 
+    /// The data-path pool's counters as JSON (`/metrics`).
+    #[cfg(feature = "pool-modes")]
+    fn backend_pool_json(p: &crate::pool::BackendIdlePool) -> serde_json::Value {
+        serde_json::json!({
+            "idle": p.idle_count(),
+            "reuses": p.reuses(),
+            "parked": p.parked(),
+            "over_capacity": p.over_capacity(),
+            "stale_evicted": p.stale_evicted(),
+            "reaped": p.reaped(),
+            "lifetime_expired": p.lifetime_expired(),
+            "acquire_timeouts": p.acquire_timeouts(),
+            "stale_lease_redials": p.stale_lease_redials(),
+            "topped_up": p.topped_up(),
+            "topup_failures": p.topup_failures(),
+            "handed_over": p.handed_over(),
+        })
+    }
+
+    /// The data-path pool (transaction / statement pooling, W02).
+    #[cfg(feature = "pool-modes")]
+    fn push_backend_pool_prometheus(output: &mut String, p: &crate::pool::BackendIdlePool) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "# HELP heliosdb_proxy_pool_idle_connections Backend connections parked in the data-path pool\n\
+             # TYPE heliosdb_proxy_pool_idle_connections gauge\n\
+             heliosdb_proxy_pool_idle_connections {}",
+            p.idle_count()
+        );
+        for (name, help, value) in [
+            (
+                "heliosdb_proxy_pool_reuses_total",
+                "Checkouts that reused a parked backend connection",
+                p.reuses(),
+            ),
+            (
+                "heliosdb_proxy_pool_lifetime_expired_total",
+                "Pooled backend connections closed for outliving the max lifetime",
+                p.lifetime_expired(),
+            ),
+            (
+                "heliosdb_proxy_pool_acquire_timeouts_total",
+                "Requests refused with 53300 at [pool_mode] acquire_timeout_secs",
+                p.acquire_timeouts(),
+            ),
+            (
+                "heliosdb_proxy_pool_stale_lease_redials_total",
+                "Connections leased without the liveness probe that refused their first write and were redialed",
+                p.stale_lease_redials(),
+            ),
+            (
+                "heliosdb_proxy_pool_topped_up_total",
+                "Backend connections opened ahead of use (min_idle, min_connections)",
+                p.topped_up(),
+            ),
+            (
+                "heliosdb_proxy_pool_topup_failures_total",
+                "Ahead-of-use backend dials that failed",
+                p.topup_failures(),
+            ),
+            (
+                "heliosdb_proxy_pool_handed_over_total",
+                "Released backend connections closed instead of parked so a session waiting for their node's or tenant's slot got it",
+                p.handed_over(),
+            ),
+        ] {
+            let _ = writeln!(
+                output,
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
+            );
+        }
+    }
+
+    /// Per tenant with pool settings of its own (W07).
+    fn push_tenant_pools_prometheus(
+        output: &mut String,
+        stats: &[crate::tenant_slots::TenantPoolStats],
+    ) {
+        use std::fmt::Write as _;
+        if stats.is_empty() {
+            return;
+        }
+        type Field = fn(&crate::tenant_slots::TenantPoolStats) -> Option<u64>;
+        let series: [(&str, &str, &str, Field); 6] = [
+            (
+                "heliosdb_proxy_tenant_pool_limit",
+                "gauge",
+                "The tenant's pool_max_connections",
+                |s| s.limit.map(|l| l as u64),
+            ),
+            (
+                "heliosdb_proxy_tenant_pool_in_use",
+                "gauge",
+                "Backend connections (in use and parked) holding the tenant's slots",
+                |s| s.in_use.map(|n| n as u64),
+            ),
+            (
+                "heliosdb_proxy_tenant_pool_waits_total",
+                "counter",
+                "Backend connections of the tenant that waited for a slot",
+                |s| Some(s.waits),
+            ),
+            (
+                "heliosdb_proxy_tenant_pool_refusals_total",
+                "counter",
+                "Requests of the tenant refused with 53300 at its pool_max_connections",
+                |s| Some(s.refusals),
+            ),
+            (
+                "heliosdb_proxy_tenant_pool_dials_total",
+                "counter",
+                "Backend connections opened for the tenant's sessions",
+                |s| Some(s.dials),
+            ),
+            (
+                "heliosdb_proxy_tenant_pool_checkouts_total",
+                "counter",
+                "Parked backend connections the tenant's sessions borrowed",
+                |s| Some(s.checkouts),
+            ),
+        ];
+        for (name, kind, help, field) in series {
+            let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
+            for s in stats {
+                if let Some(value) = field(s) {
+                    let tenant = Self::tenant_label(&s.tenant);
+                    let _ = writeln!(output, "{name}{{tenant=\"{tenant}\"}} {value}");
+                }
+            }
+        }
+    }
+
     /// Append the per-tenant request budgets (ac858d61400b), labelled by
     /// tenant id like the client caps: the active-query series for tenants
     /// with an active-query cap, the replay series for tenants with a
@@ -3839,8 +3996,11 @@ impl AdminServer {
 
 impl AdminState {
     /// Create new admin state
+    #[allow(deprecated)] // `pool_manager`, kept for 3.0 compatibility
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "pool-modes")]
+            pool_manager: RwLock::new(None),
             node_health: RwLock::new(HashMap::new()),
             metrics: RwLock::new(ServerMetricsSnapshot {
                 connections_accepted: 0,
@@ -3889,8 +4049,6 @@ impl AdminState {
             proxy_config: RwLock::new(None),
             read_lb_counter: AtomicUsize::new(0),
             commands: RwLock::new(HashMap::new()),
-            #[cfg(feature = "pool-modes")]
-            pool_manager: RwLock::new(None),
             #[cfg(feature = "circuit-breaker")]
             circuit_breaker: RwLock::new(None),
             replay_engine: RwLock::new(None),
@@ -3941,17 +4099,23 @@ impl AdminState {
         *self.branch.write().await = Some(cfg);
     }
 
-    /// Attach the connection pool manager so `/api/pools` reports real
-    /// per-node pool statistics. Wired by the server at startup.
+    /// Attach the data-path idle backend pool so `/pools` and `/api/stats`
+    /// report its connections and counters. Wired by the server at startup
+    /// in transaction and statement pooling modes.
     #[cfg(feature = "pool-modes")]
+    /// Before 3.1 this attached the connection pool manager `GET /pools`
+    /// reported; that manager served no session. Kept for compatibility: it
+    /// is stored and nothing reads it.
+    #[cfg(feature = "pool-modes")]
+    #[deprecated(
+        since = "3.1.0",
+        note = "unused; `GET /pools` reports the data-path pool"
+    )]
+    #[allow(deprecated)]
     pub async fn with_pool_manager(&self, manager: Arc<crate::pool::ConnectionPoolManager>) {
         *self.pool_manager.write().await = Some(manager);
     }
 
-    /// Attach the data-path idle backend pool so `/api/stats` reports its
-    /// counters. Wired by the server at startup in transaction and statement
-    /// pooling modes.
-    #[cfg(feature = "pool-modes")]
     pub async fn with_backend_pool(&self, pool: Arc<crate::pool::BackendIdlePool>) {
         *self.backend_pool.write().await = Some(pool);
     }
@@ -4610,11 +4774,19 @@ struct AuthoritativeTopology {
 #[derive(Serialize)]
 struct PoolStatsResponse {
     node: String,
+    /// Backend connections serving sessions now.
     active_connections: u64,
+    /// Backend connections parked in the data-path pool now.
     idle_connections: u64,
+    /// Sessions waiting for a slot on the node's cap now.
     pending_requests: u64,
+    /// Backend connections opened to the node since startup.
     total_connections_created: u64,
+    /// Backend connections to the node closed since startup.
     total_connections_closed: u64,
+    /// The node's cap (`[[nodes]] max_connections`, else `[pool]
+    /// max_connections`); `null` = unlimited.
+    max_connections: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -4829,6 +5001,126 @@ mod tests {
         let text = body["text"].as_str().unwrap();
         assert!(text.contains("heliosdb_proxy_tenant_active_query_limit{tenant=\"acme\"} 2\n"));
         assert!(text.contains("heliosdb_proxy_tenant_replay_byte_limit{tenant=\"acme\"} 1000\n"));
+    }
+
+    /// W02 `GET /pools`: every node the proxy knows, from its node slots
+    /// (in use and parked, waiting, opened and closed since startup, the
+    /// cap) and the data-path pool (parked); `/metrics` and the Prometheus
+    /// text carry the pool's counters.
+    #[cfg(feature = "pool-modes")]
+    #[tokio::test]
+    async fn pools_report_every_node_from_its_slots_and_the_idle_pool() {
+        let mut config = crate::config::ProxyConfig::default();
+        config.add_node("a:5432", "primary").unwrap();
+        config.add_node("b:5432", "standby").unwrap();
+        config.nodes[0].max_connections = 4;
+        let slots = Arc::new(crate::node_slots::NodeSlots::from_config(&config));
+        let idle = Arc::new(crate::pool::BackendIdlePool::new(4, 16));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (parked, _peer) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let in_use = slots.try_acquire("a:5432").expect("free");
+        let closed = slots.try_acquire("a:5432").expect("free");
+        drop(closed);
+        assert!(idle.checkin_conn_capped(
+            &crate::pool::pool_key("a:5432", "u", "d"),
+            crate::pool::PooledConn {
+                slot: slots.try_acquire("a:5432").expect("free"),
+                ..crate::pool::PooledConn::fresh(parked.unwrap())
+            },
+            4,
+        ));
+        let state = Arc::new(AdminState::new());
+        state.with_node_slots(Arc::clone(&slots)).await;
+        state.with_backend_pool(Arc::clone(&idle)).await;
+        let (status, json) = AdminServer::route_request("GET", "/pools", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "node": "a:5432",
+                    "active_connections": 1,
+                    "idle_connections": 1,
+                    "pending_requests": 0,
+                    "total_connections_created": 3,
+                    "total_connections_closed": 1,
+                    "max_connections": 4
+                },
+                {
+                    "node": "b:5432",
+                    "active_connections": 0,
+                    "idle_connections": 0,
+                    "pending_requests": 0,
+                    "total_connections_created": 0,
+                    "total_connections_closed": 0,
+                    "max_connections": null
+                }
+            ])
+        );
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(json["backend_pool"]["idle"], 1);
+        assert_eq!(json["backend_pool"]["parked"], 1);
+        assert_eq!(json["backend_pool"]["handed_over"], 0);
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        for line in [
+            "heliosdb_proxy_pool_idle_connections 1\n",
+            "# TYPE heliosdb_proxy_pool_lifetime_expired_total counter\n",
+            "heliosdb_proxy_pool_acquire_timeouts_total 0\n",
+            "heliosdb_proxy_pool_stale_lease_redials_total 0\n",
+            "heliosdb_proxy_pool_topped_up_total 0\n",
+            "heliosdb_proxy_pool_handed_over_total 0\n",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+        drop(in_use);
+        // Without node slots (nothing attached) the list is empty.
+        let bare = Arc::new(AdminState::new());
+        let (_, json) = AdminServer::route_request("GET", "/pools", None, &bare)
+            .await
+            .unwrap();
+        assert_eq!(json, serde_json::json!([]));
+    }
+
+    /// W07: the per-tenant pool series, labelled and escaped like the other
+    /// tenant series; a cap-less pool has no limit or in-use rows.
+    #[test]
+    fn tenant_pool_metrics_are_labelled() {
+        let mut out = String::new();
+        AdminServer::push_tenant_pools_prometheus(&mut out, &[]);
+        assert!(out.is_empty());
+        let row = |tenant: &str, limit: Option<usize>| crate::tenant_slots::TenantPoolStats {
+            tenant: tenant.into(),
+            limit,
+            in_use: limit.map(|_| 1),
+            waiting: 0,
+            waits: 2,
+            refusals: 1,
+            dials: 5,
+            checkouts: 7,
+        };
+        AdminServer::push_tenant_pools_prometheus(
+            &mut out,
+            &[row("a\"b", Some(3)), row("idle_only", None)],
+        );
+        for line in [
+            "heliosdb_proxy_tenant_pool_limit{tenant=\"a\\\"b\"} 3\n",
+            "heliosdb_proxy_tenant_pool_in_use{tenant=\"a\\\"b\"} 1\n",
+            "heliosdb_proxy_tenant_pool_waits_total{tenant=\"idle_only\"} 2\n",
+            "heliosdb_proxy_tenant_pool_refusals_total{tenant=\"idle_only\"} 1\n",
+            "heliosdb_proxy_tenant_pool_dials_total{tenant=\"idle_only\"} 5\n",
+            "heliosdb_proxy_tenant_pool_checkouts_total{tenant=\"idle_only\"} 7\n",
+        ] {
+            assert!(out.contains(line), "{line} missing from {out}");
+        }
+        assert!(!out.contains("heliosdb_proxy_tenant_pool_limit{tenant=\"idle_only\"}"));
     }
 
     #[test]

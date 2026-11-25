@@ -55,8 +55,47 @@ impl ProxyServer {
     /// `tenant_header`: that gateway has no per-request tenant identity, so
     /// its requests are not tenant-filtered. Refused under `strict_config`; a
     /// loud warning otherwise. A gateway with a `tenant_header` filters every
-    /// request for the tenant it names (H-06).
+    /// request for the tenant it names (H-06), so it is refused at startup
+    /// while a tenant uses schema, database or branch isolation (W07).
     pub(super) fn check_gateway_tenancy(config: &ProxyConfig) -> Result<()> {
+        // W07: a gateway runs every request on its own backend database and
+        // search_path, so it can serve a tenant only by its row filter; one
+        // with a `tenant_header` would run a schema-, database- or
+        // branch-isolated tenant's requests outside its isolation.
+        let isolated: Vec<&str> = config
+            .multi_tenancy
+            .tenant_settings
+            .iter()
+            .filter(|t| t.isolation != crate::config::TenantIsolation::Row)
+            .map(|t| t.id.as_str())
+            .collect();
+        let attributed: Vec<&str> = [
+            (
+                "http_gateway",
+                config.http_gateway.enabled && !config.http_gateway.tenant_header.is_empty(),
+            ),
+            (
+                "graphql_gateway",
+                config.graphql_gateway.enabled && !config.graphql_gateway.tenant_header.is_empty(),
+            ),
+            (
+                "mcp",
+                config.mcp.enabled && !config.mcp.tenant_header.is_empty(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect();
+        if config.multi_tenancy.enabled && !isolated.is_empty() && !attributed.is_empty() {
+            return Err(ProxyError::Config(format!(
+                "[multi_tenancy] tenants {} use schema, database or branch isolation, which {} \
+                 (with a tenant_header) cannot apply: a gateway runs every request on its own \
+                 backend database and search_path. Isolate those tenants by row, or remove the \
+                 gateways' tenant_header",
+                isolated.join(", "),
+                attributed.join(", ")
+            )));
+        }
         let gateways: Vec<&str> = [
             (
                 "http_gateway",

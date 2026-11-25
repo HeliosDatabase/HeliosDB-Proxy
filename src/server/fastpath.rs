@@ -131,6 +131,55 @@ impl ProxyServer {
             fault,
             continues_cycle,
         } = fwd;
+        // Sent once more on a fresh connection when a stale unprobed lease
+        // refused it, answered with 53300 when no connection could be had
+        // (see `forward_simple_query`).
+        let mut retried = false;
+        loop {
+            let sent = Self::forward_function_call_once(
+                ForwardCtx {
+                    client: &mut *client,
+                    conns: &mut *conns,
+                    current_node,
+                    reads,
+                    session,
+                    state,
+                    config,
+                    fault: &mut *fault,
+                    continues_cycle,
+                },
+                msg,
+            )
+            .await;
+            match sent {
+                Err(_) if !retried && Self::retry_stale_lease(session, fault) => retried = true,
+                Err(e) => {
+                    return match Self::answer_no_connection(&e, fault, client, session, true).await
+                    {
+                        Some(answered) => answered,
+                        None => Err(e),
+                    };
+                }
+                ok => return ok,
+            }
+        }
+    }
+
+    async fn forward_function_call_once(
+        fwd: ForwardCtx<'_>,
+        msg: &Message,
+    ) -> Result<(Option<String>, u64)> {
+        let ForwardCtx {
+            client,
+            conns,
+            current_node,
+            reads,
+            session,
+            state,
+            config,
+            fault,
+            continues_cycle,
+        } = fwd;
         let class = FunctionCallClass::of_message(config.function_call, msg);
         if class == FunctionCallClass::Refused {
             let reason = match config.function_call {
@@ -234,11 +283,13 @@ impl ProxyServer {
         };
         if let Some(msg) = backend_err {
             let e = ProxyError::Network(msg);
-            Self::record_backend_failure(state, &target, &e.to_string());
+            Self::send_failed(conns, &target, &e, session, state);
             BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
             Self::drop_undelivered(conns, &target, continues_cycle.is_some(), session, state).await;
             return Err(e);
         }
+        let backend = conns.get_mut(&target).expect("just written");
+        backend.unprobed = false;
 
         // Delivered: the journal has no text to run again.
         session.tr_replay_tainted.store(true, Ordering::Relaxed);

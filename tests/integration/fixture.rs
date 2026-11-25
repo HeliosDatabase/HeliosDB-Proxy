@@ -3,9 +3,7 @@
 //! `start_proxy()` — single-node proxy; returns `None` when `HELIOS_TEST_PG_HOST` unset.
 //! `start_proxy_ha()` — two-node (primary + standby) proxy; also needs `HELIOS_TEST_STANDBY_HOST`.
 
-use heliosdb_proxy::config::{
-    LoadBalancerConfig, NodeConfig, NodeRole, PoolConfig, ProxyConfig, Strategy,
-};
+use heliosdb_proxy::config::{LoadBalancerConfig, NodeConfig, NodeRole, ProxyConfig, Strategy};
 use heliosdb_proxy::server::ProxyServer;
 use std::time::Duration;
 use tokio::task::AbortHandle;
@@ -211,15 +209,9 @@ pub async fn start_proxy_with(customize: impl FnOnce(&mut ProxyConfig)) -> Optio
         admin_address: format!("127.0.0.1:{}", admin_port),
         tr_enabled: false,
         nodes: vec![primary_node],
-        pool: PoolConfig {
-            min_connections: 1,
-            max_connections: 5,
-            ..Default::default()
-        },
         load_balancer: LoadBalancerConfig {
             read_strategy: Strategy::RoundRobin,
             read_write_split: false,
-            latency_threshold_ms: 500,
             ..Default::default()
         },
         // Disable optional subsystems that need real configuration
@@ -292,15 +284,9 @@ pub async fn start_proxy_ha() -> Option<HaFixture> {
         admin_address: format!("127.0.0.1:{}", admin_port),
         tr_enabled: false,
         nodes: vec![primary_node, standby_node],
-        pool: PoolConfig {
-            min_connections: 1,
-            max_connections: 5,
-            ..Default::default()
-        },
         load_balancer: LoadBalancerConfig {
             read_strategy: Strategy::RoundRobin,
             read_write_split: true,
-            latency_threshold_ms: 500,
             ..Default::default()
         },
         ..Default::default()

@@ -164,6 +164,10 @@ struct BackendCtl {
     stall_cancels: std::sync::atomic::AtomicBool,
     /// The `database` parameter of each startup packet, in order.
     startup_databases: StdMutex<Vec<String>>,
+    /// Every parameter of each startup packet, in order.
+    startup_params: StdMutex<Vec<HashMap<String, String>>>,
+    /// A killed connection is reset (RST) instead of closed (FIN).
+    reset_on_kill: std::sync::atomic::AtomicBool,
 }
 
 /// What a fake backend connection is doing besides answering messages.
@@ -252,6 +256,11 @@ impl FakeBackend {
         self.ctl.startup_databases.lock().unwrap().clone()
     }
 
+    /// The parameters of each connection's startup packet, in order.
+    fn startup_params(&self) -> Vec<HashMap<String, String>> {
+        self.ctl.startup_params.lock().unwrap().clone()
+    }
+
     /// Every connection reports the BackendKeyData `key`.
     async fn start_shared_key(key: (u32, u32)) -> Self {
         Self::launch(None, Some(key)).await
@@ -270,6 +279,8 @@ impl FakeBackend {
             shared_key,
             stall_cancels: std::sync::atomic::AtomicBool::new(false),
             startup_databases: StdMutex::new(Vec::new()),
+            startup_params: StdMutex::new(Vec::new()),
+            reset_on_kill: std::sync::atomic::AtomicBool::new(false),
         });
         let accept_ctl = Arc::clone(&ctl);
         tokio::spawn(async move {
@@ -318,6 +329,17 @@ impl FakeBackend {
                         .map(|v| String::from_utf8_lossy(v).into_owned())
                         .unwrap_or_default();
                     ctl.startup_databases.lock().unwrap().push(database);
+                    let params = fields
+                        .chunks(2)
+                        .filter(|kv| kv.len() == 2 && !kv[0].is_empty())
+                        .map(|kv| {
+                            (
+                                String::from_utf8_lossy(kv[0]).into_owned(),
+                                String::from_utf8_lossy(kv[1]).into_owned(),
+                            )
+                        })
+                        .collect();
+                    ctl.startup_params.lock().unwrap().push(params);
                     break;
                 }
             }
@@ -350,7 +372,12 @@ impl FakeBackend {
             let mut header = [0u8; 5];
             tokio::select! {
                 r = sock.read_exact(&mut header) => if r.is_err() { return },
-                _ = kill.notified() => return,
+                _ = kill.notified() => {
+                    if ctl.reset_on_kill.load(Ordering::Relaxed) {
+                        let _ = socket2::SockRef::from(&sock).set_linger(Some(Duration::ZERO));
+                    }
+                    return;
+                }
             }
             let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
             let mut body = vec![0u8; len - 4];
@@ -8003,7 +8030,10 @@ mod plugin_cached;
 mod plugin_context;
 #[cfg(feature = "wasm-plugins")]
 mod plugin_reload;
+#[cfg(feature = "pool-modes")]
+mod pool_keys;
 mod routing_targets;
 mod session_bound;
 mod shutdown_drain;
 mod statement_pooling;
+mod tenant_isolation;

@@ -40,18 +40,79 @@ pub enum PoolingMode {
     Statement,
 }
 
-/// Prepared statement handling mode
+/// Prepared statement handling mode (`[pool_mode] prepared_statement_mode`).
+///
+/// In session pooling a session keeps its backend connection, so its
+/// prepared statements stay where it made them (`named`, the only value
+/// that mode accepts). In transaction and statement pooling (`track` by
+/// default, or `disable`) the proxy decides what happens to them across the
+/// connections the session borrows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PreparedStatementMode {
-    /// Disable prepared statements
+    /// Pooled modes: a named protocol-level `Parse` and a SQL `PREPARE` are
+    /// refused (0A000); unnamed statements work as usual.
     #[default]
     Disable,
-    /// Track and recreate on new connections
+    /// Pooled modes: named protocol-level statements and SQL `PREPARE`d
+    /// statements are tracked per session and prepared again on any
+    /// connection that runs them without having them.
     Track,
-    /// Use protocol-level named statements
+    /// Session mode: prepared statements live on the session's own
+    /// connection (and are prepared again after a transaction-replay
+    /// re-home).
     Named,
 }
+
+// -----------------------------------------------------------------------------
+// Defaults of the `[pool]`, `[pool_mode]` and `[load_balancer]` keys that
+// shape the data-path pool (W02). One constant per key, so a default is
+// changed in exactly one place; each reproduces the behaviour the proxy had
+// before the key took effect.
+// -----------------------------------------------------------------------------
+
+/// `[pool] min_connections`: no per-node floor.
+pub const DEFAULT_POOL_MIN_CONNECTIONS: usize = 0;
+/// `[pool] max_connections`: no per-node cap (a `[[nodes]] max_connections`
+/// still caps its node).
+pub const DEFAULT_POOL_MAX_CONNECTIONS: usize = 0;
+/// `[pool] idle_timeout_secs`: off (`[pool_mode] idle_timeout_secs` alone sets
+/// the idle TTL).
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 0;
+/// `[pool] max_lifetime_secs`: off.
+pub const DEFAULT_POOL_MAX_LIFETIME_SECS: u64 = 0;
+/// `[pool] acquire_timeout_secs`: the backend connect timeout and the bound
+/// on retrying a backend that refuses with 53300.
+pub const DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+/// `[pool] test_on_acquire`: every pooled connection is probed at checkout.
+pub const DEFAULT_POOL_TEST_ON_ACQUIRE: bool = true;
+/// `[pool_mode] max_pool_size`: idle connections parked per identity.
+pub const DEFAULT_POOL_MODE_MAX_POOL_SIZE: u32 = 100;
+/// `[pool_mode] min_idle`: no idle connections are opened ahead of use.
+pub const DEFAULT_POOL_MODE_MIN_IDLE: u32 = 0;
+/// `[pool_mode] idle_timeout_secs`: the idle reaper's TTL.
+pub const DEFAULT_POOL_MODE_IDLE_TIMEOUT_SECS: u64 = 600;
+/// `[pool_mode] max_lifetime_secs`: off.
+pub const DEFAULT_POOL_MODE_MAX_LIFETIME_SECS: u64 = 0;
+/// `[pool_mode] acquire_timeout_secs`: no overall deadline on the dial path.
+pub const DEFAULT_POOL_MODE_ACQUIRE_TIMEOUT_SECS: u64 = 0;
+/// `[pool_mode] prepared_statement_mode` when the key is absent in session
+/// pooling.
+pub const DEFAULT_SESSION_PREPARED_STATEMENT_MODE: PreparedStatementMode =
+    PreparedStatementMode::Named;
+/// `[pool_mode] prepared_statement_mode` when the key is absent in
+/// transaction or statement pooling.
+pub const DEFAULT_POOLED_PREPARED_STATEMENT_MODE: PreparedStatementMode =
+    PreparedStatementMode::Track;
+/// `[load_balancer] latency_threshold_ms`: off.
+pub const DEFAULT_LATENCY_THRESHOLD_MS: u64 = 0;
+/// `[load_balancer] latency_readmit_ratio`: a standby held out for latency
+/// serves reads again once its smoothed latency is below this fraction of
+/// `latency_threshold_ms`.
+pub const DEFAULT_LATENCY_READMIT_RATIO: f64 = 0.7;
+/// `[load_balancer] latency_smoothing`: weight of the newest health probe in
+/// a node's smoothed latency.
+pub const DEFAULT_LATENCY_SMOOTHING: f64 = 0.3;
 
 /// Pool mode configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,26 +120,40 @@ pub struct PoolModeConfig {
     /// Default pooling mode
     #[serde(default)]
     pub mode: PoolingMode,
-    /// Maximum connections per node
+    /// Most idle connections parked per `(node, user, database)` identity
+    /// (transaction / statement pooling).
     #[serde(default = "default_pool_mode_max_size")]
     pub max_pool_size: u32,
-    /// Minimum idle connections
+    /// Idle connections the pool keeps ready per identity it served
+    /// recently (transaction / statement pooling; needs a credential the
+    /// proxy holds, or a trust backend). `0` = none.
     #[serde(default = "default_pool_mode_min_idle")]
     pub min_idle: u32,
-    /// Idle timeout (seconds)
+    /// Idle timeout (seconds): a parked connection idle this long is closed.
+    /// `0` = never. With `[pool] idle_timeout_secs` also set, the smaller one
+    /// applies.
     #[serde(default = "default_pool_mode_idle_timeout")]
     pub idle_timeout_secs: u64,
-    /// Max connection lifetime (seconds)
+    /// A pooled connection older than this (seconds) is closed instead of
+    /// being parked or handed out again. `0` = no limit. With `[pool]
+    /// max_lifetime_secs` also set, the smaller one applies.
     #[serde(default = "default_pool_mode_max_lifetime")]
     pub max_lifetime_secs: u64,
-    /// Acquire timeout (seconds)
+    /// Overall deadline (seconds) on opening a backend connection for a
+    /// session in transaction / statement pooling: the node slot wait, the
+    /// reconnect permit, the connect and the authentication together. On
+    /// expiry the request is refused with 53300. `0` = no deadline beyond
+    /// the individual waits.
     #[serde(default = "default_pool_mode_acquire_timeout")]
     pub acquire_timeout_secs: u64,
     /// Reset query to run when returning connection to pool
     #[serde(default = "default_reset_query")]
     pub reset_query: String,
-    /// Prepared statement mode
-    #[serde(default)]
+    /// Prepared statement mode (default `named`). Transaction and statement
+    /// pooling give a session no backend connection of its own, so `named`
+    /// acts as `track` there
+    /// ([`Self::effective_prepared_statement_mode`]).
+    #[serde(default = "default_prepared_statement_mode")]
     pub prepared_statement_mode: PreparedStatementMode,
     /// Conditional reset (Transaction/Statement pooling): when true, a
     /// connection that provably touched no session state (no `SET`/GUC, temp
@@ -95,23 +170,27 @@ pub struct PoolModeConfig {
 }
 
 fn default_pool_mode_max_size() -> u32 {
-    100
+    DEFAULT_POOL_MODE_MAX_POOL_SIZE
 }
 
 fn default_pool_mode_min_idle() -> u32 {
-    10
+    DEFAULT_POOL_MODE_MIN_IDLE
 }
 
 fn default_pool_mode_idle_timeout() -> u64 {
-    600
+    DEFAULT_POOL_MODE_IDLE_TIMEOUT_SECS
 }
 
 fn default_pool_mode_max_lifetime() -> u64 {
-    3600
+    DEFAULT_POOL_MODE_MAX_LIFETIME_SECS
 }
 
 fn default_pool_mode_acquire_timeout() -> u64 {
-    5
+    DEFAULT_POOL_MODE_ACQUIRE_TIMEOUT_SECS
+}
+
+fn default_prepared_statement_mode() -> PreparedStatementMode {
+    DEFAULT_SESSION_PREPARED_STATEMENT_MODE
 }
 
 fn default_reset_query() -> String {
@@ -128,7 +207,7 @@ impl Default for PoolModeConfig {
             max_lifetime_secs: default_pool_mode_max_lifetime(),
             acquire_timeout_secs: default_pool_mode_acquire_timeout(),
             reset_query: default_reset_query(),
-            prepared_statement_mode: PreparedStatementMode::default(),
+            prepared_statement_mode: default_prepared_statement_mode(),
             skip_clean_reset: false,
         }
     }
@@ -153,12 +232,29 @@ impl PoolModeConfig {
         }
     }
 
-    /// Create config for statement mode
+    /// Create config for statement mode. Prepared statements are tracked
+    /// (before 3.1 the mode was not read, so `disable` here refused nothing).
     pub fn statement_mode() -> Self {
         Self {
             mode: PoolingMode::Statement,
-            prepared_statement_mode: PreparedStatementMode::Disable,
+            prepared_statement_mode: PreparedStatementMode::Track,
             ..Default::default()
+        }
+    }
+
+    /// Transaction or statement pooling: the data path lends backend
+    /// connections out of the shared idle pool.
+    pub fn pooled(&self) -> bool {
+        self.mode != PoolingMode::Session
+    }
+
+    /// The prepared-statement mode in effect: the configured one, except
+    /// that `named` acts as `track` in transaction / statement pooling, where
+    /// a session has no backend connection of its own to keep them on.
+    pub fn effective_prepared_statement_mode(&self) -> PreparedStatementMode {
+        match self.prepared_statement_mode {
+            PreparedStatementMode::Named if self.pooled() => DEFAULT_POOLED_PREPARED_STATEMENT_MODE,
+            mode => mode,
         }
     }
 
@@ -1900,8 +1996,29 @@ pub struct MultiTenancyToml {
     /// not a hard boundary: these functions can read tenant tables without the
     /// filter. Default: `DEFAULT_REFUSED_FUNCTIONS`. An empty list refuses none.
     pub refused_functions: Vec<String>,
-    /// Known tenant ids.
+    /// Known tenant ids (row isolation and the section's caps unless a
+    /// `tenant_settings` entry of the same id says otherwise).
     pub tenants: Vec<String>,
+    /// Per-tenant settings (3.1): a table naming a tenant's isolation, caps
+    /// and pool settings (`{ id = "acme", isolation = "schema",
+    /// pool_max_connections = 10 }`, see [`TenantSpec`]). Its id is a known
+    /// tenant whether or not `tenants` lists it.
+    pub tenant_settings: Vec<TenantSpec>,
+    /// How a schema-isolated tenant gets its `search_path`: `startup` (the
+    /// default) sends `-c search_path=<schema>` in the startup packet's
+    /// `options`, so `RESET`/`DISCARD ALL` return to it; `set_on_acquire`
+    /// runs `SET search_path` on every backend connection the session
+    /// opens or borrows from the pool, for a backend that ignores
+    /// `options` (one more round trip per pooled checkout).
+    pub schema_apply: SchemaApply,
+    /// Refuse (42501) a statement of a schema-isolated session that changes
+    /// its `search_path`: `SET`/`SET SCHEMA`, `set_config('search_path',
+    /// ...)`, and with `schema_apply = "set_on_acquire"` also `RESET
+    /// search_path`, `RESET ALL` and `DISCARD ALL`. `search_path` only picks
+    /// the default schema: a schema-qualified name reaches any schema the
+    /// role may use, so backend grants or row security remain the boundary.
+    /// Default `true`.
+    pub lock_search_path: bool,
     /// Most client sessions one known tenant may hold on this proxy at once
     /// (H-05). A tenant at its cap waits up to `[limits]
     /// client_admission_wait_secs` for one of its own sessions to end, then is
@@ -1974,6 +2091,257 @@ pub enum UnknownTenantPolicy {
     Passthrough,
 }
 
+/// How a tenant's sessions are kept apart from other tenants'
+/// (`[[multi_tenancy.tenant_settings]] isolation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TenantIsolation {
+    /// Shared tables, with the tenant's row filter injected into statements
+    /// on `tenant_tables`.
+    #[default]
+    Row,
+    /// A schema of its own: the session's `search_path` is the tenant's
+    /// schema (`schema_apply`).
+    Schema,
+    /// A database of its own: the session connects to the tenant's database
+    /// whatever database the client named.
+    Database,
+    /// A branch of its own: the session connects to `<database>@<branch>`
+    /// (`[branch] route_mode = "nano"`) or to the branch's database
+    /// (`"database"`).
+    Branch,
+}
+
+/// The `[multi_tenancy] schema_apply` setting (see [`MultiTenancyToml`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaApply {
+    /// `-c search_path=<schema>` in the startup packet's `options`.
+    #[default]
+    Startup,
+    /// `SET search_path` on every backend connection the session acquires.
+    SetOnAcquire,
+}
+
+/// One `[multi_tenancy] tenants` entry: either a tenant id (`"acme"`: row
+/// isolation and the section's caps), or a table with an `id` and the
+/// tenant's own settings. A setting left out falls back to the
+/// `tenant_max_*` maps, then to the section-wide value.
+///
+/// `Deserialize` is written by hand (a string or a table), not as an
+/// untagged enum, so `serde_ignored` still reports a typo inside a table
+/// (`multi_tenancy.tenant_settings.0.isolaton`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TenantSpec {
+    /// The tenant id, as the identifying startup parameter carries it.
+    pub id: String,
+    /// How the tenant is isolated. Default `row`.
+    pub isolation: TenantIsolation,
+    /// `isolation = "schema"`: the tenant's schema. Default: the id.
+    pub schema: Option<String>,
+    /// `isolation = "database"`: the tenant's database. Default: the id.
+    pub database: Option<String>,
+    /// `isolation = "branch"`: the tenant's branch. Default: the id.
+    pub branch: Option<String>,
+    /// The tenant's client-session cap (else `tenant_max_clients`, else
+    /// `max_clients_per_tenant`).
+    pub max_clients: Option<usize>,
+    /// The tenant's active-query cap (else `tenant_max_active_queries`, else
+    /// `max_active_queries_per_tenant`).
+    pub max_active_queries: Option<usize>,
+    /// The tenant's replay-byte budget (else `tenant_max_replay_bytes`, else
+    /// `max_replay_bytes_per_tenant`).
+    pub max_replay_bytes: Option<usize>,
+    /// The tenant's recovery-journal budget (else `tenant_max_journal_bytes`,
+    /// else `max_journal_bytes_per_tenant`).
+    pub max_journal_bytes: Option<usize>,
+    /// Most idle connections parked per identity for this tenant (else
+    /// `[pool_mode] max_pool_size`). Its connections are pooled apart from
+    /// other tenants'. Transaction / statement pooling only.
+    pub pool_max_idle: Option<usize>,
+    /// Most backend connections (in use and parked) this tenant's sessions
+    /// hold at once. A full tenant first gives up one of its idle pooled
+    /// connections, then waits up to `[limits] backend_slot_wait_ms`, then
+    /// is refused with 53300. Its connections are pooled apart from other
+    /// tenants'.
+    pub pool_max_connections: Option<usize>,
+}
+
+/// The table form of [`TenantSpec`], as serde reads and writes it.
+#[derive(Serialize, Deserialize)]
+struct TenantTable {
+    id: String,
+    #[serde(default)]
+    isolation: TenantIsolation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    database: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_clients: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_active_queries: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_replay_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_journal_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_max_idle: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_max_connections: Option<usize>,
+}
+
+impl From<TenantTable> for TenantSpec {
+    fn from(t: TenantTable) -> Self {
+        Self {
+            id: t.id,
+            isolation: t.isolation,
+            schema: t.schema,
+            database: t.database,
+            branch: t.branch,
+            max_clients: t.max_clients,
+            max_active_queries: t.max_active_queries,
+            max_replay_bytes: t.max_replay_bytes,
+            max_journal_bytes: t.max_journal_bytes,
+            pool_max_idle: t.pool_max_idle,
+            pool_max_connections: t.pool_max_connections,
+        }
+    }
+}
+
+impl From<&TenantSpec> for TenantTable {
+    fn from(t: &TenantSpec) -> Self {
+        Self {
+            id: t.id.clone(),
+            isolation: t.isolation,
+            schema: t.schema.clone(),
+            database: t.database.clone(),
+            branch: t.branch.clone(),
+            max_clients: t.max_clients,
+            max_active_queries: t.max_active_queries,
+            max_replay_bytes: t.max_replay_bytes,
+            max_journal_bytes: t.max_journal_bytes,
+            pool_max_idle: t.pool_max_idle,
+            pool_max_connections: t.pool_max_connections,
+        }
+    }
+}
+
+impl From<&str> for TenantSpec {
+    fn from(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+impl From<String> for TenantSpec {
+    fn from(id: String) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
+    }
+}
+
+impl Serialize for TenantSpec {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        // An entry with nothing but its id round-trips as the short form.
+        if *self == TenantSpec::from(self.id.as_str()) {
+            serializer.serialize_str(&self.id)
+        } else {
+            TenantTable::from(self).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TenantSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct SpecVisitor;
+        impl<'de> serde::de::Visitor<'de> for SpecVisitor {
+            type Value = TenantSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tenant id, or a table with an `id`")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                id: &str,
+            ) -> std::result::Result<TenantSpec, E> {
+                Ok(TenantSpec::from(id))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<TenantSpec, A::Error> {
+                // The map access is the one `serde_ignored` wrapped, so the
+                // table's unknown keys are reported with their full path.
+                TenantTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(TenantSpec::from)
+            }
+        }
+        deserializer.deserialize_any(SpecVisitor)
+    }
+}
+
+impl TenantSpec {
+    /// The schema of a schema-isolated tenant (default: its id).
+    pub fn schema_name(&self) -> &str {
+        self.schema.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The database of a database-isolated tenant (default: its id).
+    pub fn database_name(&self) -> &str {
+        self.database.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The branch of a branch-isolated tenant (default: its id).
+    pub fn branch_name(&self) -> &str {
+        self.branch.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The tenant's connections are pooled apart from other tenants' (it has
+    /// pool settings of its own).
+    pub fn has_own_pool(&self) -> bool {
+        self.pool_max_idle.is_some() || self.pool_max_connections.is_some()
+    }
+
+    /// This entry without its caps and budgets: what a SIGHUP cannot change.
+    fn without_caps(&self) -> Self {
+        Self {
+            max_clients: None,
+            max_active_queries: None,
+            max_replay_bytes: None,
+            max_journal_bytes: None,
+            pool_max_idle: None,
+            pool_max_connections: None,
+            ..self.clone()
+        }
+    }
+}
+
+/// A schema name a tenant may be given: a plain identifier
+/// (`[A-Za-z_][A-Za-z0-9_$]*`, at most 63 bytes). The proxy double-quotes it
+/// in `search_path`, so its case is kept as written.
+pub fn valid_tenant_schema(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 63
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 /// The functions refused by default under row isolation
 /// (`[multi_tenancy] refused_functions`): XML export of tables, queries,
 /// cursors, schemas and databases; dblink; large-object import and export;
@@ -2016,6 +2384,9 @@ impl Default for MultiTenancyToml {
                 .map(|f| f.to_string())
                 .collect(),
             tenants: Vec::new(),
+            tenant_settings: Vec::new(),
+            schema_apply: SchemaApply::Startup,
+            lock_search_path: true,
             max_clients_per_tenant: 0,
             tenant_max_clients: std::collections::BTreeMap::new(),
             max_active_queries_per_tenant: 0,
@@ -2032,13 +2403,18 @@ impl Default for MultiTenancyToml {
 }
 
 impl MultiTenancyToml {
-    /// This section with every per-tenant cap and byte budget at its
-    /// default: what is left is what a SIGHUP cannot change. Two sections
-    /// equal here differ at most in the caps a reload may resize
+    /// This section with every per-tenant cap, byte budget and pool cap at
+    /// its default: what is left is what a SIGHUP cannot change. Two
+    /// sections equal here differ at most in the caps a reload may resize
     /// (`tenant_slots::TenantSlots::reload_caps`).
     pub fn without_caps(&self) -> Self {
         let defaults = Self::default();
         Self {
+            tenant_settings: self
+                .tenant_settings
+                .iter()
+                .map(TenantSpec::without_caps)
+                .collect(),
             max_clients_per_tenant: defaults.max_clients_per_tenant,
             tenant_max_clients: defaults.tenant_max_clients,
             max_active_queries_per_tenant: defaults.max_active_queries_per_tenant,
@@ -2051,42 +2427,278 @@ impl MultiTenancyToml {
         }
     }
 
-    /// The client-session cap of a known tenant (H-05): its
-    /// `tenant_max_clients` override, else `max_clients_per_tenant`; 0 = none.
+    /// The ids of the known tenants, in configuration order.
+    pub fn tenant_ids(&self) -> impl Iterator<Item = &str> {
+        let mut seen = std::collections::HashSet::new();
+        self.tenants
+            .iter()
+            .map(String::as_str)
+            .chain(self.tenant_settings.iter().map(|t| t.id.as_str()))
+            .filter(move |id| seen.insert(*id))
+    }
+
+    /// Whether `tenant` is a known tenant id.
+    pub fn knows(&self, tenant: &str) -> bool {
+        self.tenants.iter().any(|t| t == tenant) || self.spec(tenant).is_some()
+    }
+
+    /// The entry of the known tenant `tenant`.
+    pub fn spec(&self, tenant: &str) -> Option<&TenantSpec> {
+        self.tenant_settings.iter().find(|t| t.id == tenant)
+    }
+
+    /// Every known tenant once, in order: the `tenants` ids (with their
+    /// `tenant_settings` entry when there is one), then the
+    /// `tenant_settings` entries `tenants` does not list.
+    pub fn tenant_list(&self) -> Vec<TenantSpec> {
+        let mut seen = std::collections::HashSet::with_capacity(
+            self.tenants.len() + self.tenant_settings.len(),
+        );
+        let mut out = Vec::with_capacity(self.tenants.len() + self.tenant_settings.len());
+        for id in &self.tenants {
+            if seen.insert(id.as_str()) {
+                out.push(
+                    self.spec(id)
+                        .cloned()
+                        .unwrap_or_else(|| TenantSpec::from(id.as_str())),
+                );
+            }
+        }
+        for spec in &self.tenant_settings {
+            if seen.insert(spec.id.as_str()) {
+                out.push(spec.clone());
+            }
+        }
+        out
+    }
+
+    /// A tenant uses an isolation other than `row`.
+    pub fn has_non_row_tenants(&self) -> bool {
+        self.tenant_settings
+            .iter()
+            .any(|t| t.isolation != TenantIsolation::Row)
+    }
+
+    /// The client-session cap of a known tenant (H-05): its entry's
+    /// `max_clients`, else its `tenant_max_clients` override, else
+    /// `max_clients_per_tenant`; 0 = none.
     pub fn client_cap(&self, tenant: &str) -> usize {
-        self.tenant_max_clients
-            .get(tenant)
-            .copied()
+        self.spec(tenant)
+            .and_then(|s| s.max_clients)
+            .or_else(|| self.tenant_max_clients.get(tenant).copied())
             .unwrap_or(self.max_clients_per_tenant)
     }
 
-    /// The active-query cap of a known tenant (ac858d61400b): its
-    /// `tenant_max_active_queries` override, else
-    /// `max_active_queries_per_tenant`; 0 = none.
+    /// The active-query cap of a known tenant (ac858d61400b): its entry's
+    /// `max_active_queries`, else its `tenant_max_active_queries` override,
+    /// else `max_active_queries_per_tenant`; 0 = none.
     pub fn active_query_cap(&self, tenant: &str) -> usize {
-        self.tenant_max_active_queries
-            .get(tenant)
-            .copied()
+        self.spec(tenant)
+            .and_then(|s| s.max_active_queries)
+            .or_else(|| self.tenant_max_active_queries.get(tenant).copied())
             .unwrap_or(self.max_active_queries_per_tenant)
     }
 
-    /// The replay-byte budget of a known tenant (ac858d61400b): its
-    /// `tenant_max_replay_bytes` override, else `max_replay_bytes_per_tenant`;
-    /// 0 = none.
+    /// The replay-byte budget of a known tenant (ac858d61400b): its entry's
+    /// `max_replay_bytes`, else its `tenant_max_replay_bytes` override, else
+    /// `max_replay_bytes_per_tenant`; 0 = none.
     pub fn replay_byte_cap(&self, tenant: &str) -> usize {
-        self.tenant_max_replay_bytes
-            .get(tenant)
-            .copied()
+        self.spec(tenant)
+            .and_then(|s| s.max_replay_bytes)
+            .or_else(|| self.tenant_max_replay_bytes.get(tenant).copied())
             .unwrap_or(self.max_replay_bytes_per_tenant)
     }
 
-    /// The recovery-journal memory budget of a known tenant; zero is
-    /// unlimited.
+    /// The recovery-journal memory budget of a known tenant: its entry's
+    /// `max_journal_bytes`, else its `tenant_max_journal_bytes` override,
+    /// else `max_journal_bytes_per_tenant`; zero is unlimited.
     pub fn journal_byte_cap(&self, tenant: &str) -> usize {
-        self.tenant_max_journal_bytes
-            .get(tenant)
-            .copied()
+        self.spec(tenant)
+            .and_then(|s| s.max_journal_bytes)
+            .or_else(|| self.tenant_max_journal_bytes.get(tenant).copied())
             .unwrap_or(self.max_journal_bytes_per_tenant)
+    }
+
+    /// The backend-connection cap of a known tenant (its entry's
+    /// `pool_max_connections`); 0 = none.
+    pub fn pool_connection_cap(&self, tenant: &str) -> usize {
+        self.spec(tenant)
+            .and_then(|s| s.pool_max_connections)
+            .unwrap_or(0)
+    }
+
+    /// The idle-connection cap per identity of a known tenant (its entry's
+    /// `pool_max_idle`); 0 = `[pool_mode] max_pool_size`.
+    pub fn pool_idle_cap(&self, tenant: &str) -> usize {
+        self.spec(tenant).and_then(|s| s.pool_max_idle).unwrap_or(0)
+    }
+
+    /// `[multi_tenancy]` validation (W07): tenant entries, where each cap is
+    /// set, isolation settings and the identity non-row isolation needs.
+    fn validate(&self, config: &ProxyConfig) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        // `tenants` ids: 3.0 accepted any spelling and repeats, so these are
+        // warned about, not refused.
+        let mut ids = std::collections::BTreeSet::new();
+        for id in &self.tenants {
+            if id.is_empty() || id.contains(['\0', '\\']) {
+                tracing::warn!(
+                    "multi_tenancy.tenants: tenant id {id:?} is empty or contains a NUL byte or a \
+                     backslash; no client can be identified as it"
+                );
+            }
+            if !ids.insert(id.as_str()) {
+                tracing::warn!("multi_tenancy.tenants: tenant {id:?} is listed twice");
+            }
+        }
+        for t in &self.tenant_settings {
+            if t.id.is_empty() {
+                return Err(ProxyError::Config(
+                    "multi_tenancy.tenant_settings: a tenant id must not be empty".to_string(),
+                ));
+            }
+            if t.id.contains(['\0', '\\']) {
+                return Err(ProxyError::Config(format!(
+                    "multi_tenancy.tenant_settings: tenant id {:?} contains a NUL byte or a backslash",
+                    t.id
+                )));
+            }
+            if !seen.insert(t.id.as_str()) {
+                return Err(ProxyError::Config(format!(
+                    "multi_tenancy.tenant_settings: tenant {:?} is listed twice",
+                    t.id
+                )));
+            }
+            for (key, entry, map) in [
+                ("max_clients", t.max_clients, &self.tenant_max_clients),
+                (
+                    "max_active_queries",
+                    t.max_active_queries,
+                    &self.tenant_max_active_queries,
+                ),
+                (
+                    "max_replay_bytes",
+                    t.max_replay_bytes,
+                    &self.tenant_max_replay_bytes,
+                ),
+                (
+                    "max_journal_bytes",
+                    t.max_journal_bytes,
+                    &self.tenant_max_journal_bytes,
+                ),
+            ] {
+                if entry.is_some() && map.contains_key(&t.id) {
+                    return Err(ProxyError::Config(format!(
+                        "multi_tenancy: tenant {:?} sets {key} in its tenant_settings entry and in \
+                         multi_tenancy.tenant_{key}; keep one",
+                        t.id
+                    )));
+                }
+            }
+            let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
+            for (key, value) in [
+                ("max_clients", t.max_clients),
+                ("max_active_queries", t.max_active_queries),
+                ("pool_max_connections", t.pool_max_connections),
+            ] {
+                if value.is_some_and(|v| v > max_permits) {
+                    return Err(ProxyError::Config(format!(
+                        "multi_tenancy.tenant_settings: tenant {:?}: {key} must be <= {max_permits}",
+                        t.id
+                    )));
+                }
+            }
+            if t.pool_max_idle == Some(0) {
+                return Err(ProxyError::Config(format!(
+                    "multi_tenancy.tenant_settings: tenant {:?}: pool_max_idle must be >= 1",
+                    t.id
+                )));
+            }
+            // Each name belongs to one isolation; on another it would not
+            // be read.
+            for (key, set, needs) in [
+                ("schema", t.schema.is_some(), TenantIsolation::Schema),
+                ("database", t.database.is_some(), TenantIsolation::Database),
+                ("branch", t.branch.is_some(), TenantIsolation::Branch),
+            ] {
+                if set && t.isolation != needs {
+                    return Err(ProxyError::Config(format!(
+                        "multi_tenancy.tenant_settings: tenant {:?}: {key} is only read with isolation = \
+                         {:?}",
+                        t.id,
+                        format!("{needs:?}").to_ascii_lowercase()
+                    )));
+                }
+            }
+            match t.isolation {
+                TenantIsolation::Row => {}
+                TenantIsolation::Schema => {
+                    if !valid_tenant_schema(t.schema_name()) {
+                        return Err(ProxyError::Config(format!(
+                            "multi_tenancy.tenant_settings: tenant {:?}: schema {:?} must be a plain \
+                             identifier ([A-Za-z_][A-Za-z0-9_$]*, at most 63 bytes)",
+                            t.id,
+                            t.schema_name()
+                        )));
+                    }
+                }
+                TenantIsolation::Database => {
+                    let db = t.database_name();
+                    if db.is_empty() || db.len() > 63 || db.contains('\0') {
+                        return Err(ProxyError::Config(format!(
+                            "multi_tenancy.tenant_settings: tenant {:?}: database {db:?} must be 1 to 63 \
+                             bytes without a NUL",
+                            t.id
+                        )));
+                    }
+                }
+                TenantIsolation::Branch => {
+                    if !crate::branch::valid_ident(t.branch_name()) {
+                        return Err(ProxyError::Config(format!(
+                            "multi_tenancy.tenant_settings: tenant {:?}: branch {:?} is not a valid branch \
+                             name (letters, digits and '_', not starting with a digit, at most 63)",
+                            t.id,
+                            t.branch_name()
+                        )));
+                    }
+                }
+            }
+        }
+        if !self.enabled || !self.has_non_row_tenants() {
+            return Ok(());
+        }
+        // A schema, database or branch is chosen by the tenant's identity:
+        // one the client picks freely (an `application_name`) would let it
+        // pick another tenant's.
+        if !matches!(self.identify_by.as_str(), "user" | "database") {
+            return Err(ProxyError::Config(format!(
+                "multi_tenancy: schema, database and branch isolation need a tenant identity \
+                 the client cannot choose freely: identify_by = \"user\" (authenticated) or \
+                 \"database\" (authorized by the backend), not {:?}",
+                self.identify_by
+            )));
+        }
+        // The mirror (and its migration cutover) replays every session's
+        // statements on one database with one search_path.
+        if config.mirror.enabled {
+            return Err(ProxyError::Config(
+                "multi_tenancy: schema, database and branch isolation cannot be combined with \
+                 [mirror] enabled = true: the mirror and its cutover target have one database \
+                 and search_path for every session"
+                    .to_string(),
+            ));
+        }
+        // Without the feature no session is pinned to its tenant, so every
+        // tenant would reach the shared database and schema.
+        if !cfg!(feature = "multi-tenancy") {
+            return Err(ProxyError::Config(
+                "multi_tenancy: schema, database and branch isolation need the `multi-tenancy` \
+                 cargo feature, which this build lacks: every tenant would reach the shared \
+                 database and schema"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -4402,8 +5014,10 @@ fn parse_placeholder(body: &str) -> Result<Option<(String, usize)>> {
 /// "commit"`) with zero signal. `serde_ignored` wraps the deserializer and
 /// invokes the callback with the exact path serde's derive-generated visitor
 /// skipped, which — because every config struct here uses plain `#[derive(
-/// Deserialize)]` with no `flatten`/`deserialize_with`/manual impls — covers
-/// the whole nested tree, not just the top level.
+/// Deserialize)]` with no `flatten`/`deserialize_with`, and the one manual
+/// impl ([`TenantSpec`]) hands its table to a derived struct through the
+/// wrapped map access — covers the whole nested tree, not just the top
+/// level.
 ///
 /// Returns the parsed config plus the sorted, deduplicated list of ignored
 /// paths. A genuine parse error (bad TOML syntax, wrong type) is still
@@ -4441,6 +5055,21 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
     (
         "pool_mode.queue_timeout_secs",
         "did you mean 'pool_mode.acquire_timeout_secs'?",
+    ),
+    (
+        "pool_mode.max_queue_size",
+        "there is no request queue: a request waits for a backend connection up to [limits] \
+         backend_slot_wait_ms for a node or tenant slot and [pool_mode] acquire_timeout_secs \
+         overall, then is refused with 53300",
+    ),
+    (
+        "multi_tenancy.tenant_settings.tenant_column",
+        "the row filter's column belongs to the shared tables, not to a tenant: set \
+         [multi_tenancy] tenant_column",
+    ),
+    (
+        "multi_tenancy.tenant_settings.isolation_strategy",
+        "did you mean 'isolation'? (row | schema | database | branch)",
     ),
     (
         "logging",
@@ -4629,6 +5258,18 @@ const KNOWN_KEYS_NOT_IN_DEFAULT: &[&str] = &[
     "mcp.principals.token",
     "mcp.memory_backend_user",
     "mcp.memory_backend_password",
+    "pool_mode.prepared_statement_mode",
+    "multi_tenancy.tenant_settings.id",
+    "multi_tenancy.tenant_settings.isolation",
+    "multi_tenancy.tenant_settings.schema",
+    "multi_tenancy.tenant_settings.database",
+    "multi_tenancy.tenant_settings.branch",
+    "multi_tenancy.tenant_settings.max_clients",
+    "multi_tenancy.tenant_settings.max_active_queries",
+    "multi_tenancy.tenant_settings.max_replay_bytes",
+    "multi_tenancy.tenant_settings.max_journal_bytes",
+    "multi_tenancy.tenant_settings.pool_max_idle",
+    "multi_tenancy.tenant_settings.pool_max_connections",
 ];
 
 /// Every dotted key path `ProxyConfig` knows, taken from a serialised default
@@ -4777,6 +5418,118 @@ impl ProxyConfig {
     /// Get write timeout as Duration
     pub fn write_timeout(&self) -> Duration {
         Duration::from_secs(self.write_timeout_secs)
+    }
+
+    /// The smaller of two "0 = off" second values, `None` when both are off.
+    fn smaller_nonzero_secs(a: u64, b: u64) -> Option<Duration> {
+        match (a, b) {
+            (0, 0) => None,
+            (0, x) | (x, 0) => Some(Duration::from_secs(x.min(MAX_LIMIT_SECS))),
+            (a, b) => Some(Duration::from_secs(a.min(b).min(MAX_LIMIT_SECS))),
+        }
+    }
+
+    /// The idle TTL of a parked connection: the smaller non-zero of `[pool]
+    /// idle_timeout_secs` and `[pool_mode] idle_timeout_secs`; `None` keeps
+    /// parked connections however long they idle.
+    pub fn pool_idle_ttl(&self) -> Option<Duration> {
+        Self::smaller_nonzero_secs(
+            self.pool.idle_timeout_secs,
+            self.pool_mode.idle_timeout_secs,
+        )
+    }
+
+    /// The lifetime of a pooled connection: the smaller non-zero of `[pool]
+    /// max_lifetime_secs` and `[pool_mode] max_lifetime_secs`; `None` = no
+    /// limit.
+    pub fn pool_max_lifetime(&self) -> Option<Duration> {
+        Self::smaller_nonzero_secs(
+            self.pool.max_lifetime_secs,
+            self.pool_mode.max_lifetime_secs,
+        )
+    }
+
+    /// The overall deadline on opening a backend connection for a session
+    /// (`[pool_mode] acquire_timeout_secs`, transaction / statement pooling
+    /// only); `None` when off or in session pooling.
+    pub fn pool_acquire_deadline(&self) -> Option<Duration> {
+        (self.pool_mode.pooled() && self.pool_mode.acquire_timeout_secs > 0)
+            .then(|| Duration::from_secs(self.pool_mode.acquire_timeout_secs.min(MAX_LIMIT_SECS)))
+    }
+
+    /// The idle floor per identity the reaper keeps (`[pool_mode] min_idle`),
+    /// at most what the pool parks per identity (`max_pool_size`, at least 1).
+    pub fn pool_min_idle(&self) -> usize {
+        (self
+            .pool_mode
+            .min_idle
+            .min(self.pool_mode.max_pool_size.max(1))) as usize
+    }
+
+    /// The connection cap of `node`: its `[[nodes]] max_connections`, else
+    /// `[pool] max_connections`; `0` = unlimited.
+    pub fn node_connection_cap(&self, node: &NodeConfig) -> usize {
+        if node.max_connections > 0 {
+            node.max_connections
+        } else {
+            self.pool.max_connections
+        }
+    }
+
+    /// The `[pool]` / `[pool_mode]` keys set away from their defaults that
+    /// only act in transaction / statement pooling, as `section.key` names
+    /// (empty in those modes). Session pooling keeps one backend connection
+    /// per session and parks nothing, so they have no effect there.
+    pub fn pooled_only_keys_set(&self) -> Vec<&'static str> {
+        if self.pool_mode.pooled() {
+            return Vec::new();
+        }
+        let p = &self.pool;
+        let m = &self.pool_mode;
+        [
+            (
+                "pool.min_connections",
+                p.min_connections != DEFAULT_POOL_MIN_CONNECTIONS,
+            ),
+            (
+                "pool.idle_timeout_secs",
+                p.idle_timeout_secs != DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+            ),
+            (
+                "pool.max_lifetime_secs",
+                p.max_lifetime_secs != DEFAULT_POOL_MAX_LIFETIME_SECS,
+            ),
+            (
+                "pool.test_on_acquire",
+                p.test_on_acquire != DEFAULT_POOL_TEST_ON_ACQUIRE,
+            ),
+            (
+                "pool_mode.min_idle",
+                m.min_idle != DEFAULT_POOL_MODE_MIN_IDLE,
+            ),
+            (
+                "pool_mode.max_lifetime_secs",
+                m.max_lifetime_secs != DEFAULT_POOL_MODE_MAX_LIFETIME_SECS,
+            ),
+            (
+                "pool_mode.acquire_timeout_secs",
+                m.acquire_timeout_secs != DEFAULT_POOL_MODE_ACQUIRE_TIMEOUT_SECS,
+            ),
+            (
+                "pool_mode.prepared_statement_mode",
+                m.prepared_statement_mode != DEFAULT_SESSION_PREPARED_STATEMENT_MODE,
+            ),
+            (
+                "multi_tenancy.tenant_settings.pool_max_idle",
+                self.multi_tenancy
+                    .tenant_settings
+                    .iter()
+                    .any(|t| t.pool_max_idle.is_some()),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(key, set)| set.then_some(key))
+        .collect()
     }
 
     /// Effective in-session Transaction Replay mode. `tr_enabled = false`
@@ -4936,16 +5689,16 @@ impl ProxyConfig {
             ("tenant_max_replay_bytes", &mt.tenant_max_replay_bytes),
             ("tenant_max_journal_bytes", &mt.tenant_max_journal_bytes),
         ] {
-            if let Some(unknown) = overrides.keys().find(|k| !mt.tenants.contains(k)) {
+            if let Some(unknown) = overrides.keys().find(|k| !mt.knows(k)) {
                 return Err(ProxyError::Config(format!(
                     "multi_tenancy.{key} names {unknown:?}, which is not in multi_tenancy.tenants"
                 )));
             }
         }
+        mt.validate(self)?;
         let tenant_journal_budget_enabled = mt.enabled
             && mt
-                .tenants
-                .iter()
+                .tenant_ids()
                 .any(|tenant| mt.journal_byte_cap(tenant) > 0);
         if tenant_journal_budget_enabled && !self.journal.dir.trim().is_empty() {
             return Err(ProxyError::Config(
@@ -5095,12 +5848,7 @@ impl ProxyConfig {
             ));
         }
 
-        // Validate pool config
-        if self.pool.max_connections < self.pool.min_connections {
-            return Err(ProxyError::Config(
-                "max_connections must be >= min_connections".to_string(),
-            ));
-        }
+        self.validate_pool()?;
 
         // A zero health-check interval panics `tokio::time::interval` at
         // construction, silently killing the health task (which then never
@@ -5817,6 +6565,91 @@ impl ProxyConfig {
         Ok(())
     }
 
+    /// `[pool]` and `[pool_mode]` (W02): bounds that a zero or an overflow
+    /// would break, the floor against the caps, the prepared-statement mode
+    /// against the pooling mode, and the keys session pooling never reads.
+    fn validate_pool(&self) -> Result<()> {
+        let p = &self.pool;
+        let m = &self.pool_mode;
+        // The connect timeout and the 53300 retry bound of every dial: 0
+        // timed every dial out at once and demoted the node in-band.
+        if p.acquire_timeout_secs == 0 {
+            tracing::warn!(
+                "pool.acquire_timeout_secs = 0 would time every dial out at once: the default \
+                 ({DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS} s) applies"
+            );
+        }
+        for (key, secs) in [
+            ("pool.idle_timeout_secs", p.idle_timeout_secs),
+            ("pool.max_lifetime_secs", p.max_lifetime_secs),
+            ("pool.acquire_timeout_secs", p.acquire_timeout_secs),
+            ("pool_mode.idle_timeout_secs", m.idle_timeout_secs),
+            ("pool_mode.max_lifetime_secs", m.max_lifetime_secs),
+            ("pool_mode.acquire_timeout_secs", m.acquire_timeout_secs),
+        ] {
+            if secs > MAX_LIMIT_SECS {
+                tracing::warn!("{key} ({secs}) is capped at {MAX_LIMIT_SECS} seconds (1 year)");
+            }
+        }
+        if p.max_connections > 0 && p.max_connections < p.min_connections {
+            tracing::warn!(
+                "pool.min_connections ({}) is above pool.max_connections ({}): each node keeps \
+                 at most its cap open",
+                p.min_connections,
+                p.max_connections
+            );
+        }
+        if let Some(node) = self.nodes.iter().find(|n| {
+            let cap = self.node_connection_cap(n);
+            cap > 0 && cap < p.min_connections
+        }) {
+            tracing::warn!(
+                "node {} is capped at {} connections ([[nodes]] max_connections), below \
+                 pool.min_connections ({}): it keeps at most its cap open",
+                node.address(),
+                node.max_connections,
+                p.min_connections
+            );
+        }
+        // The pool parks at least one connection per identity whatever
+        // max_pool_size says.
+        if m.min_idle > m.max_pool_size.max(1) {
+            tracing::warn!(
+                "pool_mode.min_idle ({}) is above pool_mode.max_pool_size ({}): each identity \
+                 keeps at most max_pool_size parked",
+                m.min_idle,
+                m.max_pool_size
+            );
+        }
+        let inert = self.pooled_only_keys_set();
+        if !inert.is_empty() {
+            let msg = format!(
+                "{} only act in transaction or statement pooling ([pool_mode] mode = \
+                 \"transaction\" or \"statement\"): with mode = \"session\" they have no effect",
+                inert.join(", ")
+            );
+            // A warning even under `strict_config`: 3.0 accepted these keys
+            // (they were not read in any mode), so refusing them now would
+            // stop configurations that start today.
+            tracing::warn!("{msg}");
+        }
+        let lb = &self.load_balancer;
+        for (key, value) in [
+            (
+                "load_balancer.latency_readmit_ratio",
+                lb.latency_readmit_ratio,
+            ),
+            ("load_balancer.latency_smoothing", lb.latency_smoothing),
+        ] {
+            if !(value > 0.0 && value <= 1.0) {
+                return Err(ProxyError::Config(format!(
+                    "{key} must be in (0, 1], got {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the writes that reach the MCP gateway's backend are seen by
     /// this proxy, so its tool cache is retired by them (C-02): the backend
     /// is a `[[nodes]]` address (every write through the proxy reaches it),
@@ -5981,33 +6814,46 @@ pub enum TrMode {
     Transaction,
 }
 
-/// Connection pool configuration
+/// Connection pool configuration (`[pool]`): the per-node bounds and the
+/// connection-level timeouts of the data path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PoolConfig {
-    /// Minimum connections per node
+    /// Backend connections (in use and parked) the proxy keeps open to each
+    /// node at least, in transaction / statement pooling: the idle reaper
+    /// opens the missing ones with the identity the node served most
+    /// recently. Needs a credential the proxy holds (`[auth] mode = "scram"`
+    /// with a plaintext `auth_file` entry) or a trust backend. `0` = none.
     pub min_connections: usize,
-    /// Maximum connections per node
+    /// Most backend connections (in use and parked) the proxy keeps open to
+    /// each node; a `[[nodes]] max_connections` overrides it for its node.
+    /// `0` = unlimited.
     pub max_connections: usize,
-    /// Connection idle timeout (seconds)
+    /// Idle timeout (seconds) of a parked connection; with `[pool_mode]
+    /// idle_timeout_secs` also set, the smaller one applies. `0` = off.
     pub idle_timeout_secs: u64,
-    /// Maximum connection lifetime (seconds)
+    /// Lifetime (seconds) of a pooled connection; with `[pool_mode]
+    /// max_lifetime_secs` also set, the smaller one applies. `0` = off.
     pub max_lifetime_secs: u64,
-    /// Connection acquire timeout (seconds)
+    /// TCP connect timeout (seconds) of a backend connection, and how long a
+    /// connection the backend refuses with 53300 keeps being retried.
     pub acquire_timeout_secs: u64,
-    /// Test connection before use
+    /// Probe a parked connection for liveness when it is handed out
+    /// (one non-blocking read). `false` skips the probe; a connection that
+    /// then turns out closed when its first request is sent is replaced by a
+    /// fresh one once, with no node fault recorded.
     pub test_on_acquire: bool,
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            min_connections: 2,
-            max_connections: 100,
-            idle_timeout_secs: 300,
-            max_lifetime_secs: 1800,
-            acquire_timeout_secs: 30,
-            test_on_acquire: true,
+            min_connections: DEFAULT_POOL_MIN_CONNECTIONS,
+            max_connections: DEFAULT_POOL_MAX_CONNECTIONS,
+            idle_timeout_secs: DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+            max_lifetime_secs: DEFAULT_POOL_MAX_LIFETIME_SECS,
+            acquire_timeout_secs: DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS,
+            test_on_acquire: DEFAULT_POOL_TEST_ON_ACQUIRE,
         }
     }
 }
@@ -6025,7 +6871,12 @@ impl PoolConfig {
 
     /// Get acquire timeout as Duration
     pub fn acquire_timeout(&self) -> Duration {
-        Duration::from_secs(self.acquire_timeout_secs)
+        // 0 timed every dial out at once (before 3.1 it was accepted): it
+        // means the default; values beyond a year are capped at a year.
+        Duration::from_secs(match self.acquire_timeout_secs {
+            0 => DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS,
+            secs => secs.min(MAX_LIMIT_SECS),
+        })
     }
 }
 
@@ -6046,8 +6897,20 @@ pub struct LoadBalancerConfig {
     /// primary, so it reads back what it just wrote despite replica lag.
     /// `0` disables. Default 1000.
     pub read_your_writes_ms: u64,
-    /// Latency threshold for unhealthy marking (ms)
+    /// A standby or read replica whose smoothed health-probe latency is above
+    /// this many milliseconds serves no offloaded reads (they go to the other
+    /// standbys, else the primary) until it drops below
+    /// `latency_readmit_ratio` of it. A node not probed yet counts as
+    /// eligible. `0` = off.
     pub latency_threshold_ms: u64,
+    /// The fraction of `latency_threshold_ms` a held-out node's smoothed
+    /// latency must drop below to serve reads again, so a node near the
+    /// threshold does not flap. In (0, 1].
+    pub latency_readmit_ratio: f64,
+    /// Weight of the newest health probe in a node's smoothed latency
+    /// (exponential moving average): `1` uses the last probe alone. In
+    /// (0, 1].
+    pub latency_smoothing: f64,
 }
 
 impl Default for LoadBalancerConfig {
@@ -6057,7 +6920,9 @@ impl Default for LoadBalancerConfig {
             read_write_split: true,
             standby_reads: StandbyReads::default(),
             read_your_writes_ms: 1000,
-            latency_threshold_ms: 100,
+            latency_threshold_ms: DEFAULT_LATENCY_THRESHOLD_MS,
+            latency_readmit_ratio: DEFAULT_LATENCY_READMIT_RATIO,
+            latency_smoothing: DEFAULT_LATENCY_SMOOTHING,
         }
     }
 }
@@ -6066,6 +6931,35 @@ impl LoadBalancerConfig {
     /// Whether reads may leave the primary at all.
     pub fn offloads_reads(&self) -> bool {
         self.read_write_split && self.standby_reads != StandbyReads::Primary
+    }
+
+    /// The latency gate's next state for a node: `excluded` is whether it is
+    /// held out of reads now, `smoothed_ms` its smoothed probe latency
+    /// (`None`: never probed). A node goes out above `latency_threshold_ms`
+    /// and comes back below `latency_readmit_ratio` of it; with the
+    /// threshold at 0 every node is eligible.
+    pub fn latency_excludes(&self, excluded: bool, smoothed_ms: Option<f64>) -> bool {
+        let Some(latency) = smoothed_ms else {
+            return false;
+        };
+        if self.latency_threshold_ms == 0 {
+            return false;
+        }
+        let threshold = self.latency_threshold_ms as f64;
+        if excluded {
+            latency >= threshold * self.latency_readmit_ratio
+        } else {
+            latency > threshold
+        }
+    }
+
+    /// Fold one probe latency into the smoothed latency (`None`: the first
+    /// probe).
+    pub fn smooth_latency(&self, smoothed_ms: Option<f64>, sample_ms: f64) -> f64 {
+        match smoothed_ms {
+            None => sample_ms,
+            Some(prev) => prev + self.latency_smoothing * (sample_ms - prev),
+        }
     }
 }
 
@@ -6522,6 +7416,233 @@ mod tests {
         );
     }
 
+    /// `validate()` of a config with schema, database or branch tenants: Ok
+    /// with the `multi-tenancy` feature, else refused by its name.
+    fn validate_isolated(c: &ProxyConfig) {
+        let validated = c.validate();
+        #[cfg(feature = "multi-tenancy")]
+        if let Err(e) = validated {
+            panic!("isolated tenants are valid with `multi-tenancy`: {e}");
+        }
+        #[cfg(not(feature = "multi-tenancy"))]
+        {
+            let e = validated.expect_err("isolated tenants need `multi-tenancy`");
+            assert!(e.to_string().contains("`multi-tenancy`"), "{e}");
+        }
+    }
+
+    /// W07: `tenants` keeps 3.0's ids; `tenant_settings` tables carry a
+    /// tenant's own isolation, caps and pool settings, resolved entry -> map
+    /// -> global. A settings id is known whether or not `tenants` lists it.
+    #[test]
+    fn tenants_take_ids_and_settings_take_tables() {
+        let head =
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\nenabled = true\n\
+                    identify_by = \"user\"\nmax_clients_per_tenant = 5\n";
+        // The table form, as an array of tables.
+        let tables = format!(
+            "{head}[[multi_tenancy.tenant_settings]]\nid = \"acme\"\nisolation = \"schema\"\n\
+             schema = \"acme_s\"\nmax_clients = 9\npool_max_connections = 4\n\
+             [[multi_tenancy.tenant_settings]]\nid = \"globex\"\nisolation = \"database\"\n\
+             pool_max_idle = 2\n"
+        );
+        let (c, ignored) = deserialize_reporting_ignored_paths(&tables).unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        validate_isolated(&c);
+        let mt = &c.multi_tenancy;
+        let acme = mt.spec("acme").unwrap();
+        assert_eq!(acme.isolation, TenantIsolation::Schema);
+        assert_eq!(acme.schema_name(), "acme_s");
+        assert_eq!(mt.client_cap("acme"), 9, "the entry wins");
+        assert_eq!(mt.client_cap("globex"), 5, "else the section");
+        assert_eq!(mt.pool_connection_cap("acme"), 4);
+        assert_eq!(mt.pool_idle_cap("globex"), 2);
+        assert_eq!(mt.spec("globex").unwrap().database_name(), "globex");
+        assert!(mt.has_non_row_tenants());
+        // 3.0's id list next to an inline settings entry.
+        let mixed = format!(
+            "{head}tenants = [\"tiny\"]\n\
+             tenant_settings = [{{ id = \"acme\", isolation = \"branch\", branch = \"b1\" }}]\n\
+             [multi_tenancy.tenant_max_clients]\ntiny = 2\n"
+        );
+        let (c, ignored) = deserialize_reporting_ignored_paths(&mixed).unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        validate_isolated(&c);
+        let mt = &c.multi_tenancy;
+        assert_eq!(mt.tenant_ids().collect::<Vec<_>>(), ["tiny", "acme"]);
+        assert!(mt.knows("tiny") && mt.spec("tiny").is_none());
+        assert_eq!(mt.tenant_list()[0], TenantSpec::from("tiny"));
+        assert_eq!(mt.client_cap("tiny"), 2, "else the map");
+        assert_eq!(mt.spec("acme").unwrap().branch_name(), "b1");
+        // The configuration serializes and reads back unchanged.
+        let text = toml::to_string(&c).unwrap();
+        assert!(text.contains("\"tiny\""), "{text}");
+        let again: ProxyConfig = toml::from_str(&text).unwrap();
+        assert_eq!(again.multi_tenancy, c.multi_tenancy);
+        // Anything else is a parse error: `tenants` holds ids only (as in
+        // 3.0), and a settings entry needs its id.
+        assert!(toml::from_str::<ProxyConfig>(&format!("{head}tenants = [1]\n")).is_err());
+        assert!(
+            toml::from_str::<ProxyConfig>(&format!("{head}tenants = [{{ id = \"acme\" }}]\n"))
+                .is_err()
+        );
+        assert!(toml::from_str::<ProxyConfig>(&format!(
+            "{head}tenant_settings = [{{ isolation = \"schema\" }}]\n"
+        ))
+        .is_err());
+    }
+
+    /// A typo inside a tenant table is reported with its full path and the
+    /// key it most likely meant, and refused under `strict_config`.
+    #[test]
+    fn typos_inside_a_tenant_entry_are_reported() {
+        let text =
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\nenabled = true\n\
+                    identify_by = \"user\"\n[[multi_tenancy.tenant_settings]]\nid = \"acme\"\n\
+                    isolaton = \"schema\"\ntenant_column = \"org\"\n";
+        let (c, ignored) = deserialize_reporting_ignored_paths(text).unwrap();
+        assert_eq!(
+            ignored,
+            [
+                "multi_tenancy.tenant_settings.0.isolaton",
+                "multi_tenancy.tenant_settings.0.tenant_column"
+            ]
+        );
+        assert_eq!(
+            c.multi_tenancy.spec("acme").unwrap().isolation,
+            TenantIsolation::Row,
+            "the misspelt key took no effect"
+        );
+        let known = known_config_keys();
+        assert_eq!(
+            ignored_key_hint("multi_tenancy.tenant_settings.0.isolaton", &known).as_deref(),
+            Some("did you mean 'multi_tenancy.tenant_settings.0.isolation'?")
+        );
+        assert!(
+            ignored_key_hint("multi_tenancy.tenant_settings.0.tenant_column", &known)
+                .unwrap()
+                .contains("[multi_tenancy] tenant_column")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(&path, format!("strict_config = true\n{text}")).unwrap();
+        let e = ProxyConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("multi_tenancy.tenant_settings.0.isolaton (did you mean"),
+            "{e}"
+        );
+    }
+
+    /// Duplicate ids, a cap set both in the entry and in the map, a name for
+    /// another isolation, bad names, a client-chosen identity for non-row
+    /// isolation and the mirror are refused at startup.
+    #[test]
+    fn tenant_entries_are_validated() {
+        let check = |tenants: &str, extra: &str| {
+            let text = format!(
+                "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n{extra}[multi_tenancy]\n\
+                 enabled = true\nidentify_by = \"user\"\ntenant_settings = [{tenants}]\n"
+            );
+            toml::from_str::<ProxyConfig>(&text).unwrap().validate()
+        };
+        let refused = |tenants: &str, needle: &str| {
+            let e = check(tenants, "").unwrap_err().to_string();
+            assert!(e.contains(needle), "{needle}: {e}");
+        };
+        refused("{ id = \"acme\" }, { id = \"acme\" }", "listed twice");
+        refused("{ id = \"\" }", "must not be empty");
+        refused("{ id = \"a\", schema = \"s\" }", "schema is only read");
+        refused(
+            "{ id = \"a\", isolation = \"schema\", database = \"d\" }",
+            "database is only read",
+        );
+        refused(
+            "{ id = \"a\", isolation = \"schema\", schema = \"bad name\" }",
+            "plain identifier",
+        );
+        refused(
+            "{ id = \"a\", isolation = \"branch\", branch = \"1x\" }",
+            "not a valid branch name",
+        );
+        refused(
+            "{ id = \"a\", pool_max_idle = 0 }",
+            "pool_max_idle must be >= 1",
+        );
+        let both =
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\nenabled = true\n\
+             tenant_settings = [{ id = \"acme\", max_active_queries = 3 }]\n\
+             [multi_tenancy.tenant_max_active_queries]\nacme = 4\n";
+        let e = toml::from_str::<ProxyConfig>(both)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("max_active_queries in its tenant_settings entry"),
+            "{e}"
+        );
+        // Non-row isolation needs an identity the client cannot pick.
+        let spoofable = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\n\
+                         enabled = true\ntenant_settings = [{ id = \"a\", isolation = \"database\" }]\n";
+        let e = toml::from_str::<ProxyConfig>(spoofable)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("identify_by = \"user\""), "{e}");
+        let e = check(
+            "{ id = \"a\", isolation = \"schema\" }",
+            "[mirror]\nenabled = true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("[mirror]"), "{e}");
+        let text =
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\nenabled = true\n\
+                    identify_by = \"user\"\ntenant_settings = [{ id = \"a\", isolation = \"schema\" }]\n";
+        validate_isolated(&toml::from_str::<ProxyConfig>(text).unwrap());
+        assert!(
+            check("{ id = \"a\" }", "[mirror]\nenabled = true\n").is_ok(),
+            "row isolation works with the mirror"
+        );
+        // 3.0's `tenants` ids are never refused: an empty or repeated id is
+        // warned about.
+        let legacy = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\n\
+                      enabled = true\ntenants = [\"acme\", \"acme\", \"\"]\n";
+        assert!(toml::from_str::<ProxyConfig>(legacy)
+            .unwrap()
+            .validate()
+            .is_ok());
+    }
+
+    /// A SIGHUP may resize entry caps: `without_caps` drops them, and keeps
+    /// the isolation settings a reload must not change.
+    #[test]
+    fn without_caps_drops_entry_caps_and_keeps_isolation() {
+        let mut a = MultiTenancyToml {
+            tenant_settings: vec![TenantSpec {
+                isolation: TenantIsolation::Schema,
+                max_clients: Some(3),
+                pool_max_connections: Some(2),
+                ..TenantSpec::from("acme")
+            }],
+            ..Default::default()
+        };
+        let mut b = a.clone();
+        b.tenant_settings[0].max_clients = Some(30);
+        b.tenant_settings[0].pool_max_idle = Some(1);
+        assert_eq!(a.without_caps(), b.without_caps());
+        b.tenant_settings[0].schema = Some("other".into());
+        assert_ne!(a.without_caps(), b.without_caps());
+        a.tenant_settings[0].isolation = TenantIsolation::Row;
+        assert_ne!(
+            a.without_caps().tenant_settings,
+            b.without_caps().tenant_settings
+        );
+    }
+
     #[test]
     fn tenant_client_caps_parse_and_name_known_tenants() {
         let base = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\nenabled = true\ntenants = [\"acme\", \"tiny\"]\nmax_clients_per_tenant = 5\n[multi_tenancy.tenant_max_clients]\n";
@@ -6688,6 +7809,18 @@ mod tests {
             hint("pool_mode.validation_query")
         );
         assert!(hint("logging").unwrap().contains("--log-level"));
+        // W02/W07: the queue keys of the old full example, and the
+        // spellings a tenant entry might borrow from other products.
+        assert_eq!(
+            hint("pool_mode.queue_timeout_secs").as_deref(),
+            Some("did you mean 'pool_mode.acquire_timeout_secs'?")
+        );
+        assert!(hint("pool_mode.max_queue_size")
+            .unwrap()
+            .contains("no request queue"));
+        assert!(hint("multi_tenancy.tenant_settings.3.isolation_strategy")
+            .unwrap()
+            .contains("'isolation'"));
         // Small typos next to a known key of the same section.
         assert_eq!(
             hint("cache.enabed").as_deref(),
@@ -9680,8 +10813,9 @@ exclude = true
     #[test]
     fn test_pool_config_durations() {
         let config = PoolConfig::default();
-        assert_eq!(config.idle_timeout(), Duration::from_secs(300));
-        assert_eq!(config.max_lifetime(), Duration::from_secs(1800));
+        assert_eq!(config.idle_timeout(), Duration::ZERO);
+        assert_eq!(config.max_lifetime(), Duration::ZERO);
+        assert_eq!(config.acquire_timeout(), Duration::from_secs(30));
     }
 
     #[test]
@@ -9689,8 +10823,9 @@ exclude = true
         let config = PoolModeConfig::default();
         assert_eq!(config.mode, PoolingMode::Session);
         assert_eq!(config.max_pool_size, 100);
-        assert_eq!(config.min_idle, 10);
+        assert_eq!(config.min_idle, 0);
         assert_eq!(config.reset_query, "DISCARD ALL");
+        assert_eq!(config.prepared_statement_mode, PreparedStatementMode::Named);
     }
 
     #[test]
@@ -9711,18 +10846,230 @@ exclude = true
     fn test_pool_mode_statement() {
         let config = PoolModeConfig::statement_mode();
         assert_eq!(config.mode, PoolingMode::Statement);
-        assert_eq!(
-            config.prepared_statement_mode,
-            PreparedStatementMode::Disable
-        );
+        assert_eq!(config.prepared_statement_mode, PreparedStatementMode::Track);
     }
 
     #[test]
     fn test_pool_mode_durations() {
         let config = PoolModeConfig::default();
         assert_eq!(config.idle_timeout(), Duration::from_secs(600));
-        assert_eq!(config.max_lifetime(), Duration::from_secs(3600));
-        assert_eq!(config.acquire_timeout(), Duration::from_secs(5));
+        assert_eq!(config.max_lifetime(), Duration::ZERO);
+        assert_eq!(config.acquire_timeout(), Duration::ZERO);
+    }
+
+    /// W02: every pool key whose default changed reproduces the behaviour
+    /// before it took effect, and the defaults are the documented constants.
+    #[test]
+    fn pool_key_defaults_are_the_documented_constants() {
+        let c = ProxyConfig::default();
+        assert_eq!(c.pool.min_connections, DEFAULT_POOL_MIN_CONNECTIONS);
+        assert_eq!(c.pool.max_connections, DEFAULT_POOL_MAX_CONNECTIONS);
+        assert_eq!(c.pool.idle_timeout_secs, DEFAULT_POOL_IDLE_TIMEOUT_SECS);
+        assert_eq!(c.pool.max_lifetime_secs, DEFAULT_POOL_MAX_LIFETIME_SECS);
+        assert_eq!(
+            c.pool.acquire_timeout_secs,
+            DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS
+        );
+        assert_eq!(c.pool.test_on_acquire, DEFAULT_POOL_TEST_ON_ACQUIRE);
+        assert_eq!(c.pool_mode.min_idle, DEFAULT_POOL_MODE_MIN_IDLE);
+        assert_eq!(
+            c.pool_mode.idle_timeout_secs,
+            DEFAULT_POOL_MODE_IDLE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            c.pool_mode.max_lifetime_secs,
+            DEFAULT_POOL_MODE_MAX_LIFETIME_SECS
+        );
+        assert_eq!(
+            c.pool_mode.acquire_timeout_secs,
+            DEFAULT_POOL_MODE_ACQUIRE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            c.load_balancer.latency_threshold_ms,
+            DEFAULT_LATENCY_THRESHOLD_MS
+        );
+        assert_eq!(
+            c.load_balancer.latency_readmit_ratio,
+            DEFAULT_LATENCY_READMIT_RATIO
+        );
+        assert_eq!(c.load_balancer.latency_smoothing, DEFAULT_LATENCY_SMOOTHING);
+        // Today's behaviour: no floor, no cap, the [pool_mode] idle TTL, no
+        // lifetime, no acquire deadline.
+        assert_eq!(c.pool_idle_ttl(), Some(Duration::from_secs(600)));
+        assert_eq!(c.pool_max_lifetime(), None);
+        assert_eq!(c.pool_acquire_deadline(), None);
+        let node = NodeConfig::new("db", 5432);
+        assert_eq!(c.node_connection_cap(&node), 0);
+    }
+
+    /// The idle TTL and the lifetime are the smaller non-zero of the two
+    /// keys; `[[nodes]] max_connections` overrides `[pool] max_connections`.
+    #[test]
+    fn effective_pool_settings_combine_both_sections() {
+        let mut c = ProxyConfig::default();
+        c.pool.idle_timeout_secs = 300;
+        assert_eq!(c.pool_idle_ttl(), Some(Duration::from_secs(300)));
+        c.pool_mode.idle_timeout_secs = 0;
+        assert_eq!(c.pool_idle_ttl(), Some(Duration::from_secs(300)));
+        c.pool.idle_timeout_secs = 0;
+        assert_eq!(c.pool_idle_ttl(), None);
+        c.pool.max_lifetime_secs = 1800;
+        c.pool_mode.max_lifetime_secs = 3600;
+        assert_eq!(c.pool_max_lifetime(), Some(Duration::from_secs(1800)));
+        c.pool_mode.max_lifetime_secs = 60;
+        assert_eq!(c.pool_max_lifetime(), Some(Duration::from_secs(60)));
+        c.pool_mode.acquire_timeout_secs = 2;
+        assert_eq!(
+            c.pool_acquire_deadline(),
+            None,
+            "session pooling dials no pool"
+        );
+        c.pool_mode.mode = PoolingMode::Transaction;
+        assert_eq!(c.pool_acquire_deadline(), Some(Duration::from_secs(2)));
+        c.pool.max_connections = 50;
+        let mut node = NodeConfig::new("db", 5432);
+        assert_eq!(c.node_connection_cap(&node), 50);
+        node.max_connections = 7;
+        assert_eq!(c.node_connection_cap(&node), 7);
+    }
+
+    /// The prepared-statement mode follows the pooling mode when absent;
+    /// `named` is refused in the pooled modes, and the pooled-only keys are
+    /// refused in session pooling under `strict_config`.
+    #[test]
+    fn prepared_statement_mode_follows_the_pooling_mode() {
+        let parse = |text: &str| {
+            let toml = format!("[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n{text}");
+            toml::from_str::<ProxyConfig>(&toml).unwrap()
+        };
+        let session = parse("");
+        assert_eq!(
+            session.pool_mode.effective_prepared_statement_mode(),
+            PreparedStatementMode::Named
+        );
+        let tx = parse("[pool_mode]\nmode = \"transaction\"\n");
+        assert_eq!(
+            tx.pool_mode.effective_prepared_statement_mode(),
+            PreparedStatementMode::Track
+        );
+        assert!(tx.validate().is_ok());
+        for spelling in ["disable", "track", "named"] {
+            let c = parse(&format!(
+                "[pool_mode]\nmode = \"statement\"\nprepared_statement_mode = \"{spelling}\"\n"
+            ));
+            let result = c.validate();
+            assert!(result.is_ok(), "{spelling}: {result:?}");
+            // `named` cannot hold across pooled connections: it acts as `track`.
+            let expected = if spelling == "named" {
+                "track"
+            } else {
+                spelling
+            };
+            assert_eq!(
+                format!("{:?}", c.pool_mode.effective_prepared_statement_mode())
+                    .to_ascii_lowercase(),
+                expected
+            );
+        }
+        // Session pooling: a pooled-only key is inert and warned about, also
+        // under strict_config (3.0 accepted it).
+        let mut inert = parse("[pool_mode]\nprepared_statement_mode = \"track\"\nmin_idle = 2\n");
+        assert_eq!(
+            inert.pooled_only_keys_set(),
+            vec!["pool_mode.min_idle", "pool_mode.prepared_statement_mode"]
+        );
+        assert!(inert.validate().is_ok());
+        inert.strict_config = true;
+        assert!(inert.validate().is_ok());
+        inert.pool_mode.mode = PoolingMode::Transaction;
+        assert!(inert.pooled_only_keys_set().is_empty());
+        assert!(inert.validate().is_ok());
+    }
+
+    /// W02 validation: out-of-range values of keys 3.0 accepted are warned
+    /// about and read as safe effective values; the latency gate's new
+    /// ratios must be fractions.
+    #[test]
+    fn pool_keys_are_validated() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("db:5432", "primary").unwrap();
+            c.pool_mode.mode = PoolingMode::Transaction;
+            c
+        };
+        let refused = |edit: fn(&mut ProxyConfig), needle: &str| {
+            let mut c = base();
+            edit(&mut c);
+            let e = c.validate().unwrap_err().to_string();
+            assert!(e.contains(needle), "{needle}: {e}");
+        };
+        // Keys 3.0 accepted are warned about, not refused, and the data path
+        // reads safe effective values.
+        let mut lax = base();
+        lax.pool.acquire_timeout_secs = 0;
+        lax.pool_mode.acquire_timeout_secs = MAX_LIMIT_SECS + 1;
+        lax.pool.max_lifetime_secs = MAX_LIMIT_SECS + 1;
+        lax.pool.min_connections = 5;
+        lax.pool.max_connections = 4;
+        lax.nodes[0].max_connections = 3;
+        lax.pool_mode.max_pool_size = 4;
+        lax.pool_mode.min_idle = 5;
+        assert!(lax.validate().is_ok());
+        assert_eq!(
+            lax.pool.acquire_timeout(),
+            Duration::from_secs(DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            lax.pool_acquire_deadline(),
+            Some(Duration::from_secs(MAX_LIMIT_SECS))
+        );
+        assert_eq!(
+            lax.pool_max_lifetime(),
+            Some(Duration::from_secs(MAX_LIMIT_SECS))
+        );
+        assert_eq!(lax.pool_min_idle(), 4);
+        refused(
+            |c| c.load_balancer.latency_readmit_ratio = 0.0,
+            "load_balancer.latency_readmit_ratio",
+        );
+        refused(
+            |c| c.load_balancer.latency_smoothing = 1.5,
+            "load_balancer.latency_smoothing",
+        );
+        refused(
+            |c| c.load_balancer.latency_smoothing = f64::NAN,
+            "load_balancer.latency_smoothing",
+        );
+        let mut ok = base();
+        ok.pool.min_connections = 5;
+        ok.pool.max_connections = 0;
+        ok.pool_mode.min_idle = 100;
+        ok.pool_mode.acquire_timeout_secs = 0;
+        assert!(ok.validate().is_ok());
+    }
+
+    /// The latency gate: out above the threshold, back below the re-admit
+    /// fraction of it; never probed or threshold 0 = eligible; smoothing is
+    /// an exponential moving average.
+    #[test]
+    fn latency_gate_has_hysteresis_and_smoothing() {
+        let mut lb = LoadBalancerConfig::default();
+        assert!(
+            !lb.latency_excludes(false, Some(10_000.0)),
+            "off by default"
+        );
+        lb.latency_threshold_ms = 100;
+        assert!(!lb.latency_excludes(false, None), "unprobed is eligible");
+        assert!(!lb.latency_excludes(false, Some(100.0)));
+        assert!(lb.latency_excludes(false, Some(100.5)));
+        // Held out: stays out until below 70 ms.
+        assert!(lb.latency_excludes(true, Some(90.0)));
+        assert!(lb.latency_excludes(true, Some(70.0)));
+        assert!(!lb.latency_excludes(true, Some(69.9)));
+        assert_eq!(lb.smooth_latency(None, 40.0), 40.0);
+        assert!((lb.smooth_latency(Some(10.0), 300.0) - 97.0).abs() < 1e-9);
+        lb.latency_smoothing = 1.0;
+        assert_eq!(lb.smooth_latency(Some(10.0), 300.0), 300.0);
     }
 
     #[test]

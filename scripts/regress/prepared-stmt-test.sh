@@ -25,16 +25,11 @@ tr_enabled = false
 tr_mode = "none"
 write_timeout_secs = 30
 [pool]
-min_connections = 2
-max_connections = 50
-idle_timeout_secs = 300
-max_lifetime_secs = 1800
 acquire_timeout_secs = 5
 test_on_acquire = true
 [load_balancer]
 read_strategy = "round_robin"
 read_write_split = false
-latency_threshold_ms = 100
 [health]
 check_interval_secs = 5
 check_timeout_secs = 3

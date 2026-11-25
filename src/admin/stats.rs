@@ -335,6 +335,21 @@ struct Pools {
     max_total_idle: usize,
     idle_timeout_secs: u64,
     acquire_timeout_secs: u64,
+    /// The prepared-statement mode in effect (`[pool_mode]
+    /// prepared_statement_mode`, or its default for the pooling mode).
+    prepared_statement_mode: crate::config::PreparedStatementMode,
+    /// `[pool] min_connections` (0 = none).
+    min_connections: usize,
+    /// `[pool] max_connections` (0 = unlimited).
+    max_connections: usize,
+    /// `[pool] test_on_acquire`.
+    test_on_acquire: bool,
+    /// The idle TTL in effect: the smaller non-zero of the two
+    /// `idle_timeout_secs` (0 = none).
+    effective_idle_timeout_secs: u64,
+    /// The max lifetime in effect: the smaller non-zero of the two
+    /// `max_lifetime_secs` (0 = none).
+    effective_max_lifetime_secs: u64,
     /// The data-path idle pool (transaction / statement mode); `None` in
     /// session mode.
     idle_pool: Option<IdlePool>,
@@ -351,6 +366,12 @@ struct IdlePool {
     reaped_total: u64,
     resets_skipped_total: u64,
     capacity_evictions_total: u64,
+    lifetime_expired_total: u64,
+    acquire_timeouts_total: u64,
+    stale_lease_redials_total: u64,
+    topped_up_total: u64,
+    topup_failures_total: u64,
+    handed_over_total: u64,
 }
 
 #[cfg(feature = "pool-modes")]
@@ -364,6 +385,12 @@ async fn pools(state: &Arc<AdminState>, config: &ProxyConfig) -> Section<PoolsDa
         reaped_total: p.reaped(),
         resets_skipped_total: p.resets_skipped(),
         capacity_evictions_total: p.capacity_evictions(),
+        lifetime_expired_total: p.lifetime_expired(),
+        acquire_timeouts_total: p.acquire_timeouts(),
+        stale_lease_redials_total: p.stale_lease_redials(),
+        topped_up_total: p.topped_up(),
+        topup_failures_total: p.topup_failures(),
+        handed_over_total: p.handed_over(),
     });
     let pm = &config.pool_mode;
     Section::on(Pools {
@@ -373,6 +400,12 @@ async fn pools(state: &Arc<AdminState>, config: &ProxyConfig) -> Section<PoolsDa
         max_total_idle: config.limits.max_total_idle_backend_conns,
         idle_timeout_secs: pm.idle_timeout_secs,
         acquire_timeout_secs: pm.acquire_timeout_secs,
+        prepared_statement_mode: pm.effective_prepared_statement_mode(),
+        min_connections: config.pool.min_connections,
+        max_connections: config.pool.max_connections,
+        test_on_acquire: config.pool.test_on_acquire,
+        effective_idle_timeout_secs: config.pool_idle_ttl().map_or(0, |d| d.as_secs()),
+        effective_max_lifetime_secs: config.pool_max_lifetime().map_or(0, |d| d.as_secs()),
         idle_pool,
     })
 }
@@ -598,6 +631,23 @@ struct TenantStats {
     queries: Option<TenantQueries>,
     /// The replay-byte budget; `None` for a tenant without one.
     replay: Option<TenantReplay>,
+    /// Its own backend-connection pool (`pool_max_idle` /
+    /// `pool_max_connections`); `None` for a tenant without one.
+    pool: Option<TenantPoolSection>,
+}
+
+#[derive(Serialize)]
+struct TenantPoolSection {
+    /// `pool_max_connections`; `None` = uncapped.
+    limit: Option<usize>,
+    /// Backend connections (in use and parked) holding its slots; `None`
+    /// without a cap.
+    in_use: Option<usize>,
+    waiting: usize,
+    waits_total: u64,
+    refusals_total: u64,
+    dials_total: u64,
+    checkouts_total: u64,
 }
 
 #[derive(Serialize)]
@@ -648,6 +698,17 @@ async fn tenants(
                 refusals_total: s.refusals,
             });
         }
+        for p in slots.pool_stats() {
+            tenant_entry(&mut by_tenant, &p.tenant).pool = Some(TenantPoolSection {
+                limit: p.limit,
+                in_use: p.in_use,
+                waiting: p.waiting,
+                waits_total: p.waits,
+                refusals_total: p.refusals,
+                dials_total: p.dials,
+                checkouts_total: p.checkouts,
+            });
+        }
         for b in slots.budget_stats() {
             let t = tenant_entry(&mut by_tenant, &b.tenant);
             if b.query_limit > 0 {
@@ -692,6 +753,7 @@ fn tenant_entry<'m>(
             sessions: None,
             queries: None,
             replay: None,
+            pool: None,
         })
 }
 

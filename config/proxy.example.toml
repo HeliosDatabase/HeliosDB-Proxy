@@ -97,26 +97,37 @@ write_timeout_secs = 30
 # -----------------------------------------------------------------------------
 
 [pool]
-# Minimum backend connections kept open per node (warm pool).
-min_connections = 5
+# Backend connections (in use and parked) to keep open per node, opened ahead
+# of use by the idle reaper in transaction/statement pooling with the identity
+# the node served last. Needs a credential the proxy holds ([auth] mode =
+# "scram" with a plaintext auth_file entry) or a trust backend; with
+# pass-through auth it is skipped (warned once). 0 = none.
+min_connections = 0
 
-# Maximum backend connections per node. Size this based on your database's
-# max_connections minus headroom for admin/replication connections.
+# Most backend connections (in use and parked) per node; a [[nodes]]
+# max_connections overrides it for its node. A full node first closes one
+# idle pooled connection, then waits [limits] backend_slot_wait_ms, then
+# refuses with 53300. Size it below the database's max_connections minus
+# headroom for admin/replication connections. 0 = unlimited.
 max_connections = ${HELIOS_PROXY_POOL_MAX:-50}
 
-# Close idle backend connections after this many seconds.
+# Idle timeout of a parked connection (seconds); the smaller of this and
+# [pool_mode] idle_timeout_secs applies. 0 = off.
 idle_timeout_secs = 300
 
-# Recycle backend connections after this many seconds regardless of activity.
-# Prevents issues with firewall/load-balancer idle timeouts.
+# Close a pooled connection this old (seconds) instead of parking or handing
+# it out again, e.g. below a firewall/load-balancer idle cutoff. A connection
+# in use is never closed. 0 = off.
 max_lifetime_secs = 1800
 
-# How long a client waits to acquire a backend connection before getting an
-# error. Keep this short to fail fast under load.
+# TCP connect timeout of a backend connection (seconds), and how long a
+# connection the backend refuses at its max_connections (53300) is retried.
 acquire_timeout_secs = 5
 
-# Run a quick query before handing a connection to a client to make sure
-# it is still alive. Small overhead, high reliability.
+# Probe a parked connection for liveness (one non-blocking read) before
+# handing it out. false skips the probe: a connection that turns out closed
+# when its first request is sent is replaced by a fresh one once, without
+# counting a node fault.
 test_on_acquire = true
 
 # -----------------------------------------------------------------------------
@@ -130,16 +141,21 @@ test_on_acquire = true
 #   transaction — connection returned after COMMIT/ROLLBACK. Best throughput
 #                 for most web applications.
 #   statement   — connection returned after every statement. Maximum reuse,
-#                 but no multi-statement transactions or prepared statements.
+#                 but no multi-statement transactions.
 mode = "${HELIOS_PROXY_POOL_MODE:-transaction}"
 
-# Maximum pool connections per node (pool_mode layer).
+# Most idle connections parked per (node, user, database) identity.
 max_pool_size = 50
 
-# Keep at least this many idle connections ready.
-min_idle = 5
+# Idle connections kept ready per identity a session used within the idle
+# timeout (opened ahead of use; same credential rule as [pool]
+# min_connections). Must be <= max_pool_size. 0 = none.
+min_idle = 0
 
-# Idle / lifetime / acquire timeouts (seconds).
+# Idle timeout (seconds; the smaller of this and [pool] idle_timeout_secs
+# applies), max lifetime (seconds; likewise), and an overall deadline on
+# opening a backend connection for a session (slot waits, connect,
+# authentication; refused with 53300 on expiry). 0 = off.
 idle_timeout_secs = 300
 max_lifetime_secs = 1800
 acquire_timeout_secs = 5
@@ -148,11 +164,11 @@ acquire_timeout_secs = 5
 # state. DISCARD ALL is the safest choice for transaction mode.
 reset_query = "DISCARD ALL"
 
-# How prepared statements are handled across pooled connections:
-#   disable — never use prepared statements (safest for statement mode)
-#   track   — proxy tracks and re-creates them transparently (recommended
-#             for transaction mode)
-#   named   — use protocol-level named statements (best for session mode)
+# How prepared statements are handled across pooled connections
+# (transaction/statement pooling; session pooling uses "named"):
+#   track   — named protocol-level statements and SQL PREPARE are tracked
+#             and prepared again on whichever connection runs them (default)
+#   disable — a named Parse or a SQL PREPARE is refused (0A000)
 prepared_statement_mode = "track"
 
 # -----------------------------------------------------------------------------
@@ -180,9 +196,11 @@ read_write_split = true
 #   primary — reads stay on the primary
 standby_reads = "async"
 
-# If a node's average response time exceeds this threshold (milliseconds)
-# it is temporarily deprioritised for read traffic.
-latency_threshold_ms = 100
+# A standby whose smoothed health-probe latency exceeds this (milliseconds)
+# serves no reads until it drops below latency_readmit_ratio of it (reads go
+# to the other standbys, else the primary). Probes with [health] credentials
+# include connect and authentication time. 0 = off.
+latency_threshold_ms = 0
 
 # -----------------------------------------------------------------------------
 # Health checks — monitor backend node availability

@@ -6,7 +6,10 @@
 //!
 //! - **Multiple Isolation Strategies**: Database, Schema, Row-level, or Branch isolation
 //! - **Flexible Tenant Identification**: Header, username prefix, JWT, or database name
-//! - **Per-Tenant Connection Pools**: Dedicated or shared pools with configurable limits
+//! - **Per-Tenant Connection Pools** (deprecated since 3.1): [`pool`] is a
+//!   library-only pool bookkeeping no daemon path uses; the proxy daemon's
+//!   per-tenant pools are `[multi_tenancy] tenant_settings` `pool_max_idle` /
+//!   `pool_max_connections` on its data-path pool (`crate::tenant_slots::TenantPool`)
 //! - **Query Transformation**: Automatic tenant filtering for row-level isolation
 //! - **Comprehensive Metrics**: Per-tenant query stats, latencies, and costs
 //!
@@ -67,6 +70,10 @@
 //! │  └──────────────────────────────────────────┘   │
 //! └─────────────────────────────────────────────────┘
 //! ```
+
+// The deprecated `pool` module stays wired into `TenantManager` for 3.0
+// library compatibility; nothing in the daemon reads it.
+#![allow(deprecated)]
 
 pub mod config;
 pub mod identifier;
@@ -305,6 +312,10 @@ impl TenantManager {
     }
 
     /// Get connection pool for a tenant
+    #[deprecated(
+        since = "3.1.0",
+        note = "library-only; the daemon's per-tenant pools are `tenant_slots::TenantPool`"
+    )]
     pub fn get_pool(&self, tenant: &TenantId) -> Option<Arc<TenantPool>> {
         let config = self.get_tenant(tenant)?;
         Some(self.pool_manager.get_pool(tenant, &config))
@@ -352,11 +363,19 @@ impl TenantManager {
     }
 
     /// Get pool statistics for all tenants
+    #[deprecated(
+        since = "3.1.0",
+        note = "library-only; the daemon's per-tenant pools are `tenant_slots::TenantPool`"
+    )]
     pub fn pool_stats(&self) -> Vec<TenantPoolStats> {
         self.pool_manager.all_stats()
     }
 
     /// Get aggregate pool statistics
+    #[deprecated(
+        since = "3.1.0",
+        note = "library-only; the daemon's per-tenant pools are `tenant_slots::TenantPool`"
+    )]
     pub fn aggregate_pool_stats(&self) -> AggregatePoolStats {
         self.pool_manager.aggregate_stats()
     }

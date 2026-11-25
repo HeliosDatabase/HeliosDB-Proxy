@@ -526,13 +526,18 @@ impl ProxyServer {
     }
 
     /// Whether a healthy read candidate may serve reads right now: its
-    /// circuit is not open and it does not lag beyond `[lag_routing]`.
+    /// circuit is not open, it does not lag beyond `[lag_routing]`, and its
+    /// smoothed probe latency does not hold it out (`[load_balancer]
+    /// latency_threshold_ms`).
     fn read_eligible(
         state: &Arc<ServerState>,
         config: &ProxyConfig,
         addr: &str,
         lag_bytes: Option<u64>,
     ) -> bool {
+        if config.load_balancer.latency_threshold_ms > 0 && state.latency_gate.excludes(addr) {
+            return false;
+        }
         // Drop a standby whose circuit is open so reads avoid it.
         #[cfg(feature = "circuit-breaker")]
         if Self::circuit_is_open(state, addr) {

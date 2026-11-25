@@ -71,6 +71,12 @@
     "max_total_idle": 8192,
     "idle_timeout_secs": 600,
     "acquire_timeout_secs": 30,
+    "prepared_statement_mode": "track",
+    "min_connections": 0,
+    "max_connections": 0,
+    "test_on_acquire": true,
+    "effective_idle_timeout_secs": 600,
+    "effective_max_lifetime_secs": 0,
     "idle_pool": {
       "idle": 14,
       "reuses_total": 912344,
@@ -79,7 +85,13 @@
       "stale_evicted_total": 3,
       "reaped_total": 40,
       "resets_skipped_total": 880102,
-      "capacity_evictions_total": 0
+      "capacity_evictions_total": 0,
+      "lifetime_expired_total": 0,
+      "acquire_timeouts_total": 0,
+      "stale_lease_redials_total": 0,
+      "topped_up_total": 0,
+      "topup_failures_total": 0,
+      "handed_over_total": 0
     }
   },
   "sessions": {
@@ -178,7 +190,16 @@
           "wait_cancels_total": 0,
           "idle_permit_timeouts_total": 0
         },
-        "replay": null
+        "replay": null,
+        "pool": {
+          "limit": 20,
+          "in_use": 6,
+          "waiting": 0,
+          "waits_total": 3,
+          "refusals_total": 0,
+          "dials_total": 41,
+          "checkouts_total": 51022
+        }
       },
       {
         "tenant": "globex",
@@ -194,7 +215,8 @@
           "byte_limit": 67108864,
           "bytes": 1024,
           "refusals_total": 0
-        }
+        },
+        "pool": null
       }
     ]
   },
