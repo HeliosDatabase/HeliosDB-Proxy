@@ -1,6 +1,6 @@
 [package]
 name = "heliosdb-proxy"
-version = "3.0.1"
+version = "3.1.0"
 edition = "2021"
 rust-version = "1.86"
 description = "HeliosProxy - PostgreSQL wire-protocol connection router: pooling, read/write routing, transaction replay across failover, caching, auth, rate limiting, WASM plugins and HTTP/MCP/GraphQL gateways for HeliosDB and PostgreSQL"

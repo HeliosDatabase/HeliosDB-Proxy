@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-11-26
+
+Minor release: the `[pool]` / `[pool_mode]` keys act, and tenants get schema, database or
+branch isolation with their own pools. Non-breaking for 3.0 configurations and library
+users. Notes: [docs/releases/3.1.0.md](docs/releases/3.1.0.md).
+
 ### Added
 
 - **The `[pool]` and `[pool_mode]` keys act (W02).** They were parsed and ignored; each

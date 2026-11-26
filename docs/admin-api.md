@@ -547,7 +547,7 @@ Useful for watching a single-node drain complete.
 ### GET /version
 
 ```json
-{ "version": "3.0.1", "build_time": "3.0.1" }
+{ "version": "3.1.0", "build_time": "3.1.0" }
 ```
 
 > Both fields derive from the crate version (`CARGO_PKG_VERSION`); `build_time` is the version string, not a wall-clock timestamp.
@@ -607,7 +607,7 @@ Example (abridged; the example fixture has every field):
 ```json
 {
   "schema_version": 1,
-  "proxy_version": "3.0.1",
+  "proxy_version": "3.1.0",
   "generated_at": "2026-11-06T10:15:02.123Z",
   "uptime_secs": 86400,
   "nodes": {

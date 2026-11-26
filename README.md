@@ -581,7 +581,7 @@ docker run -v /etc/heliosproxy:/config heliosdb-proxy --config /config/proxy.tom
 
 # or the published image (all-features,postgres-topology); allow the drain on stop
 docker run --stop-timeout 70 -v /etc/heliosproxy:/config \
-  ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.1 --config /config/proxy.toml
+  ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.1.0 --config /config/proxy.toml
 ```
 
 ### Kubernetes Sidecar
@@ -596,7 +596,7 @@ containers:
       - name: DATABASE_URL
         value: "postgres://user:pass@localhost:6432/mydb"
   - name: heliosproxy
-    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.0.1
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:3.1.0
     args: ["--config", "/config/proxy.toml"]
     ports:
       - containerPort: 6432
